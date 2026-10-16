@@ -23,6 +23,7 @@ int dm_opmode(void) {
 enum { MSG_FOCUS = 15, MSG_OPMODE = 30, MSG_PERFMODE = 31 };
 #define MQ 32
 static pthread_mutex_t g_mq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_mq_cv = PTHREAD_COND_INITIALIZER;   // 阻塞取（PopNotificationMessage）等它 | the blocking pop (PopNotificationMessage) waits on it
 static uint32_t g_mq[MQ]; static int g_mqh, g_mqn;
 static _Atomic int g_ntf_opmode, g_ntf_perfmode;          // 游戏用 Set*NotificationEnabled 打开后才推 | only pushed after the game turns it on with Set*NotificationEnabled
 static void mq_push(uint32_t m) {
@@ -40,6 +41,7 @@ static void mq_push(uint32_t m) {
             if (g_mq[(g_mqh + i) % MQ] == m) { pthread_mutex_unlock(&g_mq_lock); return; }
     if (g_mqn == MQ) die("oe 通知队列溢出（游戏没在取？）");
     g_mq[(g_mqh + g_mqn++) % MQ] = m;
+    pthread_cond_broadcast(&g_mq_cv);
     pthread_mutex_unlock(&g_mq_lock);
 }
 void dm_oe_res_changed(void) { if (getenv("DM_TEST_OE_FOCUS_FIRST")) mq_push(MSG_FOCUS);   /* 测试：让 31 排在一条焦点通知后面（iOS 包启动时的顺序） | Test: queue 31 behind a focus notification (the order at iOS app startup) */
@@ -256,6 +258,17 @@ static void scale3d_tick(void) {
     LOG("3D 渲染比例 %.2f：3D 目标 %ux%u，输出 %ux%u（帧 %llu）", want, *(uint32_t *)(renderer + 0xee78), *(uint32_t *)(renderer + 0xee7c),
         *(uint32_t *)(renderer + 0xee88), *(uint32_t *)(renderer + 0xee8c), (unsigned long long)dm_nvn_frame_count());
 }
+// 分辨率参数位在线程槽里，游戏在取通知的线程上读它们来改出图尺寸（收到 31「性能模式变化」时，main+0xe10ddc 起；30 只更新一个标志）。
+// 读的时机：处理函数每次进来、第一条通知取到之后读一次（0xe10d5c / 0xe10d60），后面循环里再取到的通知用的还是这次读的值。所以每取走一条都把此刻该给的值写进当前线程的槽——
+// 只在取走 31 时写不够：31 排在别的通知（如焦点 15）后面时，参数位在取 15 之后就读过了（iOS 包：前端没切成 16:9，Mac 宿主那局 31 正好排第一）。
+// The resolution parameter bits live in the thread slot, and the game reads them on the thread that fetches notifications to change the render size (on receiving 31 "performance mode changed", from main+0xe10ddc; 30 only updates a flag).
+// When they are read: each time the handler is entered, once after the first notification is fetched (0xe10d5c / 0xe10d60), and notifications fetched later in the loop still use the values from that read. So every time one is taken, the value due at this moment is written into the current thread's slot --
+// writing only when 31 is taken is not enough: when 31 is queued behind another notification (e.g. focus 15), the parameter bits have already been read after fetching 15 (iOS app: the front end did not switch to 16:9, in the Mac host run 31 happened to be queued first).
+static void mq_taken(uint32_t m) {
+    for (int i = 0; i < 2; i++) if (g_keyres[i]) pthread_setspecific(g_keyres[i], (void *)dm_game_res(i));
+    if (m == MSG_PERFMODE) dm_uiscreen_res_reread();
+    LOG("oe 通知被游戏取走：%u", m);   // 状态变化很少，逐条打不刷屏 | state changes are rare, printing each one does not flood the log
+}
 HLE_FORCE("_ZN2nn2oe25TryPopNotificationMessageEPj", "系统通知队列；前端状态变化入队", unsigned, h_oe_TryPopMsg, uint32_t *msg) {
     scale3d_tick();
     pthread_once(&g_oe_once, oe_script_start);
@@ -263,16 +276,19 @@ HLE_FORCE("_ZN2nn2oe25TryPopNotificationMessageEPj", "系统通知队列；前�
     int ok = g_mqn > 0;
     if (ok) { *msg = g_mq[g_mqh]; g_mqh = (g_mqh + 1) % MQ; g_mqn--; }
     pthread_mutex_unlock(&g_mq_lock);
-    // 分辨率参数位在线程槽里，游戏在取通知的线程上读它们来改出图尺寸（收到 31「性能模式变化」时，main+0xe10ddc 起；30 只更新一个标志）。
-    // 读的时机：处理函数每次进来、第一条通知取到之后读一次（0xe10d5c / 0xe10d60），后面循环里再取到的通知用的还是这次读的值。所以每取走一条都把此刻该给的值写进当前线程的槽——
-    // 只在取走 31 时写不够：31 排在别的通知（如焦点 15）后面时，参数位在取 15 之后就读过了（iOS 包：前端没切成 16:9，Mac 宿主那局 31 正好排第一）。
-    // The resolution parameter bits live in the thread slot, and the game reads them on the thread that fetches notifications to change the render size (on receiving 31 "performance mode changed", from main+0xe10ddc; 30 only updates a flag).
-    // When they are read: each time the handler is entered, once after the first notification is fetched (0xe10d5c / 0xe10d60), and notifications fetched later in the loop still use the values from that read. So every time one is taken, the value due at this moment is written into the current thread's slot --
-    // writing only when 31 is taken is not enough: when 31 is queued behind another notification (e.g. focus 15), the parameter bits have already been read after fetching 15 (iOS app: the front end did not switch to 16:9, in the Mac host run 31 happened to be queued first).
-    if (ok) for (int i = 0; i < 2; i++) if (g_keyres[i]) pthread_setspecific(g_keyres[i], (void *)dm_game_res(i));
-    if (ok && *msg == MSG_PERFMODE) dm_uiscreen_res_reread();
-    if (ok) LOG("oe 通知被游戏取走：%u", *msg);   // 状态变化很少，逐条打不刷屏 | state changes are rare, printing each one does not flood the log
+    if (ok) mq_taken(*msg);
     return ok;
+}
+// 阻塞版：王国之泪失焦后用它等下一条通知（真机上就是挂起）。SDK 原版等的系统事件宿主没建，走原版会直接中止
+// Blocking version: TotK waits for the next notification with it after losing focus (suspension on hardware). The SDK original waits on a system event the host never created and aborts
+HLE_FORCE("_ZN2nn2oe22PopNotificationMessageEv", "系统通知队列（阻塞）：队列空就等前端入队", uint32_t, h_oe_PopMsg, void) {
+    pthread_once(&g_oe_once, oe_script_start);
+    pthread_mutex_lock(&g_mq_lock);
+    while (!g_mqn) pthread_cond_wait(&g_mq_cv, &g_mq_lock);
+    uint32_t m = g_mq[g_mqh]; g_mqh = (g_mqh + 1) % MQ; g_mqn--;
+    pthread_mutex_unlock(&g_mq_lock);
+    mq_taken(m);
+    return m;
 }
 // bool 参数：Switch 调用方不扩展，声明成 unsigned 只看低 8 位
 // bool arguments: Switch callers do not extend them, declared as unsigned and only the low 8 bits are looked at
