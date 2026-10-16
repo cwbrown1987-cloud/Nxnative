@@ -7,6 +7,7 @@
 #include "hle.h"
 #include <stdatomic.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef struct { int16_t year; int8_t month, day, hour, minute, second; int8_t pad; } CalendarTime;
 typedef struct { uint32_t wday, yday; char tzname[8]; uint32_t dst; int32_t offset; } CalendarAdditionalInfo;
@@ -105,3 +106,54 @@ HLE_FORCE("_ZN2nn4time11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeE",
 HLE_FORCE("localtime", "本地时刻 → 宿主 localtime（跟系统时区）", struct tm *, h_localtime, const int64_t *t) { time_t v = (time_t)*t; return localtime(&v); }
 HLE_FORCE("localtime_r", "本地时刻 → 宿主 localtime_r（跟系统时区）", struct tm *, h_localtime_r, const int64_t *t, struct tm *out) { time_t v = (time_t)*t; return localtime_r(&v, out); }
 HLE_FORCE("mktime", "本地日历 → 绝对秒，宿主 mktime（跟系统时区）", int64_t, h_mktime, struct tm *tm) { return (int64_t)mktime(tm); }
+
+// 时钟快照与钟差（王国之泪 1.0.0）：SDK 这几处都要 time 服务对象（Initialize 接管后它一直是空的，原版直接中止）或服务的共享内存。
+// 宿主：steady 时钟 = 墙钟秒、时钟源号取一个固定值（跨次启动的快照仍能直接相减，同真机没重置过 RTC 的情形）；用户钟、网络钟都 = 墙钟，偏移 0。
+// ClockSnapshot 布局（0xD0 字节，sdk 15.3.1 构造函数反汇编：+0x50 / +0x58 两份日历缺省 1970-01-01，+0x60 / +0x78 两份附加信息、时区名 "UTC"）：
+//   +0x00 用户钟上下文 {偏移 s64, steady 时间点 {秒 s64, 时钟源号 16 字节}}、+0x20 网络钟上下文、+0x40 用户钟秒、+0x48 网络钟秒、
+//   +0x90 steady 时间点、+0xA8 地区名 36 字节、+0xCC 自动校时、+0xCD 类型
+// Clock snapshots and clock differences (TotK 1.0.0): in the SDK all of these need the time service object (null since Initialize is taken over; the original aborts) or the service's shared memory.
+// Host: steady clock = wall-clock seconds with a fixed clock source id (snapshots from different launches still subtract directly, as on a device whose RTC was never reset); the user and network clocks = wall clock, offset 0.
+// ClockSnapshot layout (0xD0 bytes, from the sdk 15.3.1 constructor disassembly: two calendars at +0x50 / +0x58 defaulting to 1970-01-01, two additional infos at +0x60 / +0x78 with time zone name "UTC"):
+//   +0x00 user clock context {offset s64, steady time point {seconds s64, clock source id 16 bytes}}, +0x20 network clock context, +0x40 user clock seconds, +0x48 network clock seconds,
+//   +0x90 steady time point, +0xA8 location name 36 bytes, +0xCC automatic correction, +0xCD type
+typedef struct { int64_t sec; uint8_t source[16]; } SteadyPoint;
+typedef struct { int64_t offset; SteadyPoint steady; } ClockContext;
+typedef struct {
+    ClockContext user, network; int64_t user_time, network_time;
+    CalendarTime user_cal, network_cal; CalendarAdditionalInfo user_info, network_info;
+    SteadyPoint steady; char location[36]; uint8_t auto_correct, type; uint16_t pad;
+} ClockSnapshot;
+_Static_assert(sizeof(ClockSnapshot) == 0xD0 && __builtin_offsetof(ClockSnapshot, steady) == 0x90 && __builtin_offsetof(ClockSnapshot, auto_correct) == 0xCC, "ClockSnapshot 布局");
+#define RES_TIME_NOT_FOUND 0x19074u   // time 模块 116，描述 200：两份快照没有共同的时钟可比 | time module 116, description 200: the two snapshots share no clock to compare
+static const uint8_t g_steady_source[16] = {'n', 'x', 'n', 'a', 't', 'i', 'v', 'e', '-', 's', 't', 'e', 'a', 'd', 'y', 0};
+static int64_t wall_now(void) { int64_t ft = fixed_time(); return ft >= 0 ? ft : time(NULL); }
+HLE_FORCE("_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_", "要 time 服务对象；按宿主墙钟填快照",
+          Result, h_time_SnapshotCreate, ClockSnapshot *s) {
+    int64_t now = wall_now(); memset(s, 0, sizeof *s);
+    s->steady.sec = now; memcpy(s->steady.source, g_steady_source, 16);
+    s->user = s->network = (ClockContext){0, s->steady};
+    s->user_time = s->network_time = now;
+    h_time_ToCalendarTime(&s->user_cal, &s->user_info, &now); s->network_cal = s->user_cal; s->network_info = s->user_info;
+    char link[256]; ssize_t n = readlink("/etc/localtime", link, sizeof link - 1); const char *z = NULL;
+    if (n > 0) { link[n] = 0; z = strstr(link, "zoneinfo/"); }
+    strlcpy(s->location, z ? z + 9 : "UTC", sizeof s->location);
+    s->auto_correct = 1;
+    return RES_OK;
+}
+// 两份快照的间隔（纳秒）：同一时钟源就用 steady 时间点相减，否则两边都有网络钟秒就用它，再不行回「没有可比的钟」（同 Ryujinx 的服务端实现）
+// Span between two snapshots (nanoseconds): with the same clock source subtract the steady time points; otherwise use the network clock seconds if both have them; otherwise answer "no comparable clock" (same as Ryujinx's service implementation)
+HLE_FORCE("_ZN2nn4time20CalculateSpanBetweenEPNS_8TimeSpanERKNS0_13ClockSnapshotES5_", "要 time 服务对象；宿主按快照内容相减",
+          Result, h_time_SpanBetween, int64_t *out, const ClockSnapshot *a, const ClockSnapshot *b) {
+    if (!memcmp(a->steady.source, b->steady.source, 16)) { *out = (b->steady.sec - a->steady.sec) * 1000000000; return RES_OK; }
+    if (a->network_time && b->network_time) { *out = (b->network_time - a->network_time) * 1000000000; return RES_OK; }
+    return RES_TIME_NOT_FOUND;
+}
+// 用户手动改钟造成的差（纳秒）：用户钟上下文偏移之差；时钟源不同、或两边都开着自动校时，答 0（同 Ryujinx）。宿主的偏移恒 0，所以恒 0
+// Difference caused by the user changing the clock by hand (nanoseconds): the difference of the user clock context offsets; with different clock sources, or automatic correction on in both, the answer is 0 (same as Ryujinx). The host's offset is always 0, so this is always 0
+HLE_FORCE("_ZN2nn4time48CalculateStandardUserSystemClockDifferenceByUserERKNS0_13ClockSnapshotES3_", "要 time 服务对象；宿主按快照内容算",
+          int64_t, h_time_UserDiff, const ClockSnapshot *a, const ClockSnapshot *b) {
+    if (memcmp(a->user.steady.source, b->user.steady.source, 16) || (a->auto_correct && b->auto_correct)) return 0;
+    return (b->user.offset - a->user.offset) * 1000000000;
+}
+HLE_FORCE("_ZN2nn4time19StandardSteadyClock3nowEv", "读 time 服务的共享内存；宿主 = 快照里同一个 steady 秒（墙钟）", int64_t, h_time_SteadyNow, void) { return wall_now(); }

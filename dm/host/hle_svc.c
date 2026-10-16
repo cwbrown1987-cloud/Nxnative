@@ -251,6 +251,14 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         _exit(42);
     }
     case 0x1E: regs[0] = 0; regs[1] = guest_ns() * 12 / 625; return 0;   // GetSystemTick
+    // ExitProcess：游戏调 exit() 走到这里（王国之泪 1.0.0 的 libc exit）。没有返回值，走宿主的优雅退出（停后台线程、音频、图形清空后 _exit(0)）
+    // ExitProcess: reached when the game calls exit() (TotK 1.0.0's libc exit). It has no return value; take the host's graceful exit (stop background threads and audio, drain graphics, then _exit(0))
+    case 0x07: dm_host_shutdown("SVC ExitProcess"); return 0;
+    // SynchronizePreemptionState：内核把线程钉在核上（不可抢占）的那段结束后，nn::os 的 Light 信号量 / 消息队列用它补做被推迟的抢占。
+    // 宿主不钉线程，不会有推迟的抢占：照原样返回，不动寄存器（这条 SVC 没有输出）。显式写出来，免得起机日志里出现占位行
+    // SynchronizePreemptionState: after the kernel stops pinning a thread to its core (non-preemptible), nn::os Light semaphores / message queues use it to carry out the deferred preemption.
+    // The host never pins threads, so there is no deferred preemption: return as is without touching registers (this SVC has no outputs). Written out explicitly so no placeholder line appears in boot logs
+    case 0x36: return 0;
     case 0x27: {  // OutputDebugString(str, len)
         if (g_flag.dbg) fprintf(stderr, "[guest] %.*s\n", (int)regs[1], (char *)regs[0]);
         regs[0] = 0; return 0;

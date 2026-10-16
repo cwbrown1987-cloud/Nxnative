@@ -1,0 +1,3 @@
+# kind: evidence  王国之泪着色器（RomFS + main 里的 BNSH / BAHS）→ 控制段 + 代码区键（dm/gfx/tools/shader_split.py）
+# 占位：P4 由 shader_split.py 重写（需先支持 ZsDic 字典） | placeholder: rewritten by shader_split.py in P4 (needs ZsDic dictionary support first)
+package	index	stage	dm_ctl_sha16	source

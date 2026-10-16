@@ -1,0 +1,53 @@
+# 塞尔达传说 王国之泪（Switch，基础版 v0 = 1.0.0）的游戏档案。移植起步中，先做基础版；1.4.2 的 build 行与差异等 base 起机后再补
+# Game profile of The Legend of Zelda: Tears of the Kingdom (Switch, base game v0 = 1.0.0). Bring-up has just started with the base game; the 1.4.2 build row and its differences come after the base game boots
+# 格式见 dm/games/README.md | Format: see dm/games/README.md
+# Nintendo 自己的引擎（sead、agl、gsys、Havok），SDK 15.3.1，NVN。着色器在 Shader/*.bfsha.zs、Effect、Lib、UI 与 main 里的 BNSH；zstd 文件多用 Pack/ZsDic.pack.zs 里的字典
+# Nintendo's own engine (sead, agl, gsys, Havok), SDK 15.3.1, NVN. Shaders are BNSH in Shader/*.bfsha.zs, Effect, Lib, UI and main; most zstd files use the dictionaries in Pack/ZsDic.pack.zs
+
+# ---- 身份 | Identity ----
+title_id	0100F2C0115B6000
+program_id	0100F2C0115B6000
+
+# ---- App ----
+# 只在 Mac 上跑，不打 IPA；ipa 与类别照格式填上 | Mac only, no IPA; ipa and the category are filled in for the format
+name	The Legend of Zelda: Tears of the Kingdom
+ipa	TotK.ipa
+app_category	public.app-category.adventure-games
+
+# ---- 版本 | Versions ----
+build	v0	1.0.0	main=082ce09b06e33a123cb1e2770f5f9147	subsdk0=a6bb7c6ffa9673769fa74ed3d7b05419	sdk=b9046c31eb5d31271be970fe732d38df
+package	v0
+shader_versions	v0
+
+# ---- 文件 | Files ----
+# 装载顺序同 Horizon：main、subsdk*、sdk（subsdk0 = NintendoSDK_movie 15.3.1） | load order as on Horizon: main, subsdk*, sdk (subsdk0 = NintendoSDK_movie 15.3.1)
+modules	main subsdk0 sdk
+romfs_marker	System/Resource
+zip_store	.zs:.bwav:.webm:.metallib
+
+# ---- 内存 | Memory ----
+# NPDM 声明系统资源 24 MB，IsVirtualAddressMemoryEnabled 为真（同 Engage）：StandardAllocator 在别名区一次分一整块（应用池 − 64 MB，按 1 GB 对齐），
+# 较新 SDK 的 AddressRegionManager 还先占别名区开头约 1 GB 作节点区；HeapDef 里引擎自己的 VirtualAddressMemory 是 1.05 GB。
+# 只在 Mac 上跑，地址空间不紧。实测（首次起机）：nninitStartup 还要 SetHeapSize 0x85c00000（2.09 GB），所以堆区给 2.25 GB；
+# 别名区给 8 GB 放 StandardAllocator 的整块与节点区，应用池报真机的 3285 MB，起机后按 [内存] 日志实测再收
+# The NPDM declares 24 MB of system resource, so IsVirtualAddressMemoryEnabled is true (as in Engage): StandardAllocator takes one region in the alias region (application pool − 64 MB, 1 GB aligned),
+# and newer SDKs' AddressRegionManager first takes about 1 GB at the start of the alias region as its node area; the engine's own VirtualAddressMemory in HeapDef is 1.05 GB.
+# Mac only, so address space is not tight. Measured (first boot): nninitStartup also calls SetHeapSize for 0x85c00000 (2.09 GB), so the heap region gets 2.25 GB;
+# the alias region gets 8 GB for StandardAllocator's region and the node area, with the hardware's 3285 MB application pool; trimmed after measuring with the [内存] log lines
+mem_reserve	0x2B0000000
+mem_alias	0x200000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+
+# ---- NVN 驱动常量段（dmsh_build.py 出包、nvn_mtl.m 运行时现填） | NVN driver constant segments (dmsh_build.py at packaging, nvn_mtl.m filled at run time) ----
+# 先沿用马力欧的，翻译全库后按实测改 | Mario's until measured over all translated shaders
+nvn_tex_base	0x20
+nvn_tex_slots	32
+nvn_samp_base	0x568
+nvn_img_base	0x120
+nvn_img_slots	8
+nvn_ssbo_bases	vs=0x110 ps=0x510 cs=0x310
+
+# ---- 着色器拆分（shader_split.py） | Shader split (shader_split.py) ----
+shader_groups	/Shader/=shader /Effect/=effect /Lib/=lib /UI/=ui
+shader_note	王国之泪着色器

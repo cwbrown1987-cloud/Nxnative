@@ -915,6 +915,69 @@ HLE_FORCE("_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", "fsp-srv
 // 存档是否已建：宿主的存档目录在挂载时建，游戏视角里恒已存在（EnsureSaveData 也恒成功）
 // Whether save data exists: the host's save directory is created at mount time, so from the game's point of view it always exists (EnsureSaveData always succeeds too)
 HLE_FORCE("_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE", "fsp-srv；存档恒已建（返回 bool）", unsigned, h_fs_SaveExists, const void *uid) { (void)uid; return 1; }
+// 按应用号问 / 只读挂载存档：本作的存档同上恒在；别的应用的存档宿主上没有，照真机「没玩过那一作」答不存在 / 目标不存在。
+// 王国之泪 1.0.0 拿旷野之息的应用号（0x01007EF00011E000，main+0xe31a14）先问在不在，在才只读挂成 prsv，不在就跳过
+// Ask about / mount read-only save data by application id: this game's own save always exists, as above; other applications' saves are absent on the host, so answer "does not exist" / "target not found" as a device that never played that title would.
+// TotK 1.0.0 asks with Breath of the Wild's application id (0x01007EF00011E000, main+0xe31a14) and mounts it read-only as prsv only if it exists, otherwise it skips
+HLE_FORCE("_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", "fsp-srv；本作存档恒在，别的应用的存档宿主上没有（返回 bool）",
+          unsigned, h_fs_SaveExistsApp, uint64_t app, const void *uid) {
+    (void)uid; if (app == DM_GAME_PROGRAM_ID) return 1;
+    LOG("fs IsSaveDataExisting：应用 %016llx 的存档宿主上没有，答不存在", (unsigned long long)app); return 0;
+}
+HLE_FORCE("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", "fsp-srv；本作存档 → DM_SAVE 只读挂载，别的应用答目标不存在",
+          Result, h_fs_MountSaveRO, const char *name, uint64_t app, const void *uid) {
+    (void)uid; const char *d = getenv("DM_SAVE");
+    if (app == DM_GAME_PROGRAM_ID && d) return mount(name, d, 1);
+    LOG("fs MountSaveDataReadOnly %s：应用 %016llx 的存档宿主上没有", name, (unsigned long long)app); return RES_TARGET_NOT_FOUND;
+}
+// 缓存存储（cache storage）：应用自己的、按序号分开的可写存储（王国之泪 1.0.0 挂成 savc / savct）。宿主：DM_CACHE/<序号>/ 目录，不限额，提交即直写（非事务挂载）。
+// 列表句柄 = 宿主分配的列表对象指针（SDK 原版的句柄也是指向内部列表的指针，按值传）；CacheStorageInfo 每项 0x20 字节、+0 是序号、其余清零（sdk 15.3.1 ReadCacheStorageList 反汇编）
+// Cache storage: the application's own writable storage, kept apart by index (TotK 1.0.0 mounts it as savc / savct). Host: DM_CACHE/<index>/ directories, no quota, written directly (non-transactional mount).
+// List handle = pointer to a host-allocated list object (the original SDK handle is also a pointer to an internal list, passed by value); each CacheStorageInfo is 0x20 bytes, index at +0, the rest zeroed (sdk 15.3.1 ReadCacheStorageList disassembly)
+#define RES_FS_INVALID_ARGUMENT 0x2F5E02u   // fs 模块 2，描述 6063：ReadCacheStorageList 原版对空指针 / 负数上限回这个 | fs module 2, description 6063: what the original ReadCacheStorageList returns for null pointers / a negative limit
+typedef struct { int n, pos; int idx[64]; } cache_list_t;
+static const char *cache_root(char *b, size_t n) { return envdir("DM_CACHE", "run/platform/cache", b, n); }
+static int cache_dir(int index, char *out, size_t n) { char b[1024]; return index >= 0 && snprintf(out, n, "%s/%d", cache_root(b, sizeof b), index) < (int)n; }
+HLE_FORCE("_ZN2nn2fs18CreateCacheStorageEill", "fsp-srv；缓存存储 → 建宿主目录 DM_CACHE/<序号>", Result, h_fs_CreateCache, int index, int64_t size, int64_t journal) {
+    char b[1024], d[1100]; mkdir(cache_root(b, sizeof b), 0755);
+    if (!cache_dir(index, d, sizeof d)) return RES_FS_INVALID_ARGUMENT;
+    if (mkdir(d, 0755)) return err_res("CreateCacheStorage", d);   // 已存在 → 2-2，同真机 | already exists → 2-2, as on hardware
+    LOG("fs 建缓存存储 #%d：%s（游戏要 %lld 字节、日志 %lld 字节，宿主不限额）", index, d, (long long)size, (long long)journal);
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn2fs18DeleteCacheStorageEi", "fsp-srv；缓存存储 → 删宿主目录", Result, h_fs_DeleteCache, int index) {
+    char d[1100]; struct stat st;
+    if (!cache_dir(index, d, sizeof d)) return RES_FS_INVALID_ARGUMENT;
+    if (stat(d, &st) || !S_ISDIR(st.st_mode)) return RES_TARGET_NOT_FOUND;
+    if (rm_tree(d)) return err_res("DeleteCacheStorage", d);
+    LOG("fs 删缓存存储 #%d：%s", index, d); return RES_OK;
+}
+HLE_FORCE("_ZN2nn2fs17MountCacheStorageEPKci", "fsp-srv；缓存存储 → 宿主目录（可写，非事务）", Result, h_fs_MountCache, const char *name, int index) {
+    char d[1100]; struct stat st;
+    if (!cache_dir(index, d, sizeof d)) return RES_FS_INVALID_ARGUMENT;
+    if (stat(d, &st) || !S_ISDIR(st.st_mode)) { LOG("fs 挂缓存存储 %s：#%d 没建过（%s）", name, index, d); return RES_TARGET_NOT_FOUND; }
+    return mount(name, d, 0);   // mount_ex 记日志 | mount_ex logs it
+}
+static int int_cmp(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
+HLE_FORCE("_ZN2nn2fs20OpenCacheStorageListEPNS0_22CacheStorageListHandleE", "fsp-srv；列 DM_CACHE 下的序号目录", Result, h_fs_OpenCacheList, void **out) {
+    cache_list_t *l = calloc(1, sizeof *l); char b[1024]; DIR *d = opendir(cache_root(b, sizeof b)); struct dirent *e;
+    if (!l) return RES_FAIL;
+    while (d && (e = readdir(d)) && l->n < 64) {
+        char *end; long v = strtol(e->d_name, &end, 10);
+        if (e->d_name[0] >= '0' && e->d_name[0] <= '9' && !*end && v <= INT32_MAX && e->d_type == DT_DIR) l->idx[l->n++] = (int)v;
+    }
+    if (d) closedir(d);
+    qsort(l->idx, (size_t)l->n, sizeof l->idx[0], int_cmp);
+    *out = l; return RES_OK;
+}
+HLE_FORCE("_ZN2nn2fs20ReadCacheStorageListEPiPNS0_16CacheStorageInfoENS0_22CacheStorageListHandleEi", "fsp-srv；从宿主列表取序号",
+          Result, h_fs_ReadCacheList, int *count, uint8_t *infos, cache_list_t *l, int max) {
+    if (!count || !infos || max < 0 || !l) return RES_FS_INVALID_ARGUMENT;
+    int n = 0;
+    for (; n < max && l->pos < l->n; n++, l->pos++) { memset(infos + n * 0x20, 0, 0x20); memcpy(infos + n * 0x20, &l->idx[l->pos], 4); }
+    *count = n; return RES_OK;
+}
+HLE_FORCE("_ZN2nn2fs21CloseCacheStorageListENS0_22CacheStorageListHandleE", "fsp-srv；放宿主列表", void, h_fs_CloseCacheList, cache_list_t *l) { free(l); }
 // 文件系统访问日志与线程优先级：真机都要问 fsp-srv（访问日志开关在服务端）；宿主没有访问日志，优先级不影响 pread
 // File system access log and thread priority: on the real device both ask fsp-srv (the access log switch lives in the service); the host has no access log and priority does not affect pread
 HLE_FORCE("_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE", "fsp-srv；文件读优先级，宿主忽略", void, h_fs_SetPrio, int prio) { (void)prio; }

@@ -690,6 +690,23 @@ def jump_offsets(insl, j):
     if page is None: return None
     tb = page + lo
     return [tb + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)]
+def adr_table_wide(insl, j):
+    """adr x18 形的跳转表，但 adr / add 离 br 超过 8 条（王国之泪 1.0.0 main 有 3 处：+0x590574 中间排进 9 条浮点运算，+0x23b1494 的 adr 在 17 条之前）。往回 32 条找 adr x18 与 add x18,x18,xI,lsl #2，
+    且 adr 之后写 x18 的只有这条 add；表项宽度看 xI 由 ldrb / ldrh 读出。认不出返回 (None, None)，只在 8 条窗口没认出时调用，原有站点的产物不变
+    An adr x18 jump table whose adr / add sit more than 8 instructions before the br (3 in TotK 1.0.0 main: +0x590574 has 9 float instructions scheduled in between, +0x23b1494 has its adr 17 before). Look back 32 for adr x18 and add x18,x18,xI,lsl #2,
+    with that add as the only x18 writer after the adr; the entry width comes from the ldrb / ldrh that loads xI. Returns (None, None) if not recognized; called only when the 8-instruction window failed, so existing sites are unchanged"""
+    ctx = insl[max(0, j - 32):j]
+    k = next((i for i in range(len(ctx) - 1, -1, -1) if ctx[i].mnemonic == 'adr' and ctx[i].op_str.startswith('x18,')), None)
+    if k is None: return None, None
+    after = ctx[k + 1:]
+    writers = [p for p in after if any(p.reg_name(r) in ('x18', 'w18') for r in p.regs_access()[1])]
+    if len(writers) != 1 or writers[0].mnemonic != 'add' or not writers[0].op_str.startswith('x18, x18,') or 'lsl #2' not in writers[0].op_str:
+        return None, None
+    idx = num(writers[0].reg_name(writers[0].operands[2].reg))
+    for q in reversed(ctx[:ctx.index(writers[0])]):
+        if q.mnemonic in ('ldrb', 'ldrsb') and num(q.reg_name(q.operands[0].reg)) == idx: return ctx[k].operands[1].imm, 256
+        if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: return ctx[k].operands[1].imm, 65536
+    return None, None
 funcs = sorted({func_of(a) for a, (k, _) in kinds.items() if k == 'x18'})
 for fa, fb in funcs:
     insl = list(md.disasm(bytes(IMG[fa:fb]), fa))
@@ -710,6 +727,8 @@ for fa, fb in funcs:
                         if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: width = 65536
                         if width: break
                     break
+            if not (base and width):
+                base, width = adr_table_wide(insl, j)
             if not (base and width):
                 tgt = jump_offsets(insl, j)
                 assert tgt, f'jump table {ins.address:x}'

@@ -149,6 +149,7 @@ static Result nfp_no_tag(const char *what) {
     return NFP_RES_TAG_NOT_FOUND;
 }
 HLE_FORCE("_ZN2nn3nfp10InitializeEv", "amiibo 库初始化；宿主一台 NFC 设备、永远找不到标签", void, h_nfp_Init, void) { LOG("nfp::Initialize：宿主一台 NFC 设备，找不到 amiibo 标签"); }
+HLE_FORCE("_ZN2nn3nfp8FinalizeEv", "amiibo 库收尾；宿主没开过 nfp 服务会话，只把设备状态归初始（王国之泪 1.0.0 引用）", void, h_nfp_Fini, void) { atomic_store(&g_nfp_state, NFP_STATE_INIT); }
 HLE_FORCE("_ZN2nn3nfp29AttachAvailabilityChangeEventEPNS_2os15SystemEventTypeE", "NFC 可用性变化事件；绑内核事件、恒不触发", void, h_nfp_AttachAvail, void *ev) { hle_bind_system_event(ev, 0); }
 HLE_FORCE("_ZN2nn3nfp11ListDevicesEPNS0_12DeviceHandleEPii", "NFC 设备列表：一台", Result, h_nfp_List, NfpDeviceHandle *out, int *n, int max) {
     *n = 0; if (max >= 1) { memset(&out[0], 0, sizeof out[0]); out[0].id = NFP_DEVICE_ID; *n = 1; }
