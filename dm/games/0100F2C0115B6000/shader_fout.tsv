@@ -1,0 +1,2 @@
+# 运行时观察到的片元输出类型（宿主 DM_NVN_FOUT_WANT → dmsh_facts.py --fout-merge）：键 <TAB> {颜色号: uint|sint} | runtime-observed fragment output types (host DM_NVN_FOUT_WANT → dmsh_facts.py --fout-merge): key <TAB> {color: uint|sint}
+0544282c162305db	{"0":"uint"}

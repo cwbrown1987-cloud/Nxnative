@@ -20,6 +20,7 @@
 # 输出：<包目录>/<阶段>_<来源组>.bin，每条记录 = 'BTCDBTCD' + 头（+0x28 控制段长、+0x2c 代码区长）补到 0x38 + 代码区 + 控制段，同键只出一份；
 #   映射表行与 D2R 的 shader_map.tsv 同列（第 5 列记首次出现的位置）；作答表每个计算着色器一行 {"local", "shared"}（共享内存按 16 字节向上取整，同 D2R 口径）。
 # 用法：shader_split.py <RomFS 目录> <ExeFS main> <输出包目录> <输出映射表> <输出作答表> [<输出配对表>]   （解 main 要 lz4：用 dm 的 venv python 跑）   环境 J=并发（缺省 8）
+#   .zs 帧头带字典号时（王国之泪），用该 RomFS 的 Pack/ZsDic.pack.zs 里同号的字典解压（zsdic_load）
 #   带更新包：RomFS 与 main 都写成逗号分隔的列表（基础版在前，如 data/v0/RomFS,data/v327680/RomFS），输出两版的并集（见 main()）
 #   Unity 的类型树字符串要 Unity 的公共字符串表，取自第一个 main
 # 配对表：BNSH 每个变体（Unity 每个程序）的（顶点键, 像素键），dmsh_build 据此给顶点着色器补上像素着色器读而它没写的输出（见 dmsh_build.py vs_pad）
@@ -44,10 +45,11 @@
 # Output: <package dir>/<stage>_<source group>.bin, each record = 'BTCDBTCD' + header (+0x28 control length, +0x2c code length) padded to 0x38 + code area + control section, one copy per key;
 #   map rows have the same columns as D2R's shader_map.tsv (column 5 records where the key first appeared); the answer table has one row per compute shader {"local", "shared"} (shared memory rounded up to 16 bytes, as D2R did).
 # Usage: shader_split.py <RomFS dir> <ExeFS main> <output package dir> <output map> <output answer table> [<output pair table>]   (decompressing main needs lz4: run with dm's venv python)   Environment J=concurrency (default 8)
+#   When a .zs frame header names a dictionary (Tears of the Kingdom), the dictionary with that ID from the same RomFS's Pack/ZsDic.pack.zs is used (zsdic_load)
 #   With an update: give RomFS and main as comma-separated lists (base game first, e.g. data/v0/RomFS,data/v327680/RomFS); the output is the union of both versions (see main())
 #   Unity type trees need Unity's common string table, which is taken from the first main
 # Pair table: (vertex key, pixel key) of every BNSH variation (every Unity program); dmsh_build uses it to give vertex shaders the outputs their pixel shaders read but they do not write (see dmsh_build.py vs_pad)
-import collections, concurrent.futures as cf, hashlib, json, os, re, struct, subprocess, sys
+import collections, concurrent.futures as cf, hashlib, json, os, re, struct, subprocess, sys, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../games')); import game as _game
 GAME = _game.load()   # 当前游戏档案（DM_GAME，必给）：来源组规则与表头说明 | the current game profile (DM_GAME, required): source group rules and the table header note
 GROUPS, NOTE = GAME.pairs('shader_groups'), GAME.get('shader_note')
@@ -178,15 +180,41 @@ def sarc_members(d):
     names = hl + 12 + 16 * n + 8
     for i in range(n):
         h, attr, s, e = struct.unpack_from('<IIII', d, hl + 12 + 16 * i)
-        nm = d[names + (attr & 0xffffff) * 4:].split(b'\0')[0].decode('utf-8', 'replace') if attr >> 24 else f'#{i}'
+        at = names + (attr & 0xffffff) * 4   # 只找到下一个 \0：切片到文件尾再 split 每个成员都复制一遍余下的数据，大 SARC 成平方级 | find only the next \0: slicing to the end and splitting copied the rest of the data per member, quadratic on large SARCs
+        nm = d[at:d.index(b'\0', at)].decode('utf-8', 'replace') if attr >> 24 else f'#{i}'
         yield nm, d[doff + s:doff + e]
 
 NV_STAGES = ['vs', 'ps', 'gs', 'hs', 'ds', 'cs']   # NVN 阶段序 | NVN stage order
-COMMON, TREES = None, {}   # Unity 公共字符串表、借用的类型树（进程池初始化时给） | Unity common strings and borrowed type trees (given when the pool starts)
+COMMON, TREES, ZSDIC = None, {}, {}   # Unity 公共字符串表、借用的类型树、ZsDic 字典文件（进程池初始化时给） | Unity common strings, borrowed type trees, ZsDic dictionary files (given when the pool starts)
 
-def _pool_init(common, trees):
-    global COMMON, TREES
-    COMMON, TREES = common, trees
+def _pool_init(common, trees, zsdic):
+    global COMMON, TREES, ZSDIC
+    COMMON, TREES, ZSDIC = common, trees, zsdic
+
+def zsdic_load(romfs_v, tmp):
+    """每个 RomFS 的 Pack/ZsDic.pack.zs（不带字典的 zstd 包着 SARC，成员是 zstd 字典）写成 tmp 下的文件 → {RomFS: {字典号: 文件}}；没有这个包的游戏得空表
+    Each RomFS's Pack/ZsDic.pack.zs (dictionary-less zstd around a SARC whose members are zstd dictionaries) written as files under tmp → {RomFS: {dictionary ID: file}}; games without the pack get empty tables"""
+    out = {}
+    for i, romfs in enumerate(romfs_v):
+        ds = out[romfs.rstrip(os.sep)] = {}; p = os.path.join(romfs, 'Pack', 'ZsDic.pack.zs')
+        if not os.path.exists(p): continue
+        for nm, m in sarc_members(subprocess.run(['zstd', '-d', '-c', '-q', p], capture_output=True, check=True).stdout):
+            if m[:4] != b'\x37\xa4\x30\xec': continue
+            ds[struct.unpack_from('<I', m, 4)[0]] = f = os.path.join(tmp, f'{i}_{nm}')
+            with open(f, 'wb') as fh: fh.write(m)
+    return out
+
+def unzstd(path):
+    """解压 .zs：帧头描述字节低 2 位 = 字典号字段长 0 / 1 / 2 / 4，第 5 位 = 单段（单段时没有窗口字节）；字典号非 0 就用所在 RomFS 的同号字典
+    Decompress a .zs: the low 2 bits of the frame header descriptor = dictionary ID field length 0 / 1 / 2 / 4, bit 5 = single segment (no window byte); a non-zero ID uses that dictionary from the file's own RomFS"""
+    with open(path, 'rb') as f: h = f.read(18)
+    n, at = (0, 1, 2, 4)[h[4] & 3], 5 + (0 if h[4] & 0x20 else 1)
+    did, cmd = int.from_bytes(h[at:at + n], 'little'), ['zstd', '-d', '-c', '-q', path]
+    if did:
+        ds = next((v for r, v in ZSDIC.items() if path.startswith(r + os.sep)), {})
+        if did not in ds: red(f'{path}：zstd 帧要字典 {did}，所在 RomFS 的 Pack/ZsDic.pack.zs 里没有')
+        cmd[4:4] = ['-D', ds[did]]
+    return subprocess.run(cmd, capture_output=True, check=True).stdout
 
 def unity_program(code, where):
     """Unity 的 Switch 程序代码 → [(阶段, 控制段, 代码区)] | Unity's Switch program code → [(stage, control, code)]"""
@@ -261,7 +289,7 @@ def var_pairs(found):
 def scan_file(args):
     """→ (相对路径, {键: …}, 配对, 额外)；额外 = 本文件的 Unity 类型树，或 'defer'（缺类型树，第二遍再扫） | → (relative path, {key: …}, pairs, extra); extra = this file's Unity type trees, or 'defer' (no type tree, scanned again in the second pass)"""
     path, rel = args
-    d = subprocess.run(['zstd', '-d', '-c', '-q', path], capture_output=True, check=True).stdout if path.endswith('.zs') else open(path, 'rb').read()
+    d = unzstd(path) if path.endswith('.zs') else open(path, 'rb').read()
     if d[:4] == b'Yaz0': d = yaz0(d)
     found = []; trees = {}
     if d[:8] == b'UnityFS\0' or (d[8:11] == b'\0\0\0' and __import__('unityfs').is_serialized(d)):
@@ -312,14 +340,15 @@ def main():
     # 第一遍：全部文件；Unity 资源包带类型树，顺手收下 Shader 的树。第二遍：没带类型树的 Unity 序列化文件借这些树再扫
     # First pass: every file; Unity bundles carry type trees, and the Shader trees are collected on the way. Second pass: Unity serialized files without type trees are scanned again with the borrowed trees
     J = int(os.environ.get('J', '8'))
-    with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, {})) as ex: results += list(ex.map(scan_file, files, chunksize=16))
+    tmp = tempfile.TemporaryDirectory(prefix='zsdic'); zsdic = zsdic_load(romfs_v, tmp.name)
+    with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, {}, zsdic)) as ex: results += list(ex.map(scan_file, files, chunksize=16))
     trees, defer = {}, []
     for rel, uniq, pr, extra in results:
         if extra == 'defer': defer.append(rel)
         elif extra: trees.update(extra)
     if defer:
         byrel = {r: p for p, r in files}
-        with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, trees)) as ex: again = list(ex.map(scan_file, [(byrel[r], r) for r in defer]))
+        with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, trees, zsdic)) as ex: again = list(ex.map(scan_file, [(byrel[r], r) for r in defer]))
         for rel, uniq, pr, extra in again:
             if extra == 'defer': red(f'{rel}：Unity 序列化文件没有类型树，资源包里也没有同哈希的 Shader 类型树可借')
         results = [r for r in results if r[3] != 'defer'] + again

@@ -7,6 +7,7 @@
 - **`c1_full.tsv`**：每次出着色器库后由 `c1_guard.py` 重生成。
 - **`pso_manifest.tsv`**：预热种子清单。
 - **`bf_want.tsv`**。
+- **`shader_fout.tsv`**（可以没有）：没有 PC 版反射的游戏里，写整数渲染目标的片元着色器。宿主建管线失败时记进 `DM_NVN_FOUT_WANT`，`dmsh_facts.py --fout-merge` 并进来；计入翻译链版本。
 - **`dmsh_chain.h`**：翻译链版本，由 `dmsh_chain.py --header` 写出。
 
 和游戏有关的都放这里。代码读档案，不写死某个游戏。

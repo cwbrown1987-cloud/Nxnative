@@ -1934,6 +1934,7 @@ static void defer_fallback(void);
 static int g_el_w, g_el_h, g_el_draws; static char g_el_key[12];
 static int enc_label_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ENC_LABEL"); v = e && atoi(e); } return v; }
 static void ghost_flush(void);
+static int g_nbcrt; static void bcrt_flush(void);   // 渲染进 BC 贴图的影子搬回（定义在 attach 前） | moving BC render-target shadows back (defined before attach)
 static void rp_end(void) { if (g_enc) { AP_B;
     ghost_flush();
     if (enc_label_on()) { static uint64_t lf = ~0ull, base; uint64_t f = atomic_load(&g_cur_frame); if (f != lf) { lf = f; base = g_stat_pass - 1; }   // 帧内序号：同一趟每帧同名，表里才能按名归并 | Intra-frame serial: the same pass has the same name every frame, so the table can aggregate by name
@@ -1942,6 +1943,7 @@ static void rp_end(void) { if (g_enc) { AP_B;
     int ranged=g_rt_range_active && !g_rt_range_pending;
 #endif
     sd_finish(); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); if (g_lp.count) lp_finish(); fz_end();
+    if (g_nbcrt) bcrt_flush();
 #ifdef NVN_RT_RANGE_TEST
     rr_finish(ranged);
 #endif
@@ -1949,11 +1951,60 @@ static void rp_end(void) { if (g_enc) { AP_B;
 } }
 void pg_sub_begin_ext(uint64_t fence) { pg_sub_begin(fence); }
 void pg_commit_ext(id<MTLCommandBuffer> cb) { pg_commit(cb); }
+// 渲染进 BC 压缩贴图（王国之泪经 RGBA16UI 视图往 BC4 贴图里画：一个像素 = 一个 4×4 块，GPU 上现压纹理）：Metal 不许压缩 / 非压缩格式之间建视图，
+// 按底图格式建管线会触发 Metal 断言（BC4 不能作颜色附件）。改画到「块数 × 块数」的非压缩影子贴图：通道开始前经缓冲把块搬进来，结束后原样搬回（字节逐一对应）。
+// 只认「底图 BC、视图是每像素字节数等于块字节数的非压缩格式」，其余照旧
+// Rendering into BC-compressed textures (TotK draws into BC4 textures through an RGBA16UI view: one pixel = one 4x4 block, compressing textures on the GPU): Metal forbids views between compressed and uncompressed formats,
+// and building the pipeline with the base format trips a Metal assertion (BC4 is not color renderable). The pass instead draws into an uncompressed shadow of blocks x blocks: the blocks are moved in through a buffer before the pass and moved back unchanged after it (byte for byte).
+// Only "BC base with an uncompressed view whose bytes per pixel equal the block size" takes this path; everything else is unchanged
+static int bc_block_bytes(MTLPixelFormat f) {
+    if (f < MTLPixelFormatBC1_RGBA || f > MTLPixelFormatBC7_RGBAUnorm_sRGB) return 0;
+    return f <= MTLPixelFormatBC1_RGBA_sRGB || f == MTLPixelFormatBC4_RUnorm || f == MTLPixelFormatBC4_RSnorm ? 8 : 16;
+}
+static int bcrt_view(id<MTLTexture> base, const view_t *v, int has_v, MTLPixelFormat *pf_out) {
+    uint32_t pf = 0; uint8_t swz[4]; int bw = 0, bh = 0, bb = base ? bc_block_bytes(base.pixelFormat) : 0;
+    if (!bb || !has_v || !v->set_format || !nvn_fmt_to_mtl(v->format, &pf, swz) || !pf || bc_block_bytes((MTLPixelFormat)pf)) return 0;
+    if (nvn_fmt_bpb(v->format, &bw, &bh) != bb || bw != 1 || bh != 1) return 0;
+    *pf_out = (MTLPixelFormat)pf; return 1;
+}
+typedef struct { id<MTLTexture> base, shadow; id<MTLBuffer> buf; NSUInteger level, slice, z, w, h, bw, bh, bpb; } bcrt_t;
+static bcrt_t g_bcrt[8];
+// 通道结束（rp_end）：影子 → 缓冲 → BC 贴图原级原层；blit() 在两次拷贝之间加编码器内屏障 | end of pass (rp_end): shadow → buffer → the BC texture's own level and slice; blit() puts an intra-encoder barrier between the two copies
+static void bcrt_flush(void) {
+    int n = g_nbcrt; g_nbcrt = 0;
+    for (int i = 0; i < n; i++) { bcrt_t e = g_bcrt[i]; g_bcrt[i] = (bcrt_t){0};
+        NSUInteger row = e.bw * e.bpb, img = row * e.bh;
+        enc_b_copy_texture_buffer(blit(), e.shadow, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(e.bw, e.bh, 1), e.buf, 0, row, img);
+        enc_b_copy_buffer_texture(blit(), e.buf, 0, row, img, MTLSizeMake(e.w, e.h, 1), e.base, e.slice, e.level, MTLOriginMake(0, 0, e.z));
+        defer_obj_release(e.shadow); defer_obj_release(e.buf);
+    }
+}
+// 挂附件时把 BC 贴图换成影子：成功返回 1（a 已改挂影子）。王国之泪的是 32×32×32 的三维 BC4，逐个深度平面画：三维按 origin.z 定位，数组按 slice
+// swap the BC texture for a shadow when attaching: returns 1 on success (a now holds the shadow). TotK's is a 32x32x32 3D BC4 drawn one depth plane at a time: 3D is addressed by origin.z, arrays by slice
+static int bcrt_attach(MTLRenderPassAttachmentDescriptor *a, id<MTLTexture> base, const view_t *v, int has_v) {
+    MTLPixelFormat spf; if (g_nbcrt >= 8 || !bcrt_view(base, v, has_v, &spf)) return 0;
+    int is3d = base.textureType == MTLTextureType3D;
+    NSUInteger lv = a.level, sl = is3d ? 0 : a.slice, z = is3d ? a.depthPlane : 0, w = MAX(base.width >> lv, 1u), h = MAX(base.height >> lv, 1u), bw = (w + 3) / 4, bh = (h + 3) / 4, bpb = (NSUInteger)bc_block_bytes(base.pixelFormat);
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:spf width:bw height:bh mipmapped:NO];
+    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> sh = [g_dev newTextureWithDescriptor:d]; id<MTLBuffer> buf = [g_dev newBufferWithLength:bw * bh * bpb options:MTLResourceStorageModePrivate];
+    if (!sh || !buf) { RED_ONCE(72, "渲染进 BC 贴图：影子建不出（%lux%lu 块，格式 %lu）", (unsigned long)bw, (unsigned long)bh, (unsigned long)spf); return 0; }
+    res_add(sh); res_add(buf);
+    NSUInteger row = bw * bpb, img = row * bh;
+    enc_b_copy_texture_buffer(blit(), base, sl, lv, MTLOriginMake(0, 0, z), MTLSizeMake(w, h, 1), buf, 0, row, img);
+    enc_b_copy_buffer_texture(blit(), buf, 0, row, img, MTLSizeMake(bw, bh, 1), sh, 0, 0, MTLOriginMake(0, 0, 0));
+    g_bcrt[g_nbcrt++] = (bcrt_t){base, sh, buf, lv, sl, z, w, h, bw, bh, bpb};
+    a.texture = sh; a.level = 0; a.slice = 0; a.depthPlane = 0;
+    static int once; if (!once++) MLOG("渲染进 BC 贴图：视图格式 %#x 画到 %lux%lu 块的影子贴图（Metal 格式 %lu），通道结束后搬回 BC 贴图（首例）", v->format, (unsigned long)bw, (unsigned long)bh, (unsigned long)spf);
+    return 1;
+}
 // 附件实际挂上的格式：视图换了格式且挂得上就是视图格式，否则底图格式。挂附件（attach）与管线预测（pso_predict_rest）共用，口径一致——
 // 原先预测按底图格式，经 sRGB 视图写的通道（马力欧末道）预测出的管线格式不对，真管线到首次绘制才现编（取自 d2r-mobile e2a0c9a9b）
 // The format an attachment is actually attached with: the view's format if the view changes the format and can be attached, otherwise the base texture's. Shared by attaching (attach) and pipeline prediction (pso_predict_rest) so both agree --
 // prediction used the base format, so for a pass written through an sRGB view (Mario's last pass) the predicted pipeline had the wrong format and the real one was compiled at the first draw (from d2r-mobile e2a0c9a9b)
 static MTLPixelFormat rt_view_fmt(id<MTLTexture> base, const view_t *v, int has_v) {
+    MTLPixelFormat spf;
+    if (bcrt_view(base, v, has_v, &spf)) return spf;
     if (!base || !has_v || !v->set_format) return base.pixelFormat;
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(v->format, &pf, swz) || !pf || pf == (uint32_t)base.pixelFormat) return base.pixelFormat;
@@ -1969,6 +2020,7 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
     // A view that changes the format is attached as a Metal view of that format (pipeline formats follow the attachment). SMBW's last pass writes the RGBA8 swapchain texture through an RGBA8_SRGB view, so the hardware encodes sRGB on write;
     // attaching the base texture instead stored the linear values as they were and the whole picture came out dark (every value decoded from sRGB once more, on the Mac and the iPhone). The view lives until this submission completes
     if (base && has_v && v->set_format) {
+        if (bcrt_attach(a, base, v, has_v)) return;
         MTLPixelFormat pf = rt_view_fmt(base, v, has_v);
         if (pf != base.pixelFormat) {
             id<MTLTexture> vw = [base newTextureViewWithPixelFormat:pf];
@@ -2117,6 +2169,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     pg_render(pd, (NSUInteger)R.rt.n);
     { void td_note(id pd, NSUInteger nc); td_note(pd, (NSUInteger)R.rt.n);
       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n); }
+    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }   // BC 影子搬入开了拷贝编码器（bcrt_attach） | moving blocks into a BC shadow opened the copy encoder (bcrt_attach)
     ser_gate();
     g_enc = enc_r_begin(pd);
     args_dirty_all();
@@ -2891,6 +2944,38 @@ static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交�
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
 }
+// 片元输出类型的运行时观察：没有 PC 版反射的游戏（王国之泪）作答表里没有片元输出类型，翻译器一律输出浮点，写整数附件的管线 Metal 不给建
+// （首例：三维 BC4 贴图的 GPU 压缩，经 RGBA16UI 视图写块）。建管线失败、且着色器写出的颜色里有整数附件时，记一行「键 <TAB> {颜色号: uint|sint}」到 DM_NVN_FOUT_WANT；
+// dmsh_facts.py --fout-merge 并进游戏档案 shader_fout.tsv，dmsh_build.py 只重出表里变了的键。同一着色器若又画浮点附件，仍会在建管线处报红
+// Runtime observation of fragment output types: for games without PC reflection (TotK) the answer table has no fragment output types, so the translator always outputs float and Metal refuses pipelines that write integer attachments
+// (first case: GPU compression into a 3D BC4 texture, writing blocks through an RGBA16UI view). When building a pipeline fails and a color the shader writes has an integer attachment, append "key <TAB> {color: uint|sint}" to DM_NVN_FOUT_WANT;
+// dmsh_facts.py --fout-merge folds it into the profile's shader_fout.tsv and dmsh_build.py rebuilds only the keys whose rows changed. If the same shader also draws float attachments, that still shows up red where the pipeline is built
+static int mtl_fmt_int_kind(MTLPixelFormat f) {
+    switch (f) {
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR16Uint: case MTLPixelFormatR32Uint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRG32Uint:
+    case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA32Uint: return 1;
+    case MTLPixelFormatR8Sint: case MTLPixelFormatR16Sint: case MTLPixelFormatR32Sint: case MTLPixelFormatRG8Sint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRG32Sint:
+    case MTLPixelFormatRGBA8Sint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Sint: return 2;
+    default: return 0;
+    }
+}
+static void fout_want_note(NvShader *fs, const pso_key *k) {
+    const char *path = getenv("DM_NVN_FOUT_WANT");
+    if (!path || !fs || strlen(fs->key) != 18 || strcmp(fs->key + 16, "_b")) return;   // 只认 B 路线的游戏着色器（键 = 控制段 16 位 + _b） | only route-B game shaders (key = 16 hex digits of the control segment + _b)
+    char line[160]; int n = snprintf(line, sizeof line, "%.16s\t{", fs->key), any = 0;
+    for (int c = 0; c < 8; c++) { int kind = fs->rf.color_mask >> c & 1 ? mtl_fmt_int_kind((MTLPixelFormat)k->cfmt[c]) : 0;
+        if (kind) n += snprintf(line + n, sizeof line - n, "%s\"%d\":\"%s\"", any++ ? "," : "", c, kind == 1 ? "uint" : "sint"); }
+    if (!any) return;
+    snprintf(line + n, sizeof line - n, "}");
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static NSMutableSet<NSString *> *seen;
+    pthread_mutex_lock(&mu);
+    if (!seen) { seen = [NSMutableSet set];
+        for (NSString *l in [[NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:nil] componentsSeparatedByString:@"\n"]) if (l.length) [seen addObject:l]; }
+    int fresh = ![seen containsObject:@(line)];
+    if (fresh) { [seen addObject:@(line)]; FILE *f = fopen(path, "a"); if (f) { fprintf(f, "%s\n", line); fclose(f); } }
+    pthread_mutex_unlock(&mu);
+    if (fresh) MLOG("片元输出要按整数重出：%s（记入 %s）", line, path);
+}
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRenderPassDescriptor *unused);
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRenderPassDescriptor *unused) { AP_B; __unsafe_unretained id<MTLRenderPipelineState> r = pso_get_(pr, unused); AP_E(2); return r; }
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRenderPassDescriptor *unused) {
@@ -2912,7 +2997,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
-    if (!ps) { MLOG("【红】建渲染管线失败（顶点 %s 片元 %s）：%s", vs->key, fs ? fs->key : "-", e.localizedDescription.UTF8String); hm_put_id(&g_pso_fail, &k, NSNull.null); return nil; }
+    if (!ps) { MLOG("【红】建渲染管线失败（顶点 %s 片元 %s）：%s", vs->key, fs ? fs->key : "-", e.localizedDescription.UTF8String); fout_want_note(fs, &k); hm_put_id(&g_pso_fail, &k, NSNull.null); return nil; }
     pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
     pso_record("R\t%s\n", shex);
     pso_user_record("R\t%s\n", shex);

@@ -96,6 +96,7 @@ static class SwshXlate
         }
         public bool QueryHostSupportsTextureShadowLod() => true;
         public bool QueryHostSupportsDepthClipControl() => false;   // Metal 没有 -1..1 裁剪控制：让翻译器在顶点着色器里改写 z（见文件头） | Metal has no -1..1 clip control: have the translator rewrite z in the vertex shader (see the file header)
+        public bool QueryHostSupportsShaderFloat64() => false;   // Metal 没有 double：翻译器把双精度运算降成单精度（DoubleToFloat；王国之泪约 0.7% 的着色器用到） | Metal has no double: the translator lowers double-precision ops to single (DoubleToFloat; about 0.7% of TotK's shaders use them)
         // 作业 reduced = true：放宽精度——翻译器只给强制精确的运算打 NoContraction（缺省全部打：保持 Maxwell 分开舍入的逐位结果，代价是 MSL 里大量禁优化的 spvFMul 等）
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;

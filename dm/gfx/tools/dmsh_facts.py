@@ -6,6 +6,8 @@
 # 用法：dmsh_facts.py --freeze   从 PC 反射重出整张表（维护者用；要 PCCACHE 反射目录、PC DXBC 目录与 vkd3d-compiler）
 #       dmsh_facts.py --check    重算一遍与仓内的表逐键比对，不一致报红退出 1（同上，要 PC 侧输入）
 #       dmsh_facts.py            打印表的行数与各项事实的覆盖数
+#       dmsh_facts.py --fout-merge <文件>   把宿主运行时记下的整数片元输出（DM_NVN_FOUT_WANT）并进游戏档案的 shader_fout.tsv；同一键同一颜色前后类型不一报红退出 1
+#         没有 PC 版的游戏（王国之泪）片元输出类型只有这个来源：load() 把它并进事实（覆盖同键同色的值），出包只重出表里变了的键
 # 行格式：键 <TAB> JSON（键按字典序、紧凑写法；同样的输入逐字节同样的表）
 # Answer table for translation queries (dm/games/<id>/shader_facts.tsv in the game profile folder): one row per Switch shader key, recording the few facts the translator asks for but that cannot be read from the Switch machine code -
 # dimension type of textures / images, image format, component types of vertex attributes and fragment outputs, thread group size and shared memory bytes of compute shaders.
@@ -14,20 +16,30 @@
 # Usage: dmsh_facts.py --freeze   regenerate the whole table from PC reflection (for maintainers; needs the PCCACHE reflection dir, the PC DXBC dir and vkd3d-compiler)
 #       dmsh_facts.py --check    recompute and compare key by key against the in-repo table; on mismatch report a failure and exit 1 (as above, needs the PC-side inputs)
 #       dmsh_facts.py            print the table's row count and the coverage count of each fact
+#       dmsh_facts.py --fout-merge <file>   fold the integer fragment outputs the host recorded at runtime (DM_NVN_FOUT_WANT) into the profile's shader_fout.tsv; the same key and color seen with two types is reported red with exit 1
+#         For games without a PC version (TotK) this is the only source of fragment output types: load() merges it into the facts (overriding the same key and color), and the build rebuilds only the keys whose rows changed
 # Row format: key <TAB> JSON (keys in lexicographic order, compact form; the same input gives a byte-identical table)
 import json, os, re, subprocess, sys
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # 工作区根目录（游戏文件、产物、运行现场都在它下面） | Workspace root (game files, build outputs and run artifacts are all under it)
 HERE = os.path.dirname(os.path.abspath(__file__)); HOME = os.path.expanduser('~')
 sys.path.insert(0, os.path.join(HERE, '../../games')); import game as _game   # 表在当前游戏档案目录（DM_GAME） | the tables are in the current game profile folder (DM_GAME)
-TABLE = str(_game.load().table('shader_facts.tsv')); MAP = str(_game.load().table('shader_map.tsv'))
+TABLE = str(_game.load().table('shader_facts.tsv')); MAP = str(_game.load().table('shader_map.tsv')); FOUT = str(_game.load().table('shader_fout.tsv'))
 TT = {'texture1d': '1d', 'texture1darray': '1darray', 'texture2d': '2d', 'texture2darray': '2darray', 'texture2dms': '2dms',
       'texture2dmsarray': '2dmsarray', 'texture3d': '3d', 'texturecube': 'cube', 'texturecubearray': 'cubearray', 'buffer_typed': 'buffer'}
 CT = {'float': 'float', 'int': 'sint', 'uint': 'uint'}
 
-def load():
-    """键 → 事实字典；表不存在返回空字典 | key → fact dict; returns an empty dict if the table does not exist"""
-    if not os.path.exists(TABLE): return {}
-    return {k: json.loads(v) for k, v in (l.rstrip('\n').split('\t', 1) for l in open(TABLE) if l.strip() and not l.startswith('#'))}
+def read_tsv(path):
+    if not os.path.exists(path): return {}
+    return {k: json.loads(v) for k, v in (l.rstrip('\n').split('\t', 1) for l in open(path) if l.strip() and not l.startswith('#'))}
+
+def load(observed=True):
+    """键 → 事实字典；表不存在返回空字典。observed：并入运行时观察到的片元输出类型（shader_fout.tsv），只有这个来源的键仍记 pc_missing
+    | key → fact dict; returns an empty dict if the table does not exist. observed: merge in the runtime-observed fragment output types (shader_fout.tsv); keys known only from there still carry pc_missing"""
+    t = read_tsv(TABLE)
+    if observed:
+        for k, v in read_tsv(FOUT).items():
+            f = t.setdefault(k, {'pc_missing': True}); f['fout'] = {**f.get('fout', {}), **v}
+    return t
 
 def row(key, facts): return key + '\t' + json.dumps(facts, sort_keys=True, separators=(',', ':'), ensure_ascii=False) + '\n'
 
@@ -84,10 +96,22 @@ if __name__ == '__main__':
         open(TABLE, 'w').write('# 翻译查询的作答表（dmsh_facts.py --freeze 生成，勿手改）：键 <TAB> 事实 JSON\n' + ''.join(row(k, t[k]) for k in sorted(t)))
         print(f'已写 {TABLE}：{len(t)} 键；无配对 PC 反射、未进表 {missing}')
     elif a == ['--check']:
-        t, missing = recompute(); have = load()
+        t, missing = recompute(); have = load(observed=False)
         bad = sorted(k for k in set(t) | set(have) if t.get(k) != have.get(k))
         for k in bad[:10]: print(f'【红】{k}：表 {have.get(k)} / 重算 {t.get(k)}')
         print(f'逐键比对 {len(set(t) | set(have))}：不一致 {len(bad)}；无配对 PC 反射 {missing}'); sys.exit(1 if bad else 0)
     elif not a:
         t = load(); print(f'{len(t)} 键：' + '，'.join(f'{n} {sum(bool(f.get(n)) for f in t.values())}' for n in ('tex', 'img', 'attr', 'fout', 'local', 'shared', 'pc_missing')))
+    elif len(a) == 2 and a[0] == '--fout-merge':
+        have, bad, new = read_tsv(FOUT), 0, 0
+        if not os.path.exists(a[1]): sys.exit(f'【红】没有 {a[1]}（宿主跑时设 DM_NVN_FOUT_WANT）')
+        for ln in open(a[1]):   # 逐行读：同一个键可能记了几行（颜色组合不同） | line by line: one key may have several lines (different color sets)
+            if not ln.strip() or ln.startswith('#'): continue
+            k, v = ln.rstrip('\n').split('\t', 1); cur = have.setdefault(k, {})
+            for c, kind in json.loads(v).items():
+                if cur.get(c, kind) != kind: print(f'【红】{k} 颜色 {c}：表里是 {cur[c]}，又观察到 {kind}（同一着色器画两种附件，一张表答不了）'); bad += 1; continue
+                new += c not in cur; cur[c] = kind
+        open(FOUT, 'w').write('# 运行时观察到的片元输出类型（宿主 DM_NVN_FOUT_WANT → dmsh_facts.py --fout-merge）：键 <TAB> {颜色号: uint|sint} | '
+                              'runtime-observed fragment output types (host DM_NVN_FOUT_WANT → dmsh_facts.py --fout-merge): key <TAB> {color: uint|sint}\n' + ''.join(row(k, have[k]) for k in sorted(have)))
+        print(f'已写 {FOUT}：{len(have)} 键，新增 {new} 项' + (f'，冲突 {bad} 项' if bad else '')); sys.exit(1 if bad else 0)
     else: sys.exit('用法见文件头')
