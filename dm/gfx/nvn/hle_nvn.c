@@ -1228,6 +1228,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(f, "@args_enc", (double)(ae_ - pae)); trow(f, "@args_reuse", (double)(ar_ - par)); pae = ae_; par = ar_;
         static uint64_t puc, pus; uint64_t uc_, us_; mtl_use_stats(&uc_, &us_);
         static uint64_t pdo; uint64_t do_ = mtl_ds_omit(); trow(f, "@ds_omit", (double)(do_ - pdo)); pdo = do_;
+        static uint64_t prs, prt; uint64_t rs_, rt_; mtl_ren_stats(&rs_, &rt_); trow(f, "@ren_skip", (double)(rs_ - prs)); trow(f, "@ren_stale", (double)(rt_ - prt)); prs = rs_; prt = rt_;
         trow(f, "@use_call", (double)(uc_ - puc)); trow(f, "@use_skip", (double)(us_ - pus)); puc = uc_; pus = us_;
         static uint64_t pfa, pre_; uint64_t fa_, pr_, up_, re_; nvn_dirty_stats(&fa_, &pr_); mtl_pkg_stats(&up_, &re_);
         trow(f, "@faults", (double)(fa_ - pfa)); trow(f, "@reuploads", (double)(re_ - pre_)); pfa = fa_; pre_ = re_;
@@ -1480,9 +1481,14 @@ NVN(nvnCommandBufferReportValue, void, NVNcommandBuffer *c, uint32_t v, NVNbuffe
 // Clear a buffer to a 32-bit value: one OP_CLEAR_BUF record, filled in order within the submission at replay (fillBuffer when all bytes match, otherwise copied from a pattern buffer)
 NVN(nvnCommandBufferClearBuffer, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n, uint32_t v) { *REC(c, OP_CLEAR_BUF, p_clear_buf) = (p_clear_buf){a, n, v, 0}; }
 
-// State the replay layer does not have yet: logged once (conditional rendering is treated as "always draw")
-NVN(nvnCommandBufferSetRenderEnable, void, NVNcommandBuffer *c, uint32_t en) { (void)c; if (!(en & 0xff)) ONCE_LOG("【红】SetRenderEnable(false)：宿主暂按恒画"); }
-NVN(nvnCommandBufferSetRenderEnableConditional, void, NVNcommandBuffer *c, NVNconditionalRenderMode m, NVNbufferAddress a) { (void)c; (void)m; (void)a; ONCE_LOG("【红】SetRenderEnableConditional：宿主暂按恒画"); }
+// Render enable: recorded in order, the replay layer gates later draws and clears with it (nvn_mtl.m ren_on). Tears of the Kingdom clears each render target only while
+// its flag differs from the reference 16 bytes on, then reports a timestamp (counter 0) onto the flag, so a target is cleared at most once per frame. Treated as
+// "always draw", the second half-resolution lighting pass and the light-volume pass cleared away the first pass's lighting, and the deferred-lit scene came out black
+NVN(nvnCommandBufferSetRenderEnable, void, NVNcommandBuffer *c, uint32_t en) { *REC(c, OP_RENDER_EN, p_render_en) = (p_render_en){(en & 0xff) ? REN_ALWAYS : REN_NEVER, 0, 0}; }
+NVN(nvnCommandBufferSetRenderEnableConditional, void, NVNcommandBuffer *c, NVNconditionalRenderMode m, NVNbufferAddress a) {
+    if (m != NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_EQUAL && m != NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_NOT_EQUAL) { ONCE_LOG("【红】SetRenderEnableConditional 模式 %d 未知：按恒画", (int)m); m = (NVNconditionalRenderMode)REN_ALWAYS; }
+    *REC(c, OP_RENDER_EN, p_render_en) = (p_render_en){(int32_t)m, 0, a};
+}
 NVN(nvnCommandBufferSetDepthClamp, void, NVNcommandBuffer *c, uint32_t en) { (void)c; if (en & 0xff) ONCE_LOG("SetDepthClamp 开：宿主暂忽略"); }
 NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { (void)c; ONCE_LOG("SetAlphaRef %.3f：宿主没有 alpha 测试（ColorStateSetAlphaTest 只记不用）", r); }
 NVN(nvnCommandBufferSetLineWidth, void, NVNcommandBuffer *c, float w) { (void)c; if (w != 1.0f) ONCE_LOG("SetLineWidth %.2f：Metal 只有 1 像素线", w); }

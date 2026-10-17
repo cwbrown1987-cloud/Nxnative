@@ -421,6 +421,17 @@ static int vis_in_ring(id<MTLBuffer> b) { for (int i = 0; i < g_vis_ring_n; i++)
 static int g_vis_on, g_vis_counting, g_vis_cur = -1; static uint64_t g_vis_cur_pass;
 static vis_slot *g_vs; static int g_nvs, g_vscap;      // Slots since the last reset
 static uint64_t g_cnt_report[32], g_cnt_reset[32];       // Report / reset counts per counter type (diagnostics)
+// ---------- Render enable (OP_RENDER_EN, NVN SetRenderEnable / SetRenderEnableConditional) ----------
+// Draws and clears run only while it holds; the conditional form compares the 64-bit values at addr and addr + 16 (two counter reports, as the Maxwell RENDER_ENABLE compare and Ryujinx's CounterCompare).
+// Reports are written back when their command buffer completes; g_ren_rep holds the reports issued so far in this submission: their memory still has the previous values,
+// so a condition takes the value a report will write when it is known at encode time (timestamps: counter 0), and counts the compare as stale when it is not (samples passed).
+static int g_ren_mode = REN_ALWAYS; static uint64_t g_ren_addr; static int g_ren_known = -1;   // g_ren_known: the evaluated result (−1 = not evaluated since the last change)
+typedef struct { uint64_t addr, val; int known; } ren_rep;
+static ren_rep g_ren_rep[1024]; static int g_ren_nrep;
+#define SP_RING 4096   // Samples-passed reports of recent submissions: address and the fence of their submission (the value is written when it completes)
+typedef struct { uint64_t addr, fence; } sp_rep;
+static sp_rep g_sp_ring[SP_RING]; static uint32_t g_sp_i;
+static uint64_t g_stat_ren_skip, g_stat_ren_stale;
 static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; }
 static vis_list *vis_snapshot(void) {
     vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs;
@@ -492,7 +503,7 @@ void mtl_sub_begin(void) {
     g_commit_blocks = [NSMutableArray array];
     // The overflow buffer created when the previous submission ran out of slots (see g_vis_n >= VIS_SLOTS): retire it. It used to be just cleared here and stayed in the residency set for good (from d2r-mobile 2eb575877)
     if (g_vis && !vis_in_ring(g_vis)) defer_obj_release(g_vis);
-    g_npost = 0; g_vis = nil; g_vis_n = 0; g_vis_cur = -1; g_npend = 0; g_pend_over = 0;
+    g_npost = 0; g_vis = nil; g_vis_n = 0; g_vis_cur = -1; g_npend = 0; g_pend_over = 0; g_ren_nrep = 0;
     zskip_clear(); g_zskip_count = 0;
     int pick = -1;
     for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].fence <= g_done) { pick = i; break; }
@@ -759,7 +770,7 @@ uint64_t mtl_sub_commit(void) {
                 for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
                 free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
             }
-            else { uint64_t t = gpu_ticks(), rec[2] = {ops[i].type == 0 || ops[i].type == 0x10 ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }
+            else { uint64_t t = gpu_ticks(), rec[2] = {0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }   // Timestamps and the other counters: counter 0 (Maxwell writes the semaphore payload, 0), GPU time after it
         }
         free(ops);
         pthread_mutex_lock(&g_mu); if (fence > g_done) g_done = fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
@@ -804,7 +815,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); mtl_init
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[84];
+static int g_red_once[96];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("【红】" __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -2009,9 +2020,9 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         if (!c.texture) continue;
         uint64_t b = att_bytes(c.texture, c.level); natt++; g_bw_store += b; if (c.loadAction == MTLLoadActionLoad) { g_bw_load += b; nload++; }
         if (R.rt.has_cview[i] && R.rt.cview[i].set_format) PD("V %llu c%d 视图格式 %#x（基贴图 NVN 格式 %#x）", g_stat_pass + 1, i, R.rt.cview[i].format, R.rt.color[i]->d.format);
-        PD("P %llu c%d ser=%llu fmt=%lu %lux%lu ms%lu lv%lu sl%lu %s mtl=%p", g_stat_pass + 1, i, R.rt.color[i]->serial, (unsigned long)c.texture.pixelFormat,
+        PD("P %llu c%d ser=%llu fmt=%lu %lux%lu ms%lu lv%lu sl%lu %s mtl=%p mem=%p", g_stat_pass + 1, i, R.rt.color[i]->serial, (unsigned long)c.texture.pixelFormat,
            (unsigned long)c.texture.width, (unsigned long)c.texture.height, (unsigned long)c.texture.sampleCount, (unsigned long)c.level, (unsigned long)c.slice,
-           c.loadAction == MTLLoadActionClear ? "clear" : c.loadAction == MTLLoadActionDontCare ? "dontcare" : "load", (__bridge void *)(c.texture.parentTexture ? c.texture.parentTexture : c.texture));
+           c.loadAction == MTLLoadActionClear ? "clear" : c.loadAction == MTLLoadActionDontCare ? "dontcare" : "load", (__bridge void *)(c.texture.parentTexture ? c.texture.parentTexture : c.texture), (void *)R.rt.color[i]->mem);
     }
     {   // Depth and stencil planes are counted separately (combined format 5 bytes = depth 4 + stencil 1; when only one is attached only that one is counted)
         id<MTLTexture> dt = pd.depthAttachment.texture, stt = pd.stencilAttachment.texture;
@@ -2020,8 +2031,11 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         uint64_t db = dt ? (comb ? whole / 5 * 4 : whole) : 0, sb = stt && stt != dt ? (comb ? whole / 5 : whole) : stt ? whole - db : 0;
         if (dt) { natt++; g_bw_store += db; if (pd.depthAttachment.loadAction == MTLLoadActionLoad) { g_bw_load += db; nload++; } }
         if (stt) { natt += !dt; g_bw_store += sb; if (pd.stencilAttachment.loadAction == MTLLoadActionLoad) { g_bw_load += sb; nload += !dt; } }
-        if (dt) PD("P %llu d ser=%llu fmt=%lu %lux%lu %s", g_stat_pass + 1, R.rt.depth->serial, (unsigned long)dt.pixelFormat,
-                   (unsigned long)dt.width, (unsigned long)dt.height, pd.depthAttachment.loadAction == MTLLoadActionClear ? "clear" : "load");
+        if (dt) PD("P %llu d ser=%llu fmt=%lu %lux%lu %s lv%lu sl%lu mem=%p 视图=%d 层%d+%d 级%d 模式%d:%d", g_stat_pass + 1, R.rt.depth->serial, (unsigned long)dt.pixelFormat,
+                   (unsigned long)dt.width, (unsigned long)dt.height, pd.depthAttachment.loadAction == MTLLoadActionClear ? "clear" : "load",
+                   (unsigned long)pd.depthAttachment.level, (unsigned long)pd.depthAttachment.slice, (void *)R.rt.depth->mem,
+                   R.rt.has_dview, R.rt.has_dview ? R.rt.dview.min_layer : 0, R.rt.has_dview ? R.rt.dview.nlayers : 0, R.rt.has_dview ? R.rt.dview.base_level : 0,
+                   R.rt.has_dview ? R.rt.dview.set_dsmode : 0, R.rt.has_dview ? R.rt.dview.dsmode : 0);
         else if (stt) PD("P %llu s ser=%llu fmt=%lu %lux%lu %s（只挂模板）", g_stat_pass + 1, R.rt.depth->serial, (unsigned long)stt.pixelFormat,
                    (unsigned long)stt.width, (unsigned long)stt.height, pd.stencilAttachment.loadAction == MTLLoadActionClear ? "clear" : "load");
     }
@@ -3357,6 +3371,7 @@ static int ds_scan(const uint8_t *p, ds_st *ds, int depth) {
                 int r = ds_scan((const uint8_t *)t, ds, depth + 1); if (r != DS_RET) return r; break; }
             case OP_SET_RT: case OP_COPY_B2B: case OP_CLEAR_BUF: case OP_UPDATE_UB: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX: case OP_DISPATCH: return DS_FREE;
             case OP_CLEAR_COLOR: case OP_CLEAR_DS: g_ds_why = h.op; return DS_USED;
+            case OP_RENDER_EN: g_ds_why = h.op; return DS_USED;   // Whether later draws and clears run is only known at replay
             case OP_BIND_STATE: { const p_bind_state *b = a; if (b->kind == 5) memcpy(ds, b->bytes, sizeof *ds); break; }
             case OP_DRAW: case OP_DRAW_IDX:   // Depth test / write → depth needed; stencil test → stencil needed; can stop once both are needed
                 g_ds_need |= (ds->dt || ds->dw ? 1 : 0) | (ds->st ? 2 : 0);
@@ -3697,6 +3712,7 @@ typedef struct { uint32_t seq, rtseq; uint64_t ser; const uint8_t *op; uint16_t 
 enum { SDX_READ = 1, SDX_NEED, SDX_ATT, SDX_CLEAR };
 #define SDX_NONE 0xffffffffu
 static sdx_ev *g_sdx, *g_sdx_tmp; static uint32_t g_sdx_n, g_sdx_cap; static int g_sdx_ok;   // Index valid
+static int g_sdx_cond;   // While indexing: a render-enable condition is in force (its clears may not run)
 // Candidate textures (those that have been attachments) -> buckets: open addressing; a texture that has not yet been an attachment when an event occurs is irrelevant to any render pass that ended before then, so it is not recorded
 #define SDX_HB 2048
 static uint64_t g_sdx_hk[SDX_HB]; static uint16_t g_sdx_hb[SDX_HB]; static uint32_t g_sdx_nb, g_sdx_bcnt[SDX_HB + 1], g_sdx_bst[SDX_HB + 1];
@@ -3730,16 +3746,17 @@ static void sdx_walk(const uint8_t *p, int depth) {
                 if (r->depth) sdx_bucket(r->depth->serial, 1);
                 break; }
             case OP_CLEAR_COLOR: { const p_clear_color *c = a; const p_set_rt *r = g_pp_rt;
-                if (!r || (c->mask & 0xf) != 0xf || c->index < 0 || c->index >= r->n || c->index >= 8 || !r->color[c->index]) break;
+                if (g_sdx_cond || !r || (c->mask & 0xf) != 0xf || c->index < 0 || c->index >= r->n || c->index >= 8 || !r->color[c->index]) break;   // g_sdx_cond: a clear under a render-enable condition may not run, so it proves nothing
                 uint16_t lv, sl; sdx_lvsl(&r->cview[c->index], r->has_cview[c->index], &lv, &sl); int last = -1;   // When the same subresource is attached at several indices, the last one counts
                 for (int k = 0; k < r->n && k < 8; k++) { uint16_t l2, s2; if (!r->color[k] || r->color[k]->serial != r->color[c->index]->serial) continue; sdx_lvsl(&r->cview[k], r->has_cview[k], &l2, &s2); if (l2 == lv && s2 == sl) last = k; }
                 if (last == c->index) sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->color[c->index]->serial, p, lv, sl, SDX_CLEAR, 0, 0, 0});
                 break; }
-            case OP_CLEAR_DS: { const p_clear_ds *c = a; const p_set_rt *r = g_pp_rt; if (!r || !r->depth) break;
+            case OP_CLEAR_DS: { const p_clear_ds *c = a; const p_set_rt *r = g_pp_rt; if (g_sdx_cond || !r || !r->depth) break;
                 uint16_t lv, sl; sdx_lvsl(&r->dview, r->has_dview, &lv, &sl);
                 if (c->depth_mask) sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->depth->serial, p, lv, sl, SDX_CLEAR, 1, !r->has_dview, 0});
                 if ((c->stencil_mask & 0xff) == 0xff) sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->depth->serial, p, lv, sl, SDX_CLEAR, 2, !r->has_dview, 0});
                 break; }
+            case OP_RENDER_EN: g_sdx_cond = ((const p_render_en *)a)->mode != REN_ALWAYS; break;
             case OP_BIND_TEX: case OP_BIND_IMG: { const p_bind_handles *b = a; bh_fresh(b); int base = h.op == OP_BIND_IMG ? 128 : 0, lim = h.op == OP_BIND_IMG ? 32 : 128;
                 if (b->stage < 6 && b->first >= 0 && b->first + b->n <= lim) for (int k = 0; k < b->n; k++) g_pp_slot[b->stage][base + b->first + k] = h_ser(b->h[k]);
                 break; }
@@ -3773,7 +3790,7 @@ void mtl_sub_index(const uint64_t *h, int n) {   // Start of submit (hle_nvn.c Q
     memset(g_sdx_hk, 0, sizeof g_sdx_hk); g_sdx_nb = 0;
     for (int i = 0; i < g_xv_n; i++) sdx_bucket(g_xv[i].ser, 1);   // Textures in the ledger enter the candidate set: otherwise, when one is only sampled and not used as an attachment in this submit, its read events are not indexed and the fallback cannot see them
     if (R.has_rt) { for (int k = 0; k < R.rt.n && k < 8; k++) if (R.rt.color[k]) sdx_bucket(R.rt.color[k]->serial, 1); if (R.rt.depth) sdx_bucket(R.rt.depth->serial, 1); }   // The targets at the start of the submit (the first draw may reopen the render pass without going through SetRenderTargets)
-    g_pp_prog = S.prog; g_pp_rt = NULL; g_pp_rtseq = SDX_NONE;
+    g_pp_prog = S.prog; g_pp_rt = NULL; g_pp_rtseq = SDX_NONE; g_sdx_cond = g_ren_mode != REN_ALWAYS;
     for (int st = 0; st < 6; st++) { for (int k = 0; k < 128; k++) g_pp_slot[st][k] = S.tex[st][k] ? h_ser(S.tex[st][k]) : 0;
                                      for (int k = 0; k < 32; k++) g_pp_slot[st][128 + k] = S.img[st][k] ? h_ser(S.img[st][k]) : 0; }
     for (int i = 0; i < n && g_sdx_ok; i++) sdx_walk((const uint8_t *)h[i], 0);
@@ -3840,7 +3857,7 @@ static void hoist_try(void) {
     for (int guard = 0; guard < 200000; guard++) {
         op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
         switch (h.op) {
-            case OP_END: case OP_CALL: case OP_COPY_T2T: case OP_COPY_B2T: case OP_COPY_T2B: case OP_CLEAR_TEX: case OP_DISPATCH: return;
+            case OP_END: case OP_CALL: case OP_COPY_T2T: case OP_COPY_B2T: case OP_COPY_T2B: case OP_CLEAR_TEX: case OP_DISPATCH: case OP_RENDER_EN: return;
             case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
             case OP_DRAW: case OP_DRAW_IDX: if (in_grp) return; break;
             case OP_SCISSOR: sc = *(const p_scissor *)a; has_sc = 1; break;
@@ -4148,7 +4165,7 @@ static void defer_try(const p_draw *dw, const p_draw_idx *di) {
                 for (int k = 0; k < g_defer.nreads && !bad; k++) if (h_ser(g_defer.p_reads[k]) == ds_) bad = 1;
                 if (g_defer.nreads > 512) bad = 1;
                 if (bad) { g_defer.reason = 3; g_defer.reason_op = h.op; goto fail; } break; }
-            case OP_REPORT_COUNTER: case OP_UPDATE_UB: case OP_COPY_B2B: case OP_CLEAR_BUF: case OP_COPY_B2T: case OP_COPY_T2B: case OP_CLEAR_TEX: case OP_DISPATCH: g_defer.reason = 3; g_defer.reason_op = h.op; goto fail;
+            case OP_REPORT_COUNTER: case OP_UPDATE_UB: case OP_COPY_B2B: case OP_CLEAR_BUF: case OP_COPY_B2T: case OP_COPY_T2B: case OP_CLEAR_TEX: case OP_DISPATCH: case OP_RENDER_EN: g_defer.reason = 3; g_defer.reason_op = h.op; goto fail;
             case OP_CLEAR_COLOR: { const p_clear_color *c = a; if (!p_end) { g_defer.reason = 16; goto fail; }   // A clear inside P's continuation segment: do not defer
                 if (c->index >= 0 && c->index < scan_rt.n && (defer_rt_hits_reads(&scan_rt, c->index) || (scan_rt.color[c->index] && defer_rt_hits_reads(&g_defer.p_rt, c->index)))) { g_defer.reason = 5; goto fail; } break; }
             case OP_CLEAR_DS: if (!p_end) { g_defer.reason = 16; goto fail; } break;
@@ -4183,7 +4200,7 @@ q_found:
         // After Q's SetRenderTargets and before its first draw and any clear, another SetRenderTargets arrives (the game sets targets repeatedly, the previous one being an empty render pass): if the new targets still cover P take it as Q, otherwise do not defer
         if (!q_body && h.op == OP_SET_RT && !q_clears) { const p_set_rt *r2 = a; if (!defer_q_superset(r2)) { g_defer.reason = 15; goto fail; } q = r2; qop = p; p += h.size; continue; }
         if (h.op == OP_CLEAR_COLOR || h.op == OP_CLEAR_DS) q_clears = 1;
-        if (!q_body && (h.op == OP_END || h.op == OP_SET_RT || h.op == OP_UPDATE_UB || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_DISPATCH)) { g_defer.reason = 9; g_defer.reason_op = h.op; goto fail; }
+        if (!q_body && (h.op == OP_END || h.op == OP_SET_RT || h.op == OP_UPDATE_UB || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_DISPATCH || h.op == OP_RENDER_EN)) { g_defer.reason = 9; g_defer.reason_op = h.op; goto fail; }
         if (h.op == OP_BIND_PROGRAM) pg = ((const p_bind_program *)a)->prog; else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG) { const p_bind_handles *b = a; bh_fresh(b); int lim = h.op == OP_BIND_IMG ? 32 : 128; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= lim) for (int k = 0; k < b->n; k++) { if (h.op == OP_BIND_IMG) img[b->stage][b->first + k] = b->h[k]; else tex[b->stage][b->first + k] = b->h[k]; } }
         else if (h.op == OP_CLEAR_COLOR) { const p_clear_color *c = a; if (c->index >= 0 && c->index < q->n && q->color[c->index]) for (int i = 0; i < g_defer.p_rt.n; i++) if (g_defer.p_rt.color[i] && sub_eq(q, c->index, &g_defer.p_rt, i)) { g_defer.reason = 10; goto fail; } }
         p += h.size;
@@ -4232,7 +4249,7 @@ static void fuse_try(void) {
         if (!fz_next(&cur, &p, &h, &a)) return;
         switch (h.op) {
             case OP_COPY_T2T: case OP_COPY_B2T: case OP_COPY_T2B: case OP_CLEAR_TEX: case OP_DISPATCH:
-            case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_UPDATE_UB: case OP_COPY_B2B: case OP_CLEAR_BUF: return;
+            case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_UPDATE_UB: case OP_COPY_B2B: case OP_CLEAR_BUF: case OP_RENDER_EN: return;
             case OP_SCISSOR: sc = *(const p_scissor *)a; has_sc = 1; break;
             case OP_SET_RT: {
                 int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
@@ -4252,7 +4269,7 @@ static void fuse_try(void) {
     for (int guard = 0; guard < 200000; guard++) {
         if (h.op == OP_DRAW || h.op == OP_DRAW_IDX) break;
         switch (h.op) {
-            case OP_COPY_T2T: case OP_COPY_B2T: case OP_COPY_T2B: case OP_CLEAR_TEX: case OP_DISPATCH: case OP_SET_RT: case OP_UPDATE_UB: case OP_COPY_B2B: case OP_CLEAR_BUF: return;
+            case OP_COPY_T2T: case OP_COPY_B2T: case OP_COPY_T2B: case OP_CLEAR_TEX: case OP_DISPATCH: case OP_SET_RT: case OP_UPDATE_UB: case OP_COPY_B2B: case OP_CLEAR_BUF: case OP_RENDER_EN: return;
             case OP_SCISSOR: sc = *(const p_scissor *)a; has_sc = 1; break;
             case OP_CLEAR_COLOR: { const p_clear_color *c = a; if (ncl >= 8 || c->index < 0 || c->index >= r2->n || !r2->color[c->index] || c->mask != 0xf) return;
                 const tex_t *t = r2->color[c->index];
@@ -5796,6 +5813,31 @@ static void sub_cut(void) {
     if (!g_cuts++) MLOG("分段提交：首段在帧 %llu 通道 %llu 交出", (unsigned long long)f, (unsigned long long)g_stat_pass);
 }
 
+// Whether draws and clears run now (see OP_RENDER_EN). DM_NVN_COND=0: always (the old behaviour, for A/B comparison).
+// Values: the latest report to that address in this submission when its value is known at encode time (timestamp counters write 0), otherwise memory.
+// A samples-passed result not out yet (reported in this submission, or in one still on the GPU) is unknown: draw (as before; Ryujinx stalls for it instead). Tears of the Kingdom
+// only compares timestamp reports: each render-target clear runs under "flag != 0" and reports a timestamp onto the flag, so a target is cleared at most once per frame
+static int ren_on(void) {
+    static int env = -1; if (env < 0) { const char *e = getenv("DM_NVN_COND"); env = !(e && !strcmp(e, "0")); }
+    if (!env || g_ren_mode == REN_ALWAYS) return 1;
+    if (g_ren_known >= 0) return g_ren_known;
+    if (g_ren_mode == REN_NEVER) return g_ren_known = 0;
+    if (!g_ren_addr) { RED_ONCE(85, "条件渲染的计数地址为 0：按恒画"); return g_ren_known = 1; }
+    uint64_t x, y; memcpy(&x, (const void *)(uintptr_t)g_ren_addr, 8); memcpy(&y, (const void *)(uintptr_t)(g_ren_addr + 16), 8);
+    int stale = g_ren_nrep >= 1024, fx = 0, fy = 0;
+    for (int i = g_ren_nrep - 1; i >= 0 && !(fx && fy); i--) {
+        if (!fx && g_ren_rep[i].addr == g_ren_addr) { fx = 1; if (g_ren_rep[i].known) x = g_ren_rep[i].val; else stale = 1; }
+        if (!fy && g_ren_rep[i].addr == g_ren_addr + 16) { fy = 1; if (g_ren_rep[i].known) y = g_ren_rep[i].val; else stale = 1; } }
+    for (int i = 0; i < SP_RING && !stale; i++) if (g_sp_ring[i].fence > g_done && (g_sp_ring[i].addr == g_ren_addr || g_sp_ring[i].addr == g_ren_addr + 16)
+                                                  && !(g_sp_ring[i].addr == g_ren_addr ? fx : fy)) stale = 1;
+    g_ren_known = stale ? 1 : g_ren_mode == REN_IF_EQUAL ? x == y : x != y;
+    if (stale) g_stat_ren_stale++;
+    { static int once; if (!once++) MLOG("条件渲染：首次求值 %s（帧 %llu 通道 %llu，值 %llu / %llu%s）", g_ren_known ? "画" : "跳过", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass,
+                                         (unsigned long long)x, (unsigned long long)y, stale ? "，样本数未出" : ""); }
+    PD("O %llu 条件渲染 %s 地址=%#llx 值=%llu/%llu%s%s → %s", g_stat_pass, g_ren_mode == REN_IF_EQUAL ? "相等才画" : "不等才画", (unsigned long long)g_ren_addr,
+       (unsigned long long)x, (unsigned long long)y, fx || fy ? "（含本提交已报的值）" : "", stale ? "（样本数未出：照画）" : "", g_ren_known ? "画" : "跳过");
+    return g_ren_known;
+}
 void mtl_exec(const uint8_t *p) {
     static int inited; if (!inited) { inited = 1; state_reset(); }
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
@@ -5829,6 +5871,9 @@ void mtl_exec(const uint8_t *p) {
                 PD("Y signal_event cmd=%p dst=%p mode=%u value=%u", p, val, m, v); mtl_sub_event(val, m, v); break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
+                if (g_ren_nrep < 1024) g_ren_rep[g_ren_nrep++] = (ren_rep){ad, 0, t != NVN_COUNTER_TYPE_SAMPLES_PASSED};
+                if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) g_sp_ring[g_sp_i++ % SP_RING] = (sp_rep){ad, g_fence + 1};   // This submission's fence once committed
+                g_ren_known = -1;
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){3, NULL, 0, 0, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1; }
                 else mtl_sub_counter(ad, (uint32_t)t);
                 break; }
@@ -5859,6 +5904,8 @@ void mtl_exec(const uint8_t *p) {
             }
             case OP_CLEAR_COLOR: {
                 const p_clear_color *c = a;
+                PD("c %llu 清色 目标%d 掩码=%#x 色=%g,%g,%g,%g 通道中=%d", g_stat_pass, c->index, c->mask, c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3], g_enc != nil);
+                if (!ren_on()) { g_stat_ren_skip++; PD("c %llu 条件渲染不成立：清色跳过", g_stat_pass); break; }
                 // A scissored clear to 0 outside a pass with all channels (SMBW clears pyramid levels as sub-rectangles of 480×272 and other targets): copy from the zero buffer into the scissor rectangle in the replay stream
                 if (!g_enc && c->mask == 0xf && !c->rgba[0] && !c->rgba[1] && !c->rgba[2] && !c->rgba[3] && R.has_sc && c->index >= 0 && c->index < R.rt.n && R.rt.color[c->index]
                     && !scissor_full(R.rt.color[c->index], &R.rt.cview[c->index], R.rt.has_cview[c->index]) && clear_rect_zero(c->index)) break;
@@ -5874,6 +5921,8 @@ void mtl_exec(const uint8_t *p) {
             }
             case OP_CLEAR_DS: {
                 const p_clear_ds *c = a;
+                PD("c %llu 深度模板清除 depth=%g dmask=%d stencil=%d smask=%#x 通道中=%d", g_stat_pass, c->depth, c->depth_mask, c->stencil, c->stencil_mask, g_enc != nil);
+                if (!ren_on()) { g_stat_ren_skip++; PD("c %llu 条件渲染不成立：深度模板清除跳过", g_stat_pass); break; }
                 if (g_rt_merged) rp_end();
                 // Depth / stencil clear in the middle of a pass: end the current pass and attach the clear to the start of the next one (color attachments load as usual, as a continued pass does above when a clear arrives). It used to be skipped, and later draws depth-tested against stale depth.
                 // When the scissor does not cover the depth target, Metal's load-action clear cannot express a partial clear; still skipped
@@ -5886,8 +5935,13 @@ void mtl_exec(const uint8_t *p) {
                 if (c->stencil_mask) { R.clear_s = 1; R.cs = (uint32_t)c->stencil; }
                 break;
             }
-            case OP_DRAW: g_exec_next = p + h.size; draw(a, NULL); g_exec_next = NULL; break;   // Lookahead start point
-            case OP_DRAW_IDX: g_exec_next = p + h.size; draw(NULL, a); g_exec_next = NULL; break;
+            case OP_DRAW: if (!ren_on()) { g_stat_ren_skip++; break; } g_exec_next = p + h.size; draw(a, NULL); g_exec_next = NULL; break;   // Lookahead start point
+            case OP_DRAW_IDX: if (!ren_on()) { g_stat_ren_skip++; break; } g_exec_next = p + h.size; draw(NULL, a); g_exec_next = NULL; break;
+            case OP_RENDER_EN: { const p_render_en *e = a;
+                if (e->mode != g_ren_mode || e->addr != g_ren_addr) { g_ren_mode = e->mode; g_ren_addr = e->addr; g_ren_known = -1; }
+                else if (e->mode == REN_IF_EQUAL || e->mode == REN_IF_NOT_EQUAL) g_ren_known = -1;   // Same condition set again: the counters may have changed since, evaluate again
+                PD("O %llu 渲染开关 模式=%d 地址=%#llx", g_stat_pass, e->mode, (unsigned long long)e->addr);
+                break; }
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
             case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
@@ -6646,6 +6700,7 @@ void mtl_present_wait(uint64_t tk) {
 void mtl_present_flush(void) { pthread_mutex_lock(&g_pq_mu); uint64_t h = g_pq_in; pthread_mutex_unlock(&g_pq_mu); mtl_present_wait(h); }
 void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = g_stat_pass; *draws = g_stat_draw; }
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { *enc = g_stat_args_enc; *reuse = g_stat_args_reuse; }
+void mtl_ren_stats(uint64_t *skip, uint64_t *stale) { *skip = g_stat_ren_skip; *stale = g_stat_ren_stale; }
 void mtl_use_stats(uint64_t *call, uint64_t *skip) { *call = 0; *skip = 0; }
 uint64_t mtl_ds_omit(void) { return g_stat_ds_omit; }
 void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full) { *load = g_bw_load; *store = g_bw_store; *full = g_pass_full_rw; }
