@@ -944,7 +944,11 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
     return 1;
 }
 NVN(nvnWindowGetPresentInterval, int, const NVNwindow *w) { return ((const win_t *)w)->interval; }   // Link's Awakening reads it back every frame
-NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (((win_t *)w)->interval != v) LOG("[nvn] 游戏设出图间隔 %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; }
+NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) {
+    if (((win_t *)w)->interval != v) { uint64_t ra = (uint64_t)__builtin_return_address(0); module_t *m = module_of((void *)ra);
+        LOG("[nvn] 游戏设出图间隔 %d → %d（调用点 %s+%#llx）", ((win_t *)w)->interval, v, m ? m->name : "?", m ? (unsigned long long)(ra - (uint64_t)m->base) : (unsigned long long)ra); }
+    ((win_t *)w)->interval = v;
+}
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
     win_t *o = (win_t *)w; int v[4] = {x, y, ww, hh};
     if (memcmp(o->crop, v, sizeof v)) LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh);

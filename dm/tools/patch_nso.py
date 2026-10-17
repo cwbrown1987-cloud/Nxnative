@@ -154,6 +154,17 @@ CUTS = {
     (0x1126748, '1f0d0071', '1f090071', '升档时记的降档目标：cmp w8,#3 → cmp w8,#2', '仅宿主'),
     (0x1126794, '3f0d0071', '3f090071', '降档到 < 3 停 → 到 < 2 停：cmp w9,#3 → cmp w9,#2', '仅宿主'),
   ],
+  # The Legend of Zelda: Tears of the Kingdom 1.4.2 (v655360) main: 60 fps, the same model as Breath of the Wild above. The frame interval controller (main+0x2d4e50, the only caller of
+  # nvnWindowSetPresentInterval at main+0x2d4fc4) turns the last frame's CPU / GPU time into a candidate interval, clamps it to [floor +0x0, ceiling +0x4] (2 and 3 at run time, set as data),
+  # steps up after overrunning frames and down one level at a time to the floor. The game's time step follows the chosen interval, so only the floor changes from 2 to 1: every use of the floor in
+  # the function becomes the constant 1 (the per-frame clamp, the step-down stop, the step-down target recorded on step-up; the target on the other step-down path reads the w8 set at +0x501c).
+  '5cb42b1cf25469fb0635fd046453d843': [
+    (0x2d4ee0, '5f01086b', '5f050071', '帧间隔下限（逐帧夹取）：cmp w10,w8 → cmp w10,#1', '仅宿主'),
+    (0x2d4ee4, '0ab1891a', '2aa59f1a', '帧间隔下限（逐帧夹取）：csel w10,w8,w9,lt → csinc w10,w9,wzr,ge（max(候选, 1)）', '仅宿主'),
+    (0x2d501c, '880240b9', '28008052', '降档停在下限：ldr w8,[x20] → mov w8,#1', '仅宿主'),
+    (0x2d503c, 'bf01086b', 'bf050071', '升档时记的降档目标：cmp w13,w8 → cmp w13,#1', '仅宿主'),
+    (0x2d5048, 'acc1881a', 'acc59f1a', '升档时记的降档目标：csel w12,w13,w8,gt → csinc w12,w13,wzr,gt（max(当前 − 1, 1)）', '仅宿主'),
+  ],
   '56ec24747ec9e7f19b3efb062483a19d': [
     (0x346430, '08fca752', '087ca052', 'AddressRegionManager 构造：节点区上限 mov w8,#0x3fe00000 → mov w8,#0x3e00000', '仅宿主'),
     (0x3464cc, '09fca752', '097ca052', 'AddressRegionManager 构造：节点区登记为已占区域的长度 mov w9,#0x3fe00000 → mov w9,#0x3e00000', '仅宿主'),
