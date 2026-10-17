@@ -1581,7 +1581,7 @@ static void pass_dims(MTL4RenderPassDescriptor *pd, NSUInteger nc, NSUInteger *w
         NSUInteger aw = mip_extent(a.texture.width, a.level), ah = mip_extent(a.texture.height, a.level);
         *w = *w ? MIN(*w, aw) : aw; *h = *h ? MIN(*h, ah) : ah;
     }
-    if (!*w) *w = *h = 1;
+    if (!*w) { *w = MAX(pd.renderTargetWidth, 1); *h = MAX(pd.renderTargetHeight, 1); }   // attachment-less pass: its explicit size
 }
 
 // ---------- DM_NVN_PASSGPU=<file>: per-pass GPU time (stage-boundary timestamp counters) ----------
@@ -1937,6 +1937,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only);
 static id<MTL4RenderCommandEncoder> rp_begin(void) { return rp_begin_ex(0); }
 static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only);
 static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) { AP_B; id<MTL4RenderCommandEncoder> e = rp_begin_ex_(clear_only); AP_E(1); return e; }
+static void bare_dims(NSUInteger *w, NSUInteger *h);
 static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     if (g_enc) return g_enc;
     memset(g_zskip_cand_ok, 0, sizeof g_zskip_cand_ok);
@@ -1998,6 +1999,16 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
                 pd.stencilAttachment.clearStencil = R.cs; pd.stencilAttachment.storeAction = MTLStoreActionStore;
             }
         }
+    }
+    int bare = !any && clear_only != 1 && !R.rt.depth;
+    for (int i = 0; i < R.rt.n && bare; i++) if (R.rt.color[i]) bare = 0;
+    if (bare) {   // No targets set at all (TotK 1.4.2: an agl fragment shader that only stores to a buffer): attachment-less pass covering the viewport, else the scissor
+        NSUInteger bw, bh; bare_dims(&bw, &bh);
+        pd.renderTargetWidth = bw; pd.renderTargetHeight = bh;
+        pd.defaultRasterSampleCount = 1;
+        static int once; if (!once++) MLOG("无附件通道：游戏没设渲染目标就绘制，按视口开 %lux%lu 的通道（首例 通道 %llu）", (unsigned long)pd.renderTargetWidth, (unsigned long)pd.renderTargetHeight, g_stat_pass + 1);
+        PD("P %llu 无附件 %lux%lu", g_stat_pass + 1, (unsigned long)pd.renderTargetWidth, (unsigned long)pd.renderTargetHeight);
+        any = 1;
     }
     if (!any) {
         RED_ONCE(4, "渲染目标都建不出 MTLTexture");
@@ -2091,7 +2102,7 @@ static void rt_dims(NSUInteger *tw, NSUInteger *th) {
         t0 = tex_mtl(R.rt.color[i]); level = R.rt.has_cview[i] && R.rt.cview[i].set_levels ? R.rt.cview[i].base_level : 0;
     }
     if (!t0 && R.rt.depth) { t0 = tex_mtl(R.rt.depth); level = R.rt.has_dview && R.rt.dview.set_levels ? R.rt.dview.base_level : 0; }
-    *tw = t0 ? mip_extent(t0.width, level) : 1; *th = t0 ? mip_extent(t0.height, level) : 1;
+    *tw = t0 ? mip_extent(t0.width, level) : 16384; *th = t0 ? mip_extent(t0.height, level) : 16384;   // no targets: an attachment-less pass can be up to 16384
 }
 // There are pending clears but no draw in the pass: open a pass once to land the clears
 static void rp_flush(void) {
@@ -2647,6 +2658,12 @@ static struct {
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp, depth_clamp;
     float blend_color[4]; int64_t copy_stride, copy_img_stride;
 } S;
+// Size of an attachment-less pass: the viewport's far corner, else the scissor's, clamped to Metal's 1..16384
+static void bare_dims(NSUInteger *w, NSUInteger *h) {
+    double x1 = S.has_vp ? MAX(S.vp[0][0], S.vp[0][0] + S.vp[0][2]) : R.has_sc ? (double)R.sc.x + R.sc.w : 1;
+    double y1 = S.has_vp ? MAX(S.vp[0][1], S.vp[0][1] + S.vp[0][3]) : R.has_sc ? (double)R.sc.y + R.sc.h : 1;
+    *w = (NSUInteger)MIN(MAX(ceil(x1), 1.0), 16384.0); *h = (NSUInteger)MIN(MAX(ceil(y1), 1.0), 16384.0);
+}
 static void udc_note_draw(NvProg *pr) {
     if (R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) { zskip_del(R.rt.color[i]->serial); g_zskip_cand_ok[i] = 0; }   // Zero-source set: once really drawn it is no longer all zeros
     if (pr) for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue; for (int i = 0; i < sh->rf.nb; i++) if (sh->rf.b[i].kind == NVN_RB_IMG) { zskip_clear(); break; } }   // Image slots are writable: conservatively clear
@@ -4964,7 +4981,7 @@ frz_plain:;
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
     g_fd_dw = NULL; g_fd_di = NULL;
-    if (!en) { PD("Z %llu 绘制跳过：没开成渲染通道", g_stat_pass); return; }   // Z lines: why a draw was dropped at these early returns
+    if (!en) { PD("Z %llu 绘制跳过：没开成渲染通道 vs=%.16s fs=%.16s", g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-"); return; }   // Z lines: why a draw was dropped at these early returns
     if (defer_q_draw) defer_replay();
     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
