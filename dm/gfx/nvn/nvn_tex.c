@@ -1,6 +1,9 @@
 // Storage size / alignment / per-level offsets of NVN textures (Tegra X1 block-linear layout).
 // The algorithm is ported from deko3d source/dk_image.cpp (zlib license, Copyright (C) 2018-2020 fincs):
 //   one GOB = 64 bytes × 8 rows = 512 bytes; the block height (tileH, in GOBs) is picked by 'height×1.5'; levels are accumulated with block alignment.
+//   The one deviation from deko3d: 'height×1.5' is rounded down to whole GOBs, as NVN itself does (the layout routine in the game's sdk, 0x48f710 in TotK v0:
+//   h + h/2 ≥ 128 / 64 / 32 / 16 rows → 16 / 8 / 4 / 2 GOBs). deko3d rounds up, which doubles the block height of e.g. a 20-block-row texture
+//   (TotK's 256×78 BC4 charge-flash streak, CPU-written without packaged layout parameters, came out as scrambled blocks).
 // The game's packaged textures (SetPackagedTextureLayout) carry 8 bytes of layout parameters: byte 0 = log2 of the block height (derived by comparing 16 cases from the real game,
 // 4 of which differ from the automatic algorithm); when present it takes precedence.
 #include "nvn_tex.h"
@@ -94,7 +97,7 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
         return;
     }
     unsigned tileH = 0, tileD = 0;
-    if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = d->pkg_block_h ? (unsigned)d->pkg_block_h - 1 : pick_tile((ah + ah / 2 + 7) / 8); }
+    if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = d->pkg_block_h ? (unsigned)d->pkg_block_h - 1 : pick_tile((ah + ah / 2) / 8); }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
     o->tileH = tileH; o->tileD = tileD;
     unsigned levels = d->levels ? d->levels : 1;

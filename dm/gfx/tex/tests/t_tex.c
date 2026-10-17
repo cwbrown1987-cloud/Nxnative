@@ -240,6 +240,23 @@ int main(int argc, char **argv) {
         printf("  E 32³ RGBA16F（选角页调色表形态）块高/块深 %u/%u、存储 %llu（期望 0/4、262144）\n", L.tileH, L.tileD, (unsigned long long)L.size);
     }
 
+    // ---------- F automatic block height (no packaged layout parameters): NVN's own rule, from the layout routine in TotK's sdk (0x48f710 in v0) ----------
+    // h = block rows; h + h/2 ≥ 128 / 64 / 32 / 16 → 16 / 8 / 4 / 2 GOBs (rounded down; deko3d's (h + h/2 + 7) / 8 rounds up and differs right below each threshold)
+    printf("F 自动块高（无预排布参数；NVN 规则：行数×1.5 向下取整到 GOB）\n");
+    {
+        struct { uint32_t h; unsigned want; } T[] = {{10, 0}, {11, 1}, {21, 1}, {22, 2}, {42, 2}, {43, 3}, {85, 3}, {86, 4}};
+        for (unsigned i = 0; i < sizeof T / sizeof *T; i++) {
+            nvn_texdesc d = {1, 0x25, 0, 0, 64, T[i].h, 1, 1, 0, 0}; nvn_texlayout L; nvn_tex_layout(&d, &L);
+            CHECK(L.tileH == T[i].want, "F RGBA8 64×%u 块高 log2 %u，期望 %u", T[i].h, L.tileH, T[i].want);
+            printf("  F RGBA8 64×%-3u（×1.5 = %3u 行）块高 log2 %u %s\n", T[i].h, T[i].h + T[i].h / 2, L.tileH, L.tileH == T[i].want ? "✓" : "✗");
+        }
+        // TotK charge-flash streak (ser 326): BC4 256×78, 9 levels, CPU-written into a CPU-visible pool without layout parameters.
+        // 20 block rows → 30 → 2 GOBs (deko3d's rule: 4 GOBs, which scrambled the streak into blocks); storage 16384 + 4096 + 1024 + 6×512 = 24576 as the game allocated
+        nvn_texdesc d = {1, 0x49, 0, 0, 256, 78, 1, 9, 0, 0}; nvn_texlayout L; nvn_tex_layout(&d, &L);
+        CHECK(L.tileH == 1 && L.size == 24576, "F BC4 256×78 9 级 块高 log2 %u 存储 %llu，期望 1、24576", L.tileH, (unsigned long long)L.size);
+        printf("  F BC4 256×78 9 级（王国之泪蓄力闪光）块高 log2 %u、存储 %llu（期望 1、24576）\n", L.tileH, (unsigned long long)L.size);
+    }
+
     printf("C/D 真数据对拍（Switch 块线性 vs PC 线性）+ 错块高负对照，阈值 %.0f dB\n", PSNR_PASS);
     const char *dir = argc > 1 ? argv[1] : getenv("DM_TEX_SAMPLES");
     char lp[1024]; snprintf(lp, sizeof lp, "%s/list.tsv", dir ? dir : "."); FILE *f = dir ? fopen(lp, "r") : NULL;
