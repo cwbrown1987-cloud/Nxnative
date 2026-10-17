@@ -1489,7 +1489,7 @@ NVN(nvnCommandBufferSetRenderEnableConditional, void, NVNcommandBuffer *c, NVNco
     if (m != NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_EQUAL && m != NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_NOT_EQUAL) { ONCE_LOG("【红】SetRenderEnableConditional 模式 %d 未知：按恒画", (int)m); m = (NVNconditionalRenderMode)REN_ALWAYS; }
     *REC(c, OP_RENDER_EN, p_render_en) = (p_render_en){(int32_t)m, 0, a};
 }
-NVN(nvnCommandBufferSetDepthClamp, void, NVNcommandBuffer *c, uint32_t en) { (void)c; if (en & 0xff) ONCE_LOG("SetDepthClamp 开：宿主暂忽略"); }
+NVN(nvnCommandBufferSetDepthClamp, void, NVNcommandBuffer *c, uint32_t en) { REC(c, OP_DEPTH_CLAMP, p_depth_clamp)->on = (en & 0xff) != 0; }
 NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { (void)c; ONCE_LOG("SetAlphaRef %.3f：宿主没有 alpha 测试（ColorStateSetAlphaTest 只记不用）", r); }
 NVN(nvnCommandBufferSetLineWidth, void, NVNcommandBuffer *c, float w) { (void)c; if (w != 1.0f) ONCE_LOG("SetLineWidth %.2f：Metal 只有 1 像素线", w); }
 NVN(nvnCommandBufferSetPointSize, void, NVNcommandBuffer *c, float s) { (void)c; (void)s; ONCE_LOG("SetPointSize：点大小由着色器给"); }

@@ -2645,7 +2645,7 @@ static struct {
     p_bind_buf ubo[6][16], ssbo[6][16];
     uint64_t tex[6][128], samp[6][128], img[6][32];
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
-    p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp;
+    p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp, depth_clamp;
     float blend_color[4]; int64_t copy_stride, copy_img_stride;
 } S;
 static void udc_note_draw(NvProg *pr) {
@@ -3499,6 +3499,7 @@ static int state_op(uint32_t op, const void *a) {
         case OP_POLY_OFFSET: S.po = *(const p_poly_offset *)a; break;
         case OP_VIEWPORTS: { const p_viewports *b = a; for (int i = 0; i < b->n; i++) memcpy(S.vp[b->first + i], b->v[i], 16); S.has_vp = 1; break; }
         case OP_DEPTH_RANGE: { const p_depth_range *b = a; S.dr[0] = b->n; S.dr[1] = b->f; break; }
+        case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_depth_clamp *)a)->on; break;
         case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
         case OP_COPY_STRIDE: { const p_copy_stride *cs = a; if (cs->image) S.copy_img_stride = cs->stride; else S.copy_stride = cs->stride; break; }
         default: return 0;
@@ -5007,6 +5008,7 @@ frz_plain:;
     enc_r_winding(en, (S.poly.front == NVN_FRONT_FACE_CCW) != atomic_load_explicit(&g_origin_ll, memory_order_relaxed) ? MTLWindingCounterClockwise : MTLWindingClockwise);   // the y flip of lower-left mode reverses the winding
     enc_r_fill(en, S.poly.mode == NVN_POLYGON_MODE_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill);
     if (S.poly.offset_en & 4) enc_r_depth_bias(en, S.po.units, S.po.factor, S.po.clamp); else enc_r_depth_bias(en, 0, 0, 0);
+    enc_r_depth_clip(en, !S.depth_clamp);
     enc_r_blend_color(en, S.blend_color[0], S.blend_color[1], S.blend_color[2], S.blend_color[3]);
     for (int s_ = 0; s_ < 16; s_++) {
         if (!S.vbuf[s_].address) continue;
@@ -5083,10 +5085,10 @@ frz_plain:;
             } }
         if (last_pass != g_stat_pass) {
             last_pass = g_stat_pass;
-            PD("D %llu prim=%d vc=%d inst=%d blend=%#x wm=%#x dt=%d dw=%d df=%d st=%d sc=%lu,%lu,%lu,%lu tgt=%lux%lu vp=%.0f,%.0f,%.0f,%.0f dr=%g,%g", g_stat_pass, prim,
+            PD("D %llu prim=%d vc=%d inst=%d blend=%#x wm=%#x dt=%d dw=%d df=%d st=%d sc=%lu,%lu,%lu,%lu tgt=%lux%lu vp=%.0f,%.0f,%.0f,%.0f dr=%g,%g dc=%d", g_stat_pass, prim,
                dw ? dw->count : di->count, dw ? dw->instances : di->instances, S.color.blend_en, S.chmask.mask, (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, (int)S.ds.st,
                (unsigned long)sc.x, (unsigned long)sc.y, (unsigned long)sc.width, (unsigned long)sc.height, (unsigned long)tw, (unsigned long)th,
-               S.has_vp ? S.vp[0][0] : 0, S.has_vp ? S.vp[0][1] : 0, S.has_vp ? S.vp[0][2] : (float)tw, S.has_vp ? S.vp[0][3] : (float)th, S.dr[0], S.dr[1]);
+               S.has_vp ? S.vp[0][0] : 0, S.has_vp ? S.vp[0][1] : 0, S.has_vp ? S.vp[0][2] : (float)tw, S.has_vp ? S.vp[0][3] : (float)th, S.dr[0], S.dr[1], S.depth_clamp);
         }
     }
     g_kd_force = 0;
@@ -5945,7 +5947,7 @@ void mtl_exec(const uint8_t *p) {
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
             case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
-            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
+            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
                 state_op(h.op, a); break;
             case OP_COPY_B2T: copy_b2t(a); break;
             case OP_COPY_T2B: copy_t2b(a); break;
