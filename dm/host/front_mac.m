@@ -1,7 +1,9 @@
 // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−.
+// Physical controllers (GameController, window mode only) map by position as in iOS DmGamepad.m: bottom B, right A, left Y, top X, Menu = +, View = −; merged with the keyboard, which owns the left stick while WASD is held.
 #import <Cocoa/Cocoa.h>
+#import <GameController/GameController.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #include "dm.h"
@@ -15,8 +17,9 @@ __attribute__((constructor)) static void ui_shift_reg(void) { mtl_set_ui_rect_fn
 #include <signal.h>
 
 static CAMetalLayer *g_layer;
-static uint64_t g_btn;
+static uint64_t g_btn, g_pad_btn;
 static int g_w, g_a, g_s, g_d;
+static int32_t g_pad_lx, g_pad_ly, g_pad_rx, g_pad_ry;   // keyboard and controller callbacks both run on the main thread, so no lock
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 // The original game's 16:9 constants, behavior unchanged; DM_GAME_RES=<width>x<height> (docked mode; handheld scaled by 720/900) is only for side-by-side comparison with iOS widescreen
@@ -27,8 +30,34 @@ uint64_t front_game_res(int docked) {
 }
 
 static void push(void) {
-    int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
-    dm_input_set(g_btn, lx, ly, 0, 0);
+    int wasd = g_w | g_a | g_s | g_d;
+    int32_t lx = wasd ? (g_d - g_a) * 32767 : g_pad_lx, ly = wasd ? (g_w - g_s) * 32767 : g_pad_ly;
+    dm_input_set(g_btn | g_pad_btn, lx, ly, g_pad_rx, g_pad_ry);
+}
+static int32_t axis(float v) { return (int32_t)(fmaxf(-1.f, fminf(1.f, v)) * DM_STICK_MAX); }
+static void read_pad(GCExtendedGamepad *g) {
+    uint64_t m = 0;
+    #define K(btn, bit) if ((btn).isPressed) m |= (bit)
+    K(g.buttonB, DM_BTN_A); K(g.buttonA, DM_BTN_B); K(g.buttonY, DM_BTN_X); K(g.buttonX, DM_BTN_Y);
+    K(g.leftShoulder, DM_BTN_L); K(g.rightShoulder, DM_BTN_R); K(g.leftTrigger, DM_BTN_ZL); K(g.rightTrigger, DM_BTN_ZR);
+    K(g.buttonMenu, DM_BTN_PLUS); if (g.buttonOptions) K(g.buttonOptions, DM_BTN_MINUS);
+    if (g.leftThumbstickButton) K(g.leftThumbstickButton, DM_BTN_LS); if (g.rightThumbstickButton) K(g.rightThumbstickButton, DM_BTN_RS);
+    K(g.dpad.left, DM_BTN_LEFT); K(g.dpad.up, DM_BTN_UP); K(g.dpad.right, DM_BTN_RIGHT); K(g.dpad.down, DM_BTN_DOWN);
+    #undef K
+    g_pad_btn = m; g_pad_lx = axis(g.leftThumbstick.xAxis.value); g_pad_ly = axis(g.leftThumbstick.yAxis.value);
+    g_pad_rx = axis(g.rightThumbstick.xAxis.value); g_pad_ry = axis(g.rightThumbstick.yAxis.value);
+    push();
+}
+static void pad_release(void) { g_pad_btn = 0; g_pad_lx = g_pad_ly = g_pad_rx = g_pad_ry = 0; push(); }
+// On connect / disconnect and when the window regains focus, rebind the handlers and read the current state; an unfocused app gets no controller events, so focus loss releases everything first to avoid stuck keys and sticks
+static void pads_bind(int log) {
+    int any = 0;
+    for (GCController *c in GCController.controllers) if (c.extendedGamepad) {
+        any = 1; c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; read_pad(g); };
+        if (log) LOG("手柄：%s（%s），按位置映射，对游戏是全键手柄", c.vendorName.UTF8String ?: "?", c.productCategory.UTF8String ?: "?");
+        read_pad(c.extendedGamepad);
+    }
+    if (!any) { if (log) LOG("手柄：没有接上的扩展手柄"); pad_release(); }
 }
 static int key_bit(unsigned short code) {
     switch (code) {
@@ -93,10 +122,13 @@ void front_run(void (*guest)(void)) {
                                                       usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1)
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; if (!win.miniaturized) dm_focus_set(2); }];
-        [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(1); }];
+        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; pad_release(); if (!win.miniaturized) dm_focus_set(2); }];
+        [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; pads_bind(0); dm_focus_set(1); }];
         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
         [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); }];
+        [nc addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; pads_bind(1); }];
+        [nc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; pads_bind(1); }];
+        pads_bind(0);   // devices are usually still being discovered at launch; connected controllers report in through the connect notification
         // Guest thread: 64 MiB stack (the Switch main thread stack is specified by npdm; the host gives plenty)
         static guest_arg ga; ga.fn = guest;
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);
