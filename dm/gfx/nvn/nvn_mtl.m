@@ -5001,7 +5001,7 @@ frz_plain:;
     static uint64_t zero_gpu; if (!zero_gpu) zero_gpu = zero.gpuAddress;
     enc_r_vbuf(en, 30, zero_gpu);
     g_kd_force = kd_draw(pr, dw, di);
-    { void ts_draw(const char *); if (pr->sh[1]) ts_draw(pr->sh[1]->key); }
+    { void ts_draw(const char *, NvProg *); if (pr->sh[1]) ts_draw(pr->sh[1]->key, pr); }
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
@@ -5066,10 +5066,10 @@ frz_plain:;
             } }
         if (last_pass != g_stat_pass) {
             last_pass = g_stat_pass;
-            PD("D %llu prim=%d vc=%d inst=%d blend=%#x wm=%#x dt=%d dw=%d df=%d st=%d sc=%lu,%lu,%lu,%lu tgt=%lux%lu vp=%.0f,%.0f,%.0f,%.0f", g_stat_pass, prim,
+            PD("D %llu prim=%d vc=%d inst=%d blend=%#x wm=%#x dt=%d dw=%d df=%d st=%d sc=%lu,%lu,%lu,%lu tgt=%lux%lu vp=%.0f,%.0f,%.0f,%.0f dr=%g,%g", g_stat_pass, prim,
                dw ? dw->count : di->count, dw ? dw->instances : di->instances, S.color.blend_en, S.chmask.mask, (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, (int)S.ds.st,
                (unsigned long)sc.x, (unsigned long)sc.y, (unsigned long)sc.width, (unsigned long)sc.height, (unsigned long)tw, (unsigned long)th,
-               S.has_vp ? S.vp[0][0] : 0, S.has_vp ? S.vp[0][1] : 0, S.has_vp ? S.vp[0][2] : (float)tw, S.has_vp ? S.vp[0][3] : (float)th);
+               S.has_vp ? S.vp[0][0] : 0, S.has_vp ? S.vp[0][1] : 0, S.has_vp ? S.vp[0][2] : (float)tw, S.has_vp ? S.vp[0][3] : (float)th, S.dr[0], S.dr[1]);
         }
     }
     g_kd_force = 0;
@@ -6032,6 +6032,7 @@ static void shot(id<MTLTexture> src, const char *path, int screen, const int cro
 // ---------- DM_NVN_TEXDUMP=frame number:path (%d in the path is replaced with "index*100+mip level"): save each color render target used by that frame as an image ----------
 // Diagnostic: before the first render pass of the next frame is opened, wait for the GPU to finish, then draw each one (the mip level used by that frame) by full-screen sampling into RGBA8 and save as PNG (float formats are clamped to [0,1])
 static long g_td_frame = -2; static const char *g_td_path; static NSMutableArray *g_td_list; static int g_td_done;
+static NSMutableArray *g_ts_sbuf;   // storage buffers copied by pass snapshots (ts_after), saved by td_dump
 static void td_dump(void);
 // DM_NVN_TEXDUMP=size=WxH:path instead picks the frame by content: the first frame that opens a render pass whose first color attachment level is WxH (for one-off work whose frame differs between runs)
 static unsigned g_td_w, g_td_h;
@@ -6072,6 +6073,13 @@ static void td_dump(void) {
         if (!ps) { MLOG("【红】TEXDUMP 管线失败 %s", e.localizedDescription.UTF8String); return; }
     }
     MLOG("[texdump] 帧 %ld 共 %lu 张颜色目标", g_td_frame, (unsigned long)g_td_list.count);
+    for (NSArray *e in g_ts_sbuf) {   // snapshot storage buffers: <path with in-frame index>_sb<stage><slot>.raw, first line "size guest-address"
+        id<MTLBuffer> b = e[0]; char p[1024]; snprintf(p, sizeof p, g_td_path, [e[1] intValue]);
+        char p2[1100]; snprintf(p2, sizeof p2, "%s_sb%d%d.raw", p, [e[2] intValue], [e[3] intValue]);
+        FILE *f = fopen(p2, "wb"); if (f) { fprintf(f, "%lu %#llx\n", (unsigned long)b.length, [e[4] unsignedLongLongValue]); fwrite(b.contents, 1, b.length, f); fclose(f); }
+        MLOG("[texdump] 通道快照存储缓冲 帧内 %d 阶段 %d 槽 %d %lu 字节 → %s", [e[1] intValue], [e[2] intValue], [e[3] intValue], (unsigned long)b.length, p2);
+    }
+    [g_ts_sbuf removeAllObjects];
     // DM_NVN_TEXRAW=index,...: save raw bytes by texture index (including 3D; file: %d in the path is replaced with the index, suffix .raw, first-line text header: width height depth format bytes-per-row)
     for (const char *q = getenv("DM_NVN_TEXRAW"); q && *q; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) {
         if (!strncmp(q, "info", 4)) {   // DM_NVN_TEXRAW=info: the textures remembered by DM_NVN_TEXINFO
@@ -6141,8 +6149,15 @@ static void td_dump(void) {
 static int g_ts_idx[64], g_ts_n = -1, g_ts_on; static uint64_t g_ts_first, g_ts_curf = ~0ull;
 static char g_ts_key[24]; static int g_ts_hit, g_ts_pidx;   // DM_NVN_TEXSNAP=k:<片元着色器键前缀>：用到该着色器的通道都拍（帧内序号随运行变）| k:<fragment shader key prefix>: snapshot every pass that uses that shader (in-frame indices vary between runs)
 static __strong id<MTLTexture> g_ts_att[9]; static uint64_t g_ts_ser[9]; static NSUInteger g_ts_lv[9]; static int g_ts_na;
-void ts_draw(const char *fs_key) {
-    if (g_ts_key[0] && g_ts_na && !g_ts_hit && fs_key && !strncmp(fs_key, g_ts_key, strlen(g_ts_key))) { g_ts_hit = 1; g_ts_on = g_ts_pidx + 1; } }
+// The matched draw's storage buffers (vertex and fragment stage) are copied on the GPU when the pass ends, like the attachments: CPU-side dumps only see the state after the frame
+static struct { uint64_t addr, size; int stage, reg; } g_ts_sb[8]; static int g_ts_nsb;
+void ts_draw(const char *fs_key, NvProg *pr) {
+    if (!(g_ts_key[0] && g_ts_na && !g_ts_hit && fs_key && !strncmp(fs_key, g_ts_key, strlen(g_ts_key)))) return;
+    g_ts_hit = 1; g_ts_on = g_ts_pidx + 1; g_ts_nsb = 0;
+    for (int st = 0; st < 2; st++) { NvShader *sh = pr->sh[st]; if (!sh) continue;
+        for (int i = 0; i < sh->rf.nb && g_ts_nsb < 8; i++) if (sh->rf.b[i].kind == NVN_RB_SBUFP && sh->rf.b[i].reg < 16) {
+            const p_bind_buf *u = &S.ssbo[st][sh->rf.b[i].reg]; if (u->addr && u->size) g_ts_sb[g_ts_nsb++] = (typeof(g_ts_sb[0])){u->addr, u->size, st, sh->rf.b[i].reg}; } }
+}
 void ts_note(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
     if (g_ts_n < 0) { g_ts_n = 0; const char *e = getenv("DM_NVN_TEXSNAP");
         if (e && !strncmp(e, "k:", 2)) { strlcpy(g_ts_key, e + 2, sizeof g_ts_key); e = NULL; }
@@ -6172,6 +6187,15 @@ void ts_after(void) {
         enc_b_copy_texture(blit(), t, 0, lv, MTLOriginMake(0, 0, 0), MTLSizeMake(MAX(t.width >> lv, 1u), MAX(t.height >> lv, 1u), 1), c, 0, lv, MTLOriginMake(0, 0, 0));
         [g_td_list addObject:@[c, @((uint64_t)(g_ts_on - 1) * 1000 + g_ts_ser[i]), @(lv), @0]];   // 第 4 项是层：帧末存图按层取，快照只拷第 0 层 | the 4th item is the layer: the end-of-frame dump reads it, and snapshots copy only slice 0
     }
+    for (int i = 0; i < g_ts_nsb; i++) {
+        void *mb; uint64_t mo; if (!mtl_addr(g_ts_sb[i].addr, g_ts_sb[i].size, &mb, &mo)) continue;
+        id<MTLBuffer> c = [g_dev newBufferWithLength:g_ts_sb[i].size options:MTLResourceStorageModeShared]; if (!c) continue;
+        res_add(c);
+        enc_b_copy_buffer(blit(), (__bridge id<MTLBuffer>)mb, mo, c, 0, g_ts_sb[i].size);
+        if (!g_ts_sbuf) g_ts_sbuf = [NSMutableArray array];
+        [g_ts_sbuf addObject:@[c, @(g_ts_on - 1), @(g_ts_sb[i].stage), @(g_ts_sb[i].reg), @(g_ts_sb[i].addr)]];
+    }
+    g_ts_nsb = 0;
     g_ts_on = 0;
 }
 // Ring of actual presentation times: present sequence number -> presentedTime (seconds; -1 = dropped by the system, not presented)
