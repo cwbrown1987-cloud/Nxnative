@@ -133,7 +133,8 @@ int main(void) {
     EXPECT("事件值：h1(7,+5) h2 拷贝后再跑 h1(7,+5) = 12", 12, P(nvnEventGetValue)(&ev));
     EXPECT("缓冲拷贝 64 B 全等", 0, memcmp(src, dst, 64));
     uint64_t ts[2]; memcpy(ts, cnt, 16);
-    EXPECT("计数器时间戳已写（非 0）", 1, ts[0] != 0 && ts[0] == ts[1]);
+    // Timestamp report = {counter 0 (Maxwell writes the semaphore payload), GPU time}; the old {t, t} broke the game's render-enable compares (TotK A23)
+    EXPECT("计数器时间戳已写（计数 0、时间非 0）", 1, ts[0] == 0 && ts[1] != 0);
 
     // 5b. Sync must hold the CPU back: first queue 24 copies of 64 MiB to keep the GPU busy, with the last one copying src to dst;
     //     the CPU rewrites src only after the fence wait returns. If the wait is released early, that last copy reads the rewritten src.
