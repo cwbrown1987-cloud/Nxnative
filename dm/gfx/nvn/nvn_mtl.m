@@ -2560,16 +2560,18 @@ static id<MTLTexture> tex_fit(int tid, id<MTLTexture> t, MTLTextureType want, ui
     r->alt = (void *)CFBridgingRetain(v); r->alt_of = (__bridge void *)t; r->alt_type = (uint8_t)want; r->alt_rid = v.gpuResourceID._impl;
     *rid = r->alt_rid; return v;
 }
-// Alpha from red: the fragment shaders the game profile's alpha_from_red lists read a single-channel texture whose channel mapping is exactly (R, 0, 0, 1) as (R, 0, 0, R).
-// Breath of the Wild's HUD text shadow (e6a88e12dbae9743): for each prompt the game draws the text into a 198x40 target, blurs it at half size, copies the blurred alpha into the red channel
-// of a 99x20 R8 texture it builds with mapping (R, 0, 0, 1), then draws a black pane whose alpha is that texture's alpha. Read literally, alpha is always 1 and every prompt sits on a hard-edged
-// translucent box (what the port showed, Mac and iPhone alike); in Switch footage the prompts have no boxes, only the soft dark shadow this mask describes.
-// DM_NVN_ALPHA_RED=0 turns it off, <keys,...> replaces the profile's list. Caller holds g_rmu
-static char g_afr_keys[16][20]; static int g_afr_nk = -1;
+// Alpha from red: the fragment shaders the game profile's alpha_from_red lists read a single-channel render target whose channel mapping is exactly (R, 0, 0, 1) as (R, 0, 0, R).
+// Breath of the Wild's layout captures: a layout pane marked CaptureOn (user data "A8", "CaptureScale" 0.5, "MultiFilter"; about 140 layouts) is drawn into an RGBA8 target, blurred at half size,
+// and its alpha copied into the red channel of an R8 texture the game builds with mapping (R, 0, 0, 1); the layout's panes then sample it in place of the FBLayout_00 placeholder.
+// Each HUD prompt bar (PaGuideKey*) draws, per key, a cream glow P_Glow_00 (aa209f57b133e862: colour from the Kumo64 cloud texture, alpha = min(cloud alpha, capture alpha), animated in
+// when the bar appears), then a black shadow P_Sh_00 (e6a88e12dbae9743: alpha = capture alpha), then the text. Read literally, the capture's alpha is always 1: the shadow is a hard-edged box
+// and the glow fills the whole rectangle with cloud (both seen on the iPhone); in Switch footage both follow the text. On the Mac (shrine, bar fade-in) the full list leaves only a glow around the words.
+// Only render targets qualify (captures always are; asset and CPU-written textures are not), so the list can name every layout shader variant. DM_NVN_ALPHA_RED=0 turns it off, <keys,...> replaces the list. Caller holds g_rmu
+static char g_afr_keys[48][20]; static int g_afr_nk = -1;
 static int afr_want(NvShader *sh) {
     if (!sh->afr) {
         if (g_afr_nk < 0) { g_afr_nk = 0; const char *e = getenv("DM_NVN_ALPHA_RED"), *src = e && *e ? e : DM_GAME_ALPHA_FROM_RED;
-            if (strcmp(src, "0")) for (const char *q = src; *q && g_afr_nk < 16;) { size_t n = strcspn(q, ", "); if (n) { if (n > 16) n = 16; memcpy(g_afr_keys[g_afr_nk], q, n); g_afr_keys[g_afr_nk++][n] = 0; } q += n; q += strspn(q, ", "); }
+            if (strcmp(src, "0")) for (const char *q = src; *q && g_afr_nk < 48;) { size_t n = strcspn(q, ", "); if (n) { if (n > 16) n = 16; memcpy(g_afr_keys[g_afr_nk], q, n); g_afr_keys[g_afr_nk++][n] = 0; } q += n; q += strspn(q, ", "); }
             if (g_afr_nk) MLOG("单通道贴图 alpha 取红：%s%s", src, e && *e ? "（DM_NVN_ALPHA_RED）" : "（游戏档案 alpha_from_red）"); }
         sh->afr = 1; for (int i = 0; i < g_afr_nk; i++) if (!strncmp(sh->key, g_afr_keys[i], strlen(g_afr_keys[i]))) sh->afr = 2;
     }
@@ -2579,10 +2581,11 @@ static id<MTLTexture> tex_alpha_red(int tid, id<MTLTexture> t, uint64_t *rid) {
     MTLPixelFormat pf = t.pixelFormat; MTLTextureSwizzleChannels sw = t.swizzle;
     if (pf != MTLPixelFormatR8Unorm && pf != MTLPixelFormatR16Unorm && pf != MTLPixelFormatR16Float && pf != MTLPixelFormatR32Float) return nil;
     if (sw.red != MTLTextureSwizzleRed || sw.green != MTLTextureSwizzleZero || sw.blue != MTLTextureSwizzleZero || sw.alpha != MTLTextureSwizzleOne || tid <= 0 || tid >= g_ntreg) return nil;
+    id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
+    if (!(base.usage & MTLTextureUsageRenderTarget)) return nil;   // packaged and CPU-written textures are built without render-target usage
     treg_t *r = &g_treg[tid];
     if (r->ar && r->ar_of == (__bridge void *)t) { *rid = r->ar_rid; return (__bridge id<MTLTexture>)r->ar; }
     treg_drop_ar(r);
-    id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
     NSUInteger l0 = t.parentTexture ? t.parentRelativeLevel : 0, s0 = t.parentTexture ? t.parentRelativeSlice : 0;
     NSUInteger ns = t.textureType == MTLTextureType3D ? 1 : t.arrayLength * (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray ? 6 : 1);
     id<MTLTexture> v = [base newTextureViewWithPixelFormat:pf textureType:t.textureType levels:NSMakeRange(l0, t.mipmapLevelCount) slices:NSMakeRange(s0, ns)
@@ -3160,6 +3163,7 @@ static uint32_t ubo_handle(int stage, int reg, int off) {
     if (!mtl_addr(u->addr + off, 4, &mb, &mo) || !(base = [(__bridge id<MTLBuffer>)mb contents])) return 0;
     uint32_t h; memcpy(&h, base + mo, 4); return h;
 }
+static uint32_t g_dispatch_dim[3];   // the current dispatch's workgroup counts (driver segment c0 + 0x200 for compute)
 static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex);
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) { AP_B; int r = encode_args_(en, sh, nvn_stage, metal_vertex); AP_E(3); return r; }
 static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
@@ -3263,6 +3267,13 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                     int base = DM_GAME_NVN_SSBO_BASE(nvn_stage);   // game profile nvn_ssbo_bases (Mario: vertex 0x110, pixel 0x510, compute 0x310)
                     if (base < 0) RED_ONCE(45, "阶段 %d 的着色器读驱动段 c0，存储缓冲表基址未实测", nvn_stage);
                     else for (int r = 0; r < 16; r++) { uint64_t a = S.ssbo[nvn_stage][r].addr; uint32_t n = (uint32_t)S.ssbo[nvn_stage][r].size; memcpy(d + base + 16 * r, &a, 8); memcpy(d + base + 16 * r + 8, &n, 4); }
+                    // Compute also has the dispatch size at 0x200 (x, y, z) and the uniform buffer table at 0x210 + 16 r (address 64 bits, size 32 bits), ending where the storage buffer table
+                    // starts (0x310). Measured on Link's Awakening's light culling (light_culling_compute.bfsha): tile index = workgroup y × c0[0x200] + workgroup x, and c0[0x280] is
+                    // the address of uniform buffer 7 (the light parameters, 144 bytes per light); Breath of the Wild's compute shaders read 0x280 / 0x290 / 0x2d0 of the same table
+                    if (nvn_stage == 5) {
+                        memcpy(d + 0x200, g_dispatch_dim, 12);
+                        for (int r = 0; r < 16; r++) { uint64_t a = S.ubo[5][r].addr; uint32_t n = (uint32_t)S.ubo[5][r].size; memcpy(d + 0x210 + 16 * r, &a, 8); memcpy(d + 0x210 + 16 * r + 8, &n, 4); }
+                    }
                 } else {
                     for (int r = 0; r < DM_GAME_NVN_TEX_SLOTS; r++) { uint32_t th = (uint32_t)S.tex[nvn_stage][r]; memcpy(d + DM_GAME_NVN_TEX_BASE + 8 * r, &th, 4); }
                     for (int r = 0; r < DM_GAME_NVN_IMG_SLOTS; r++) { uint32_t ih = (uint32_t)S.img[nvn_stage][r]; memcpy(d + DM_GAME_NVN_IMG_BASE + 8 * r, &ih, 4); }   // This game (NVN 55): texture handle table at 0x20 + 8 r (dm/gfx/tools/dmsh_build.py TEX_BASE)
@@ -5282,6 +5293,7 @@ static void dispatch(const p_dispatch *dp) {
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     id<MTLComputeCommandEncoder> ce = pg_compute();
     enc_c_pso(ce, ps);
+    g_dispatch_dim[0] = (uint32_t)dp->x; g_dispatch_dim[1] = (uint32_t)dp->y; g_dispatch_dim[2] = (uint32_t)dp->z;   // read back by the driver segment c0 (encode_args_)
     encode_args(ce, cs, 5, 0);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
     enc_c_end(ce);
@@ -5403,7 +5415,9 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
 // Texture copies a blit cannot do -- a format change, a scaled region or a mirrored one (MIRROR_X / MIRROR_Y) (Link's Awakening converts its 1408x792 RG11B10F scene to RGBA16F every frame; Super Mario 3D World scales 1920x1080 to 1280x720
 // when leaving the title): one render pass per layer that draws the source region into the destination region, nearest or (LINEAR_FILTER) bilinear. Float, unorm and sRGB formats only, 2D / 2D array,
 // destinations that can be render targets; anything else returns 0 and keeps the red line. Depth (Depth32Float / Depth32Float_Stencil8 into the same format) is drawn by writing depth from the fragment shader,
-// always nearest; stencil is not carried over (Link's Awakening halves its 1408x792 depth-stencil buffer to 704x396)
+// always nearest, and stencil is written from the fragment shader too ([[stencil]] export, read through an X32_Stencil8 view of the source). Link's Awakening halves its depth-stencil buffer twice
+// (1920x1080 → 960x540 → 480x270) and its depth-of-field mask pass only writes where stencil bit 1 is clear: with the stencil left as the new texture's undefined content, the mask kept its
+// clear value 1.0 (full blur) everywhere and the whole picture was out of focus. Without a stencil view the stencil is cleared to 0 instead
 static int fmt_int_or_ds(MTLPixelFormat f) {
     switch (f) {
         case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
@@ -5415,7 +5429,7 @@ static int fmt_int_or_ds(MTLPixelFormat f) {
     }
 }
 static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsigned ss, unsigned dl, unsigned ds, const NVNcopyRegion *sr, const NVNcopyRegion *dr, int linear, int mirror) {
-    static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *pso; static id<MTLFunction> vf, ff, fd; static id<MTLSamplerState> samp[2]; static id<MTL4ArgumentTable> at; static id<MTLDepthStencilState> dss; static int failed;
+    static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *pso; static id<MTLFunction> vf, ff, fd, fds; static id<MTLSamplerState> samp[2]; static id<MTL4ArgumentTable> at; static id<MTLDepthStencilState> dss, dss_s; static int failed;
     if (failed || sr->width <= 0 || sr->height <= 0 || dr->width <= 0 || dr->height <= 0) return 0;
     int depth = (s.pixelFormat == MTLPixelFormatDepth32Float || s.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) && d.pixelFormat == s.pixelFormat, stencil = depth && d.pixelFormat == MTLPixelFormatDepth32Float_Stencil8;
     if (!depth && (fmt_int_or_ds(s.pixelFormat) || fmt_int_or_ds(d.pixelFormat))) return 0;
@@ -5430,23 +5444,32 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
             "  float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; return t.sample(s, st / p[1].zw, level(0)); }\n"
             "struct D { float d [[depth(any)]]; };\n"
             "fragment D fsd(V in [[stage_in]], depth2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant float4 *p [[buffer(0)]]) {\n"
-            "  float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; D o; o.d = t.sample(s, st / p[1].zw, level(0)); return o; }\n";
+            "  float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; D o; o.d = t.read(uint2(st)); return o; }\n"
+            "struct DS { float d [[depth(any)]]; uint s [[stencil]]; };\n"
+            "fragment DS fsds(V in [[stage_in]], depth2d<float> t [[texture(0)]], texture2d<uint> ts [[texture(1)]], constant float4 *p [[buffer(0)]]) {\n"
+            "  float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; DS o; o.d = t.read(uint2(st)); o.s = ts.read(uint2(st)).r; return o; }\n";
         NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src) options:nil error:&e];
-        vf = [lib newFunctionWithName:@"vs"]; ff = [lib newFunctionWithName:@"fs"]; fd = [lib newFunctionWithName:@"fsd"];
+        vf = [lib newFunctionWithName:@"vs"]; ff = [lib newFunctionWithName:@"fs"]; fd = [lib newFunctionWithName:@"fsd"]; fds = [lib newFunctionWithName:@"fsds"];
         MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new]; dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES; dss = [g_dev newDepthStencilStateWithDescriptor:dd];
-        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1; ad.maxSamplerStateBindCount = 1; ad.maxBufferBindCount = 1; at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
+        MTLStencilDescriptor *sd_ = [MTLStencilDescriptor new]; sd_.stencilCompareFunction = MTLCompareFunctionAlways; sd_.depthStencilPassOperation = MTLStencilOperationReplace;   // Replace writes the [[stencil]] output
+        dd.frontFaceStencil = dd.backFaceStencil = sd_; dss_s = [g_dev newDepthStencilStateWithDescriptor:dd];
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 2; ad.maxSamplerStateBindCount = 1; ad.maxBufferBindCount = 1; at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
         for (int i = 0; i < 2; i++) { MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = i ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
             sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge; sd.supportArgumentBuffers = YES; samp[i] = [g_dev newSamplerStateWithDescriptor:sd]; }
-        if (!vf || !ff || !fd || !dss || !at || !samp[0] || !samp[1]) { failed = 1; MLOG("【红】换格式 / 缩放贴图拷贝的管线建不出：%s", e.localizedDescription.UTF8String); return 0; }
+        if (!vf || !ff || !fd || !fds || !dss || !dss_s || !at || !samp[0] || !samp[1]) { failed = 1; MLOG("【红】换格式 / 缩放贴图拷贝的管线建不出：%s", e.localizedDescription.UTF8String); return 0; }
         pso = [NSMutableDictionary dictionary];
     }
-    id<MTLRenderPipelineState> ps = pso[@(d.pixelFormat)];
+    // Stencil: read through a stencil-only view of the source (one per layer below); without one it is cleared to 0
+    id<MTLTexture> stv0 = stencil && s.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? [s newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8 textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss + sr->zoffset, 1)] : nil;
+    int scopy = stv0 != nil;
+    NSNumber *pk = @(d.pixelFormat * 2 + scopy);
+    id<MTLRenderPipelineState> ps = pso[pk];
     if (!ps) {
-        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = vf; pd.fragmentFunction = depth ? fd : ff;
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = vf; pd.fragmentFunction = depth ? (scopy ? fds : fd) : ff;
         if (depth) { pd.depthAttachmentPixelFormat = d.pixelFormat; if (stencil) pd.stencilAttachmentPixelFormat = d.pixelFormat; } else pd.colorAttachments[0].pixelFormat = d.pixelFormat;
         NSError *e = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         if (!ps) { RED_ONCE(83, "换格式 / 缩放贴图拷贝：目标格式 %lu 的管线建不出：%s", (unsigned long)d.pixelFormat, e.localizedDescription.UTF8String); return 0; }
-        pso[@(d.pixelFormat)] = ps;
+        pso[pk] = ps;
     }
     unsigned sw = MAX(s.width >> sl, 1ul), sh = MAX(s.height >> sl, 1ul), dw = MAX(d.width >> dl, 1ul), dh = MAX(d.height >> dl, 1ul);
     if ((unsigned)(dr->xoffset + dr->width) > dw || (unsigned)(dr->yoffset + dr->height) > dh) return 0;
@@ -5464,19 +5487,20 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
         MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
         MTLRenderPassAttachmentDescriptor *a = depth ? (MTLRenderPassAttachmentDescriptor *)rp.depthAttachment : (MTLRenderPassAttachmentDescriptor *)rp.colorAttachments[0];
         a.texture = d; a.level = dl; a.slice = ds + dr->zoffset + z; a.loadAction = MTLLoadActionLoad; a.storeAction = MTLStoreActionStore;
-        if (stencil) { MTLRenderPassStencilAttachmentDescriptor *st = rp.stencilAttachment; st.texture = d; st.level = dl; st.slice = a.slice; st.loadAction = MTLLoadActionLoad; st.storeAction = MTLStoreActionStore; }
+        id<MTLTexture> stv = scopy ? (z ? [s newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8 textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss + sr->zoffset + z, 1)] : stv0) : nil;
+        if (stencil) { MTLRenderPassStencilAttachmentDescriptor *st = rp.stencilAttachment; st.texture = d; st.level = dl; st.slice = a.slice; st.loadAction = scopy ? MTLLoadActionLoad : MTLLoadActionClear; st.clearStencil = 0; st.storeAction = MTLStoreActionStore; }
         ser_gate(); id<MTL4RenderCommandEncoder> en = enc_r_begin(rp);
-        if (depth) [en setDepthStencilState:dss];
+        if (depth) [en setDepthStencilState:scopy ? dss_s : dss];
         [en setArgumentTable:at atStages:MTLRenderStageFragment];
-        [at setTexture:sv.gpuResourceID atIndex:0]; [at setSamplerState:samp[!!linear && !depth].gpuResourceID atIndex:0]; [at setAddress:pb.gpuAddress atIndex:0];
+        [at setTexture:sv.gpuResourceID atIndex:0]; if (stv) [at setTexture:stv.gpuResourceID atIndex:1]; [at setSamplerState:samp[!!linear && !depth].gpuResourceID atIndex:0]; [at setAddress:pb.gpuAddress atIndex:0];
         [en setViewport:(MTLViewport){dr->xoffset, dr->yoffset, dr->width, dr->height, 0, 1}];
         [en setScissorRect:(MTLScissorRect){(NSUInteger)dr->xoffset, (NSUInteger)dr->yoffset, (NSUInteger)dr->width, (NSUInteger)dr->height}];
         [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; enc_r_end(en);
-        defer_obj_unref(sv); defer_obj_release(pb);   // released after this submission has run
+        defer_obj_unref(sv); if (stv) defer_obj_unref(stv); defer_obj_release(pb);   // released after this submission has run
     }
     args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
     { static int once[2]; if (!once[depth]++) MLOG("换格式 / 缩放贴图拷贝：首例 %dx%d 格式 %lu → %dx%d 格式 %lu%s%s", sr->width, sr->height, (unsigned long)s.pixelFormat, dr->width, dr->height, (unsigned long)d.pixelFormat,
-                                                    linear && !depth ? "（双线性）" : "", stencil ? "（只拷深度，模板不拷）" : ""); }
+                                                    linear && !depth ? "（双线性）" : "", stencil ? (scopy ? "（深度 + 模板）" : "（模板建不出视图，清成 0）") : ""); }
     return 1;
 }
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
