@@ -107,6 +107,8 @@ HLE("getentropy", int, g_getentropy, void *p, size_t n) {
     for (size_t i = 0; i < n; i += 8) { uint64_t v = dm_entropy64(); memcpy((uint8_t *)p + i, &v, n - i < 8 ? n - i : 8); }
     return 0;
 }
+// The SDK asks the csrng service; SDK 20's libc reaches it from exit / fflush (TotK 1.4.2)
+HLE_FORCE("_ZN2nn6crypto36GenerateCryptographicallyRandomBytesEPvm", "加密随机数（csrng 服务）→ 宿主熵源", void, h_crypto_random, void *p, size_t n) { g_getentropy(p, n); }
 
 // ---------- nn::mem::StandardAllocator::Allocate(size): 13 Sentinels' large blocks aligned to 64 KB ----------
 // 13 Sentinels 1.10's own malloc (main 4b632573…, main+0x310550) is StandardAllocator::Allocate(size). It gets the storage of a GPU memory pool from malloc rounded only to 4 KB (main+0x3073b8),
