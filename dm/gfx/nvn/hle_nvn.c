@@ -7,7 +7,8 @@
 // Metal command buffer (nvn_mtl.m): buffer copies / uniform updates go through blit (GPU ordering), event value writes / counters are written after the GPU completes;
 // sync object = submit fence value, and waits are released only after the GPU completes.
 // Every implementation gets a compile-time signature check against the prototypes in nvn_protos.h (NVNboolean parameters are received as uint32_t, only the low 8 bits are looked at).
-// Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation.
+// Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation;
+// DM_NVN_TEXCENSUS=path writes every distinct texture configuration the game initialises (for replaying them through the original driver, dm/tools/nvn_layout_diff.py).
 #include "../../host/hle.h"
 #include "nvn_protos.h"
 #include "nvn_count.h"
@@ -230,6 +231,27 @@ NVN(nvnTextureBuilderGetStorageAlignment, size_t, const NVNtextureBuilder *b) {
 }
 #define TX(t) ((tex_t *)(t))
 #define CTX(t) ((const tex_t *)(t))
+// DM_NVN_TEXCENSUS: one line per distinct (target format flags samples width height depth levels stride layout bytes), with the host's size
+static void tex_census(const tex_builder_t *s, const nvn_texlayout *L) {
+    static FILE *f; static int on = -1; static uint64_t seen[8192]; static unsigned nseen; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    if (on < 0) { const char *p = getenv("DM_NVN_TEXCENSUS"); on = p && (f = fopen(p, "w")) != NULL; }
+    if (!on) return;
+    const nvn_texdesc *d = &s->d;
+    uint64_t k = 1469598103934665603ull;
+    const uint32_t v[] = {(uint32_t)d->target, (uint32_t)d->format, (uint32_t)d->flags, (uint32_t)d->samples, d->width, d->height, d->depth,
+                          d->levels, d->stride, (uint32_t)s->has_layout, s->layout[0], s->layout[1]};
+    for (unsigned i = 0; i < sizeof v / sizeof *v; i++) k = (k ^ v[i]) * 1099511628211ull;
+    pthread_mutex_lock(&mu);
+    unsigned i = 0;
+    while (i < nseen && seen[i] != k) i++;
+    if (i == nseen && nseen < sizeof seen / sizeof *seen) {
+        seen[nseen++] = k;
+        fprintf(f, "%d %#x %#x %d %u %u %u %u %u %s%02x%02x %#llx\n", d->target, d->format, d->flags, d->samples, d->width, d->height, d->depth,
+                d->levels, d->stride, s->has_layout ? "" : "-", s->layout[0], s->layout[1], (unsigned long long)L->size);
+        fflush(f);
+    }
+    pthread_mutex_unlock(&mu);
+}
 NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b) {
     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
     // Re-initializing a texture object that is still live (without a Finalize first): release the host texture of the old serial first. SMBW re-initializes its transient render targets on the same object every frame and never Finalizes them;
@@ -239,6 +261,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8); o->set_swz = s->set_swz; o->swz = s->swz;
     nvn_tex_layout(&o->d, &o->L);
+    tex_census(s, &o->L);
     o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
     o->serial = nvn_new_serial();
     // See SetPackagedTextureData. Linear textures are not re-uploaded as packaged: in a CPU-visible pool they are created on the pool buffer (tex_linear) and read what was copied in
