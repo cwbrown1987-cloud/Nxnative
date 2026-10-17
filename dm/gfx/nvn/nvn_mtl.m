@@ -2151,6 +2151,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
             any = 1;
             pd.depthAttachment.loadAction = R.clear_d ? MTLLoadActionClear : MTLLoadActionLoad;
             pd.depthAttachment.clearDepth = R.cd; pd.depthAttachment.storeAction = MTLStoreActionStore;
+            if (R.clear_d) PD("C %llu d 清成 %g", g_stat_pass + 1, R.cd);
             MTLPixelFormat pf = pd.depthAttachment.texture.pixelFormat;
             if (clear_only != 4 && (pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatStencil8)) {   // 4：只挂深度 | 4: depth only
                 pd.stencilAttachment.texture = pd.depthAttachment.texture; pd.stencilAttachment.level = pd.depthAttachment.level;
@@ -2918,10 +2919,8 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
         if (nk < 0) { nk = 0; const char *e = getenv("DM_NVN_HILITE");
             for (const char *q = e; q && *q && nk < 6; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 23) n = 23; memcpy(keys[nk], q, n); keys[nk++][n] = 0; } }
         for (int i = 0; i < nk; i++) if (!strncmp(fs->key, keys[i], strlen(keys[i]))) {
-            if (!hl) { NSError *e = nil; hl = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nstruct O { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; float4 c2 [[color(2)]]; };\n"
-                "fragment O hl0() { return {float4(1,0,1,1),float4(1,0,1,1),float4(1,0,1,1)}; } fragment O hl1() { return {float4(0,1,0,1),float4(0,1,0,1),float4(0,1,0,1)}; }\n"
-                "fragment O hl2() { return {float4(0,1,1,1),float4(0,1,1,1),float4(0,1,1,1)}; } fragment O hl3() { return {float4(1,1,0,1),float4(1,1,0,1),float4(1,1,0,1)}; }\n"
-                "fragment O hl4() { return {float4(0,0,1,1),float4(0,0,1,1),float4(0,0,1,1)}; } fragment O hl5() { return {float4(1,1,1,1),float4(1,1,1,1),float4(1,1,1,1)}; }\n" options:nil error:&e];
+            if (!hl) { NSError *e = nil; hl = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nstruct O { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; float4 c2 [[color(2)]]; float4 c3 [[color(3)]]; float4 c4 [[color(4)]]; float4 c5 [[color(5)]]; float4 c6 [[color(6)]]; float4 c7 [[color(7)]]; };\n#define K(n, v) fragment O hl##n() { float4 c = v; return {c, c, c, c, c, c, c, c}; }\n"
+                "K(0, float4(1,0,1,1)) K(1, float4(0,1,0,1)) K(2, float4(0,1,1,1)) K(3, float4(1,1,0,1)) K(4, float4(0,0,1,1)) K(5, float4(1,1,1,1))\n" options:nil error:&e];
                 if (!hl) MLOG("【红】HILITE 着色器编译失败 %s", e.localizedDescription.UTF8String); }
             if (hl) d.fragmentFunction = [hl newFunctionWithName:[NSString stringWithFormat:@"hl%d", i]];
             break; } }
@@ -4912,6 +4911,13 @@ static int kd_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     for (int stg = 0; stg < 2; stg++) { NvShader *sh = pr->sh[stg]; if (!sh) continue;
         for (int i = 0; i < sh->rf.nb; i++) if (sh->rf.b[i].kind == NVN_RB_CBUF && sh->rf.b[i].reg < 16) {
             const p_bind_buf *u = &S.ubo[stg][sh->rf.b[i].reg]; kd_floats(stg ? "片元 uniform" : "顶点 uniform", sh->rf.b[i].reg, u->addr, u->size, 4096); } }
+    for (int stg = 0; stg < 2; stg++) { NvShader *sh = pr->sh[stg]; if (!sh) continue;   // 存储缓冲：按 4 个 int 一组打前 32 组（分块、计数一类数据多是整数）| storage buffers: first 32 groups of 4 ints (tile / counter data is mostly integers)
+        for (int i = 0; i < sh->rf.nb; i++) if (sh->rf.b[i].kind == NVN_RB_SBUFP && sh->rf.b[i].reg < 16) {
+            const p_bind_buf *u = &S.ssbo[stg][sh->rf.b[i].reg]; void *mb; uint64_t mo; const int32_t *v;
+            if (!u->addr || !mtl_addr(u->addr, 1, &mb, &mo)) { fprintf(stderr, "[kd]   %s 存储 r%d 未绑或不在池\n", stg ? "片元" : "顶点", sh->rf.b[i].reg); continue; }
+            v = (const int32_t *)((const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo);
+            fprintf(stderr, "[kd]   %s 存储 r%d addr=%#llx size=%u%s\n", stg ? "片元" : "顶点", sh->rf.b[i].reg, (unsigned long long)u->addr, (unsigned)u->size, pend_hits(u->addr, u->size) ? "（本提交里还有待执行的写）" : "");
+            for (int k = 0; k < 32 && (k + 1) * 16 <= (int)u->size; k++) fprintf(stderr, "[kd]     #%d %d %d %d %d\n", k, v[4 * k], v[4 * k + 1], v[4 * k + 2], v[4 * k + 3]); } }
     return 1;
 }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
@@ -5087,6 +5093,7 @@ frz_plain:;
     static uint64_t zero_gpu; if (!zero_gpu) zero_gpu = zero.gpuAddress;
     enc_r_vbuf(en, 30, zero_gpu);
     g_kd_force = kd_draw(pr, dw, di);
+    { void ts_draw(const char *); if (pr->sh[1]) ts_draw(pr->sh[1]->key); }
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
     // 参数绑定在登记表锁内捕获实际资源；资格判断到绑定期间有版本变化，则在任何GPU draw前切开重试。
@@ -6149,6 +6156,19 @@ static void td_dump(void) {
         id<MTLTexture> t = e[0]; uint64_t ser = [e[1] unsignedLongLongValue]; NSUInteger lv = [e[2] unsignedIntegerValue], sl = [e[3] unsignedIntegerValue];
         // 二维数组按挂上的那一层存（文件序号 序号*100 + 层*10 + 级；第 0 层与二维同名）| 2D arrays are saved by the attached layer (file index ser*100 + layer*10 + level; layer 0 is named like 2D)
         if (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray) { MLOG("[texdump] ser=%llu 类型 %lu 跳过", ser, (unsigned long)t.textureType); continue; }
+        int is_depth = t.pixelFormat == MTLPixelFormatDepth32Float || t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 || t.pixelFormat == MTLPixelFormatDepth16Unorm;
+        if (is_depth) {   // 深度：只存深度平面（头里记 55 = R32Float 或 250 = Depth16Unorm），不转图 | depth: save only the depth plane (header records 55 = R32Float or 250 = Depth16Unorm), no image
+            NSUInteger rw = MAX(t.width >> lv, 1u), rh = MAX(t.height >> lv, 1u), bp = t.pixelFormat == MTLPixelFormatDepth16Unorm ? 2 : 4;
+            id<MTLBuffer> rb = [g_dev newBufferWithLength:rw * rh * bp options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> rc = q_cb(); id<MTLBlitCommandEncoder> bb = [rc blitCommandEncoder];
+            [bb copyFromTexture:t sourceSlice:0 sourceLevel:lv sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(rw, rh, 1) toBuffer:rb destinationOffset:0 destinationBytesPerRow:rw * bp destinationBytesPerImage:rw * rh * bp
+                        options:t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone];
+            [bb endEncoding]; [rc commit]; [rc waitUntilCompleted];
+            char rp_[1024]; snprintf(rp_, sizeof rp_, g_td_path, (int)(ser * 100 + lv)); strlcat(rp_, ".raw", sizeof rp_);
+            FILE *f = fopen(rp_, "wb"); if (f) { fprintf(f, "%lu %lu %lu %lu\n", (unsigned long)rw, (unsigned long)rh, bp == 2 ? 250ul : 55ul, (unsigned long)(rw * bp)); fwrite(rb.contents, 1, rw * rh * bp, f); fclose(f); }
+            MLOG("[texdump] ser=%llu 深度 %lux%lu → %s", ser, (unsigned long)rw, (unsigned long)rh, rp_);
+            continue;
+        }
         if (getenv("DM_NVN_SNAPRAW")) {   // 同时存原始字节（HDR 目标转 8 位图会截断；首行文本头：宽 高 格式 每行字节） | Also save the raw bytes (converting an HDR target to an 8-bit image truncates; first-line text header: width height format bytes-per-row)
             NSUInteger rw = MAX(t.width >> lv, 1u), rh = MAX(t.height >> lv, 1u);
             size_t bpp = t.pixelFormat == MTLPixelFormatRGBA16Float ? 8 : t.pixelFormat == MTLPixelFormatRGBA32Float ? 16 : t.pixelFormat == MTLPixelFormatR16Float || t.pixelFormat == MTLPixelFormatR16Unorm ? 2 : 4;
@@ -6181,32 +6201,40 @@ static void td_dump(void) {
 // DM_NVN_TEXSNAP=in-frame index,... (together with the frame number and path of DM_NVN_TEXDUMP): as soon as these render passes end, copy their color attachments and save them together with the end-of-frame dump
 // (the same target is often cleared and reused within a frame, so the end-of-frame state cannot reflect the output of intermediate passes); file name index = in-frame index*100000 + texture index*100 + mip level
 static int g_ts_idx[64], g_ts_n = -1, g_ts_on; static uint64_t g_ts_first, g_ts_curf = ~0ull;
-static __strong id<MTLTexture> g_ts_att[8]; static uint64_t g_ts_ser[8]; static NSUInteger g_ts_lv[8]; static int g_ts_na;
+static char g_ts_key[24]; static int g_ts_hit, g_ts_pidx;   // DM_NVN_TEXSNAP=k:<片元着色器键前缀>：用到该着色器的通道都拍（帧内序号随运行变）| k:<fragment shader key prefix>: snapshot every pass that uses that shader (in-frame indices vary between runs)
+static __strong id<MTLTexture> g_ts_att[9]; static uint64_t g_ts_ser[9]; static NSUInteger g_ts_lv[9]; static int g_ts_na;
+void ts_draw(const char *fs_key) {
+    if (g_ts_key[0] && g_ts_na && !g_ts_hit && fs_key && !strncmp(fs_key, g_ts_key, strlen(g_ts_key))) { g_ts_hit = 1; g_ts_on = g_ts_pidx + 1; } }
 void ts_note(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
     if (g_ts_n < 0) { g_ts_n = 0; const char *e = getenv("DM_NVN_TEXSNAP");
+        if (e && !strncmp(e, "k:", 2)) { strlcpy(g_ts_key, e + 2, sizeof g_ts_key); e = NULL; }
         for (const char *q = e; q && *q && g_ts_n < 64; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) g_ts_idx[g_ts_n++] = atoi(q); }
-    g_ts_on = 0; if (!g_ts_n || g_td_frame < 0 || g_td_done) return;
+    g_ts_on = 0; g_ts_hit = 0; g_ts_na = 0; if ((!g_ts_n && !g_ts_key[0]) || g_td_frame < 0 || g_td_done) return;
     uint64_t f = atomic_load(&g_cur_frame); if (f != g_ts_curf) { g_ts_curf = f; g_ts_first = g_stat_pass; }
     if ((long)f != g_td_frame) return;
-    int idx = (int)(g_stat_pass - g_ts_first); for (int i = 0; i < g_ts_n; i++) if (g_ts_idx[i] == idx) g_ts_on = idx + 1;
-    g_ts_na = 0; if (!g_ts_on) return;
+    int idx = (int)(g_stat_pass - g_ts_first); g_ts_pidx = idx; for (int i = 0; i < g_ts_n; i++) if (g_ts_idx[i] == idx) g_ts_on = idx + 1;
+    if (!g_ts_on && !g_ts_key[0]) return;
     for (NSUInteger i = 0; i < nc && i < 8; i++) { id<MTLTexture> t = pd.colorAttachments[i].texture; if (!t) continue;
         g_ts_att[g_ts_na] = t; g_ts_ser[g_ts_na] = R.rt.color[i] ? R.rt.color[i]->serial : 0; g_ts_lv[g_ts_na] = pd.colorAttachments[i].level; g_ts_na++; }
+    id<MTLTexture> dt = pd.depthAttachment.texture;   // 深度附件也拍（导出时只存深度平面的原始字节）| the depth attachment is snapshotted too (exported as the raw depth plane only)
+    if (dt && R.rt.depth) { g_ts_att[g_ts_na] = dt; g_ts_ser[g_ts_na] = R.rt.depth->serial; g_ts_lv[g_ts_na] = pd.depthAttachment.level; g_ts_na++; }
 }
 void ts_after(void) {
     if (!g_ts_on) return;
-    id<MTLCommandBuffer> dcb = q_cb();
+    // 拷贝编进回放流（blit()，同一命令缓冲、编码器内屏障）：原先走另一条队列 g_q，与回放不排序，快照可能拍到通道执行之前的内容
+    // The copy goes into the replay stream (blit(): same command buffer, intra-encoder barriers); it used to go through another queue g_q, unordered with the replay, so a snapshot could show the contents from before the pass ran
     for (int i = 0; i < g_ts_na; i++) {
         id<MTLTexture> t = g_ts_att[i]; if (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray) continue;   // 二维数组取第 0 层 | 2D arrays take slice 0
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t.pixelFormat width:t.width height:t.height mipmapped:t.mipmapLevelCount > 1];
         d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate; d.mipmapLevelCount = t.mipmapLevelCount;
-        id<MTLTexture> c = [g_dev newTextureWithDescriptor:d];
-        id<MTLBlitCommandEncoder> b = [dcb blitCommandEncoder];
-        [b copyFromTexture:t sourceSlice:0 sourceLevel:g_ts_lv[i] toTexture:c destinationSlice:0 destinationLevel:g_ts_lv[i] sliceCount:1 levelCount:1]; [b endEncoding];
-        [g_td_list addObject:@[c, @((uint64_t)(g_ts_on - 1) * 1000 + g_ts_ser[i]), @(g_ts_lv[i])]];
+        if (t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 || t.pixelFormat == MTLPixelFormatDepth32Float || t.pixelFormat == MTLPixelFormatDepth16Unorm) d.usage |= MTLTextureUsageRenderTarget;
+        id<MTLTexture> c = [g_dev newTextureWithDescriptor:d]; if (!c) continue;
+        res_add(c);
+        NSUInteger lv = g_ts_lv[i];
+        enc_b_copy_texture(blit(), t, 0, lv, MTLOriginMake(0, 0, 0), MTLSizeMake(MAX(t.width >> lv, 1u), MAX(t.height >> lv, 1u), 1), c, 0, lv, MTLOriginMake(0, 0, 0));
+        [g_td_list addObject:@[c, @((uint64_t)(g_ts_on - 1) * 1000 + g_ts_ser[i]), @(lv), @0]];   // 第 4 项是层：帧末存图按层取，快照只拷第 0 层 | the 4th item is the layer: the end-of-frame dump reads it, and snapshots copy only slice 0
     }
     g_ts_on = 0;
-    [dcb commit];
 }
 // 真实呈现时刻环：出图序号 → presentedTime（秒；−1 = 被系统丢弃未呈现）
 // Ring of actual presentation times: present sequence number -> presentedTime (seconds; -1 = dropped by the system, not presented)
