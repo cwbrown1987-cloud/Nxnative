@@ -495,10 +495,73 @@ def find_windows(insl):
         j = i
         while j < len(insl) and insl[j].mnemonic not in EXCL_ST: j += 1
         if j >= len(insl) or j - i >= 16: continue
+        if any(insl[k].mnemonic in EXCL_LD for k in range(i + 1, j)): continue   # the store belongs to a later exclusive load (TotK 1.4.2 main+0x6fcca8)
         if j + 1 < len(insl) and insl[j + 1].mnemonic in ('cbz', 'cbnz'): j += 1
         seg = insl[i:j + 1]
         if any(has18(x) for x in seg): out.append(seg)
     return out
+
+def is_branch(x): return x.mnemonic in ('b', 'bl', 'br', 'blr', 'ret', 'cbz', 'cbnz', 'tbz', 'tbnz') or x.mnemonic.startswith('b.')
+
+def retry_blocks(insl, ws):
+    """Outlined LL/SC retry (SDK 20's compiler, TotK 1.4.2 main+0xa79b8): a cold block 'ldxr; cmp; b.eq <store inside a window>' repeats the
+    window's exclusive load and joins its store. Returns (branch addresses that are such joins, [(cold block, window tail)] for the ones whose
+    cold block or tail uses x18: those are copied as one window, so no slot access falls between load and store; the others run in place)"""
+    inwin = {x.address: w for w in ws for x in w}
+    ok, out = set(), []
+    for j, x in enumerate(insl):
+        if not (x.mnemonic == 'b' or x.mnemonic.startswith('b.')): continue
+        t = x.operands[-1].imm; w = inwin.get(t)
+        if w is None or t == w[0].address: continue
+        k = next((k for k in range(j - 1, max(-1, j - 5), -1) if insl[k].mnemonic in EXCL_LD), None)
+        if k is None: continue
+        cold = insl[k:j + 1]
+        if any(is_branch(c) or c.mnemonic.startswith('st') for c in cold[:-1]): continue
+        tail = w[[y.address for y in w].index(t):]
+        ok.add(x.address)
+        if any(has18(c) for c in cold + tail): out.append((cold, tail))
+    return ok, out
+
+def site_retry_window(cold, tail):
+    """Copy of an outlined retry block plus the window tail it joins (see retry_blocks), x18 → S as in site_window.
+    Layout: cold block, a branch to the cold block's fall-through stub, tail; then stubs: tail fall-through (the window's end), cold block fall-through, other exits"""
+    seg = cold + tail
+    used = set()
+    for x in seg: used |= regs_in(x)
+    S, T = pick(used)
+    start = here()
+    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+    copy0 = here()
+    pos = {x.address: copy0 + 4 * k for k, x in enumerate(cold)}
+    gap = copy0 + 4 * len(cold)
+    pos.update({x.address: gap + 4 + 4 * k for k, x in enumerate(tail)})
+    stubs = copy0 + 4 * (len(seg) + 1)
+    ex_targets = [tail[-1].address + 4, cold[-1].address + 4]
+    words = []
+    for x in seg:
+        w = struct.unpack('<I', x.bytes)[0]
+        if has18(x): w = subst(x, S)
+        m = x.mnemonic
+        if m in ('cbz', 'cbnz', 'tbz', 'tbnz') or m.startswith('b.'):
+            tgt = x.operands[-1].imm
+            if tgt in pos: newt = pos[tgt]
+            else:
+                if tgt not in ex_targets: ex_targets.append(tgt)
+                newt = stubs + 16 * ex_targets.index(tgt)
+            pc = pos[x.address]; off = (newt - pc) >> 2
+            if m in ('tbz', 'tbnz'): w = (w & 0xFFF8001F) | ((off & 0x3FFF) << 5)
+            else: w = (w & 0xFF00001F) | ((off & 0x7FFFF) << 5)
+            dd = dis(w, pc); assert dd.operands[-1].imm == newt and dd.mnemonic == m
+        else:
+            assert m not in ('adr', 'adrp', 'b', 'bl', 'br', 'blr', 'ret') and not (m == 'ldr' and '[' not in x.op_str), hex(x.address)
+        words.append(w)
+    for w in words[:len(cold)]: emit(w)
+    emit(B(here(), stubs + 16))
+    for w in words[len(cold):]: emit(w)
+    assert here() == stubs
+    for t in ex_targets:
+        emit(STRX(S, T)); emit(LDP(S, T, 31, -16)); emit(B(here(), t)); emit(NOP)
+    return start
 
 def site_window(seg):
     used = set()
@@ -640,6 +703,55 @@ def adr_table_wide(insl, j):
         if q.mnemonic in ('ldrb', 'ldrsb') and num(q.reg_name(q.operands[0].reg)) == idx: return ctx[k].operands[1].imm, 256
         if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: return ctx[k].operands[1].imm, 65536
     return None, None
+def adr_anchor_table(insl, j):
+    """br x18 after 'adr x18, #anchor; ldrsw xE, [xB, xI, lsl #2]; add x18, x18, xE' (SDK 20's compiler, TotK 1.4.2 main+0x642d44): target = anchor + signed entry.
+    Entry count from 'cmp wI, #N' on the index (following register copies into it), table base from the add / adrp writers of xB. Returns all targets, or None"""
+    ctx = insl[max(0, j - 8):j]
+    add = next((p for p in reversed(ctx) if p.mnemonic == 'add' and re.fullmatch(r'x18, x18, x\d+', p.op_str)), None)
+    if not add: return None
+    k = ctx.index(add); re_ = add.op_str.split(', ')[2]
+    adr = next((p for p in reversed(ctx[:k]) if p.mnemonic == 'adr' and p.op_str.startswith('x18,')), None)
+    ld = next((p for p in reversed(ctx[:k]) if p.mnemonic == 'ldrsw' and re.fullmatch(rf'{re_}, \[x\d+, x\d+, lsl #2\]', p.op_str)), None)
+    if not (adr and ld) or any('x18' in [p.reg_name(r) for r in p.regs_access()[1]] for p in ctx[ctx.index(adr) + 1:k]): return None
+    m = re.fullmatch(rf'{re_}, \[(x\d+), x(\d+), lsl #2\]', ld.op_str)
+    rb, idx = m.group(1), {'w' + m.group(2)}
+    li = insl.index(ld); n = None
+    for p in reversed(insl[max(0, li - 16):li]):
+        mm = re.fullmatch(r'(w\d+), (w\d+)', p.op_str) if p.mnemonic == 'mov' else None
+        if mm and mm.group(1) in idx: idx.add(mm.group(2)); continue
+        mm = re.fullmatch(r'(w\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
+        if mm and mm.group(1) in idx: n = int(mm.group(2), 0) + 1; break
+    if n is None: return None
+    anchor = adr.operands[1].imm
+    branch_from = {}
+    for q, x in enumerate(insl):
+        if x.mnemonic in ('b', 'cbz', 'cbnz', 'tbz', 'tbnz') or x.mnemonic.startswith('b.'): branch_from.setdefault(x.operands[-1].imm, []).append(q)
+    def writes(p):
+        return (p.mnemonic in ('bl', 'blr') and num(rb) <= 18) or any(p.reg_name(r) in (rb, 'w' + rb[1:]) for r in p.regs_access()[1])
+    def base_vals(i, seen, depth=0):
+        """adrp + add constants the base register holds just before insl[i], following branches into the block and fall-through
+        (the base is set 1385 instructions back at main+0x642d44, and in another block at main+0x6dc060); None = unknown writer; loops add nothing"""
+        vals, k = set(), i
+        while True:
+            for b in branch_from.get(insl[k].address, ()):
+                if b in seen: continue
+                seen.add(b)
+                vals |= base_vals(b, seen, depth + 1) if depth < 16 else {None}
+            if k == 0: vals.add(None); break
+            p = insl[k - 1]
+            if p.mnemonic in ('b', 'br', 'ret'): break
+            if writes(p):
+                m = re.fullmatch(rf'{rb}, {rb}, #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'add' else None
+                q = insl[k - 2] if k >= 2 else None
+                vals.add(q.operands[1].imm + int(m.group(1), 0) if m and q.mnemonic == 'adrp' and q.op_str.startswith(rb + ',') else None)
+                break
+            k -= 1
+        return vals
+    v = base_vals(li, set())
+    if len(v) != 1 or None in v: return None
+    tb = v.pop()
+    return [anchor + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)]
+retry_wins = []
 funcs = sorted({func_of(a) for a, (k, _) in kinds.items() if k == 'x18'})
 for fa, fb in funcs:
     insl = list(md.disasm(bytes(IMG[fa:fb]), fa))
@@ -663,22 +775,28 @@ for fa, fb in funcs:
             if not (base and width):
                 base, width = adr_table_wide(insl, j)
             if not (base and width):
-                tgt = jump_offsets(insl, j)
+                tgt = jump_offsets(insl, j) or adr_anchor_table(insl, j)
                 assert tgt, f'jump table {ins.address:x}'
                 tabjumps[ins.address] = tgt; continue
             jumps[ins.address] = (base, width)
-    # No jump may land in the middle of a window
+    # No jump may land in the middle of a window, except an outlined LL/SC retry joining its store (retry_blocks)
     inwin = {x.address for wseg in ws for x in wseg}; heads = {wseg[0].address for wseg in ws}
+    joins, rws = retry_blocks(insl, ws)
+    for cold, tail in rws:
+        assert not any(c.address in inwin for c in cold), f'retry block inside a window {cold[0].address:x}'
+        retry_wins.append((cold, tail)); done |= {x.address for x in cold}
     for x in insl:
         if x.mnemonic in ('b', 'bl', 'cbz', 'cbnz', 'tbz', 'tbnz') or x.mnemonic.startswith('b.'):
             t = x.operands[-1].imm
-            assert not (t in inwin and t not in heads), f'branch into window {x.address:x}'
+            assert not (t in inwin and t not in heads) or x.address in joins, f'branch into window {x.address:x}'
     for a_, tgt in tabjumps.items():
         if fa <= a_ < fb: assert not any(t in inwin and t not in heads for t in tgt), f'jump table target into window {a_:x}'
 
 def put_branch(at, to): struct.pack_into('<I', IMG, at, B(at, to))
 for wseg in windows:
     st, lo, hi = site_window(wseg); stat('window'); put_branch(lo, st)
+for cold, tail in retry_wins:
+    st = site_retry_window(cold, tail); stat('retry'); put_branch(cold[0].address, st)
 for a in sorted(kinds):
     if a in done: continue
     k, arg = kinds[a]
