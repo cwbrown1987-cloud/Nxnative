@@ -126,8 +126,8 @@ static void real_pair(const char *dir, int i, const char *why) {
         printf("  C %d %-30s 无 Switch 块线性标记（0x14 = 0）→ 线性存放，与 PC 原件 %s（%zu 字节）\n", i, why, ns == np && !memcmp(sb, pb, ns) ? "逐字节全等" : "不等", ns);
         free(sb); free(pb); return;
     }
-    nvn_texdesc d = {1, s.nvn, 0, 0, s.w, s.h, 1, s.mips, 0, s.th_hdr + 1};   // block height follows the file header (same as the packaged layout parameters the game passes in)
-    unsigned th_auto, td_auto; { nvn_texdesc a = d; a.pkg_block_h = 0; nvn_tex_level_tiles(&a, 0, &th_auto, &td_auto); }
+    nvn_texdesc d = {1, s.nvn, 0, 0, s.w, s.h, 1, s.mips, 0, 0x100 | s.th_hdr};   // block height follows the file header (same as the packaged layout parameters the game passes in)
+    unsigned th_auto, td_auto; { nvn_texdesc a = d; a.pkg_layout = 0; nvn_tex_level_tiles(&a, 0, &th_auto, &td_auto); }
     // ③ Per-level offsets in the file (cumulative mip table) vs nvn_tex_level_offset
     int off_ok = 1;
     for (unsigned l = 0; l < s.mips; l++)
@@ -255,6 +255,41 @@ int main(int argc, char **argv) {
         nvn_texdesc d = {1, 0x49, 0, 0, 256, 78, 1, 9, 0, 0}; nvn_texlayout L; nvn_tex_layout(&d, &L);
         CHECK(L.tileH == 1 && L.size == 24576, "F BC4 256×78 9 级 块高 log2 %u 存储 %llu，期望 1、24576", L.tileH, (unsigned long long)L.size);
         printf("  F BC4 256×78 9 级（王国之泪蓄力闪光）块高 log2 %u、存储 %llu（期望 1、24576）\n", L.tileH, (unsigned long long)L.size);
+    }
+
+    // ---------- G rules beyond deko3d, expected values produced by TotK's original NVN driver run under emulation (dm/tools/nvn_layout_diff.py) ----------
+    printf("G 原驱动对拍得出的规则（立方体数组层数 / MINIMAL_LAYOUT / 预排布块深 / 线性渲染目标）\n");
+    {
+        struct { const char *what; nvn_texdesc d; uint64_t size, layer, off1; uint32_t align; unsigned th, td; } G[] = {
+            // CUBEMAP_ARRAY depth = layer-faces: TotK's 4×4 depth 6 is one cube (the host used to allocate and upload 6 cubes)
+            {"立方体数组 RGBA8 4×4 深 6（王国之泪）",      {9, 0x25, 0, 0, 4, 4, 6, 1, 0, 0},        3072, 512, 0, 512, 0, 0},
+            {"立方体数组 RGBA8 64×64 深 12 7 级",          {9, 0x25, 0, 0, 64, 64, 12, 7, 0, 0},     294912, 24576, 16384, 512, 3, 0},
+            // MINIMAL_LAYOUT: the automatic block only if no level gets padded, else 1 GOB
+            {"MINIMAL RG8 260×260 9 级（王国之泪）",        {1, 0x0d, 0x200, 0, 260, 260, 1, 9, 0, 0}, 214528, 214528, 152064, 512, 0, 0},
+            {"MINIMAL RGB565 320×320（王国之泪）",          {1, 0x3c, 0x200, 0, 320, 320, 1, 1, 0, 0}, 204800, 204800, 0, 512, 0, 0},
+            {"MINIMAL RGBA8 64×128（整除，保留自动块高）",  {1, 0x25, 0x200, 0, 64, 128, 1, 1, 0, 0},  32768, 32768, 0, 512, 4, 0},
+            {"MINIMAL R8 8×1920 11 级（第 1 级会补行）",    {1, 0x01, 0x200, 0, 8, 1920, 1, 11, 0, 0}, 246784, 246784, 122880, 512, 0, 0},
+            {"MINIMAL 3D RGBA8 64×64×8",                   {2, 0x25, 0x200, 0, 64, 64, 8, 1, 0, 0},   131072, 131072, 0, 512, 0, 3},
+            {"MINIMAL 3D RGBA8 64×64×9",                   {2, 0x25, 0x200, 0, 64, 64, 9, 1, 0, 0},   147456, 147456, 0, 512, 0, 0},
+            // Packaged layout byte 0: low nibble block height, high nibble block depth
+            {"预排布 3D BC6H 64³ 7 级 L0=0x40（王国之泪）", {2, 0x49, 0, 0, 64, 64, 64, 7, 0, 0x140}, 163328, 163328, 131072, 512, 0, 4},
+            {"预排布 3D RGBA8 32³ L0=0x00",                {2, 0x25, 0, 0, 32, 32, 32, 1, 0, 0x100}, 131072, 131072, 0, 512, 0, 0},
+            {"预排布 3D RGBA8 32³ L0=0x12",                {2, 0x25, 0, 0, 32, 32, 32, 1, 0, 0x112}, 131072, 131072, 0, 512, 2, 1},
+            {"预排布 2D RGBA8 64×64 L0=0x13",              {1, 0x25, 0, 0, 64, 64, 1, 1, 0, 0x113},  16384, 16384, 0, 512, 3, 0},
+            // LINEAR_RENDER_TARGET is linear: stride × rows, aligned to 128 (TotK has 16 of them); linear sizes count pixel rows, also for BC
+            {"线性渲染目标 RGBA8 260×260 跨距 1152（王国之泪）", {1, 0x25, 0x40, 0, 260, 260, 1, 1, 1152, 0}, 299520, 299520, 0, 128, 0, 0},
+            {"线性渲染目标 RGBA8 1×1 跨距 128（王国之泪）",      {1, 0x25, 0x40, 0, 1, 1, 1, 1, 128, 0},       128, 128, 0, 128, 0, 0},
+            {"线性 BC1 64×64 跨距 128",                          {1, 0x42, 0x10, 0, 64, 64, 1, 1, 128, 0},     8192, 8192, 0, 32, 0, 0},
+        };
+        for (unsigned i = 0; i < sizeof G / sizeof *G; i++) {
+            nvn_texlayout L; nvn_tex_layout(&G[i].d, &L);
+            uint64_t off1 = G[i].d.levels > 1 ? nvn_tex_level_offset(&G[i].d, 1) : 0;
+            int ok = L.size == G[i].size && L.layer_size == G[i].layer && off1 == G[i].off1 && L.align == G[i].align && L.tileH == G[i].th && L.tileD == G[i].td;
+            CHECK(ok, "G %s：尺寸 %llu 层 %llu 第1级 %llu 对齐 %u 块 %u/%u，期望 %llu %llu %llu %u %u/%u", G[i].what,
+                  (unsigned long long)L.size, (unsigned long long)L.layer_size, (unsigned long long)off1, L.align, L.tileH, L.tileD,
+                  (unsigned long long)G[i].size, (unsigned long long)G[i].layer, (unsigned long long)G[i].off1, G[i].align, G[i].th, G[i].td);
+            printf("  G %-44s 尺寸 %7llu 块 %u/%u %s\n", G[i].what, (unsigned long long)L.size, L.tileH, L.tileD, ok ? "✓" : "✗");
+        }
     }
 
     printf("C/D 真数据对拍（Switch 块线性 vs PC 线性）+ 错块高负对照，阈值 %.0f dB\n", PSNR_PASS);

@@ -4,8 +4,12 @@
 //   The one deviation from deko3d: 'height×1.5' is rounded down to whole GOBs, as NVN itself does (the layout routine in the game's sdk, 0x48f710 in TotK v0:
 //   h + h/2 ≥ 128 / 64 / 32 / 16 rows → 16 / 8 / 4 / 2 GOBs). deko3d rounds up, which doubles the block height of e.g. a 20-block-row texture
 //   (TotK's 256×78 BC4 charge-flash streak, CPU-written without packaged layout parameters, came out as scrambled blocks).
-// The game's packaged textures (SetPackagedTextureLayout) carry 8 bytes of layout parameters: byte 0 = log2 of the block height (derived by comparing 16 cases from the real game,
-// 4 of which differ from the automatic algorithm); when present it takes precedence.
+// The game's packaged textures (SetPackagedTextureLayout) carry 8 bytes of layout parameters; the driver (TextureBuilderSetPackagedTextureLayout, sdk 0x45ea80 in TotK v0)
+//   keeps byte 0's low nibble as log2 of the block height and its high nibble as log2 of the block depth (byte 1's low nibble is the block width, always 0 on Tegra); when present they take precedence.
+// Checked against the original driver run under emulation (dm/tools/nvn_layout_diff.py): sizes, block sizes, level offsets and layer strides of every target / format class,
+//   plus the two rules below that deko3d does not have:
+//   - CUBEMAP_ARRAY depth already counts layer-faces (a multiple of 6), it is not a cube count;
+//   - MINIMAL_LAYOUT keeps the automatic block height / depth only if it adds no padding at any level (same total size as 1-GOB blocks), otherwise uses 1 GOB.
 #include "nvn_tex.h"
 
 typedef struct { uint8_t bpb, bw, bh; } fmt_t;   // Bytes per block, block width, block height (for uncompressed formats block width and height = 1)
@@ -51,7 +55,7 @@ static void shape(const nvn_texdesc *d, unsigned *dpl, int *layered, uint32_t *w
         case 2: *dpl = 3; break;                                        // 3D
         case 4: case 6: *dpl = 2; *layered = 1; break;                  // 2D_ARRAY / MS_ARRAY
         case 8: *dpl = 2; *z = 6; *layered = 1; break;                  // CUBEMAP
-        case 9: *dpl = 2; *z = d->depth * 6; *layered = 1; break;       // CUBEMAP_ARRAY
+        case 9: *dpl = 2; *z = d->depth; *layered = 1; break;           // CUBEMAP_ARRAY (depth = layer-faces)
         default: *dpl = 2; *z = 1; break;                               // 2D / MS / RECTANGLE
     }
     if (*z == 0) *z = 1;
@@ -79,6 +83,20 @@ static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl,
     return off;
 }
 
+// Bytes of one layer (all levels), layered textures aligned to the block
+static uint64_t layer_bytes(const nvn_texdesc *d, unsigned dpl, int layered, uint32_t w, uint32_t h, uint32_t z,
+                            unsigned tileH, unsigned tileD, fmt_t t) {
+    uint64_t ls = level_offset(d, d->levels ? d->levels : 1, dpl, w, h, z, tileH, tileD, t);
+    if (layered) {
+        uint32_t hh = blk(h, t.bh); unsigned th = tileH, td = tileD;
+        while (th && hh <= (8u << (th - 1))) th--;
+        while (td && z <= (1u << (td - 1))) td--;
+        unsigned sh = th + td + 9; uint64_t g = ls >> sh;
+        if (ls != g << sh) ls = (g + 1) << sh;
+    }
+    return ls;
+}
+
 void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     fmt_t t = fmt_of(d->format);
     unsigned dpl; int layered; uint32_t w, h, z;
@@ -90,25 +108,25 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
         o->layer_size = o->size = (uint64_t)t.bpb * d->width;
         o->align = t.bpb == 12 ? 4 : t.bpb; return;
     }
-    if (d->flags & 0x10) {                                            // LINEAR: row pitch = stride or aligned to 32
+    if (d->flags & 0x50) {                                            // LINEAR / LINEAR_RENDER_TARGET: row pitch = stride or aligned to 32 / 128
         o->align = (d->flags & 0x40) ? 128 : 32;
         uint32_t stride = d->stride ? d->stride : (t.bpb * blk(w, t.bw) + o->align - 1) & ~(o->align - 1);
-        o->layer_size = o->size = (uint64_t)stride * blk(h, t.bh);
+        o->layer_size = o->size = (uint64_t)stride * h;               // the driver counts pixel rows here, also for block-compressed formats
         return;
     }
+    // SPARSE (0x20) textures use the 64 KB sparse-tile layout in the driver; not modelled (no game run so far creates one)
     unsigned tileH = 0, tileD = 0;
-    if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = d->pkg_block_h ? (unsigned)d->pkg_block_h - 1 : pick_tile((ah + ah / 2) / 8); }
+    if (d->pkg_layout) {
+        if (dpl == 2) tileH = d->pkg_layout & 0xF;
+        else if (dpl == 3) { tileH = d->pkg_layout & 0xF; tileD = (d->pkg_layout >> 4) & 0xF; }
+    } else if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = pick_tile((ah + ah / 2) / 8); }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
-    o->tileH = tileH; o->tileD = tileD;
-    unsigned levels = d->levels ? d->levels : 1;
-    uint64_t ls = level_offset(d, levels, dpl, w, h, z, tileH, tileD, t);
-    if (layered) {                                                    // Layer size is aligned to the block
-        uint32_t hh = blk(h, t.bh); unsigned th = tileH, td = tileD;
-        while (th && hh <= (8u << (th - 1))) th--;
-        while (td && z <= (1u << (td - 1))) td--;
-        unsigned sh = th + td + 9; uint64_t g = ls >> sh;
-        if (ls != g << sh) ls = (g + 1) << sh;
+    uint64_t ls = layer_bytes(d, dpl, layered, w, h, z, tileH, tileD, t);
+    if ((d->flags & 0x200) && !d->pkg_layout && (tileH || tileD)) {   // MINIMAL_LAYOUT: the automatic block only if it adds no padding at any level, else 1 GOB
+        uint64_t min = layer_bytes(d, dpl, layered, w, h, z, 0, 0, t);
+        if (min != ls) { tileH = tileD = 0; ls = min; }
     }
+    o->tileH = tileH; o->tileD = tileD;
     o->layer_size = ls;
     o->size = layered ? ls * z : ls;
     o->align = 512;
