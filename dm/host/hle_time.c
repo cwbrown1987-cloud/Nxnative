@@ -128,6 +128,11 @@ _Static_assert(sizeof(ClockSnapshot) == 0xD0 && __builtin_offsetof(ClockSnapshot
 #define RES_TIME_NOT_FOUND 0x19074u   // time 模块 116，描述 200：两份快照没有共同的时钟可比 | time module 116, description 200: the two snapshots share no clock to compare
 static const uint8_t g_steady_source[16] = {'n', 'x', 'n', 'a', 't', 'i', 'v', 'e', '-', 's', 't', 'e', 'a', 'd', 'y', 0};
 static int64_t wall_now(void) { int64_t ft = fixed_time(); return ft >= 0 ? ft : time(NULL); }
+// 稳定时钟时刻（上游为旷野之息加）：与快照和 StandardSteadyClock::now 同一源号、同一墙钟秒，SDK 的 GetSpanBetween 要源号相同才相减
+// Steady clock time point (added upstream for BotW): same source ID and wall-clock seconds as the snapshot and StandardSteadyClock::now, since the SDK's GetSpanBetween subtracts only when the source IDs match
+HLE_FORCE("_ZN2nn4time19StandardSteadyClock19GetCurrentTimePointEPNS0_20SteadyClockTimePointE", "稳定时钟时刻 → 墙钟秒，源号与快照相同", Result, h_time_SteadyPoint, SteadyPoint *out) {
+    out->sec = wall_now(); memcpy(out->source, g_steady_source, 16); return RES_OK;
+}
 HLE_FORCE("_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_", "要 time 服务对象；按宿主墙钟填快照",
           Result, h_time_SnapshotCreate, ClockSnapshot *s) {
     int64_t now = wall_now(); memset(s, 0, sizeof *s);
