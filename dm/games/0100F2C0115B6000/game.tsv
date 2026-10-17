@@ -51,3 +51,7 @@ nvn_ssbo_bases	vs=0x110 ps=0x510 cs=0x310
 # ---- 着色器拆分（shader_split.py） | Shader split (shader_split.py) ----
 shader_groups	/Shader/=shader /Effect/=effect /Lib/=lib /UI/=ui
 shader_note	王国之泪着色器
+
+# ---- 贴图 | Textures ----
+# Model textures are decoded by the CPU straight into CPU-visible pools; without this every 3D material samples 0 and the 3D view is black
+cpu_pool_tex	on

@@ -1332,6 +1332,13 @@ static int tex_cpu_written(uint64_t serial) {
     pthread_mutex_lock(&g_cpu_tex_mu); int r = g_cpu_tex && CFSetContainsValue(g_cpu_tex, (const void *)(uintptr_t)serial); pthread_mutex_unlock(&g_cpu_tex_mu);
     return r;
 }
+// TotK decodes model textures on the CPU straight into CPU-visible pools (no packaged data, no WriteTexels): profile key cpu_pool_tex uploads them like packaged ones
+static int tex_cpu_pool_bc(const tex_t *t) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_CPUPOOL_TEX"); on = e && *e ? !strcmp(e, "1") : DM_GAME_CPU_POOL_TEX; if (on) MLOG("CPU 可见池里的块压缩贴图按预排布贴图上传 / 重传%s", e && *e ? "（DM_NVN_CPUPOOL_TEX）" : "（游戏档案 cpu_pool_tex）"); }
+    if (!on || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) return 0;
+    if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE)) return 0;
+    int bw, bh; return nvn_fmt_bpb(t->d.format, &bw, &bh) && (bw > 1 || bh > 1);
+}
 static id<MTLTexture> tex_mtl_(const tex_t *ct);
 static id<MTLTexture> tex_mtl(const tex_t *ct) { AP_B; id<MTLTexture> r = tex_mtl_(ct); AP_E(4); return r; }
 static uint64_t g_texinfo_ser[8]; static int g_texinfo_n;
@@ -1339,7 +1346,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     tex_t *t = (tex_t *)ct;
     if (!t || !t->serial) return nil;
     if (t->magic != MAGIC('T', 'E', 'X', 0)) { RED_ONCE(70, "贴图对象已失效（magic %#x，首例 ser=%llu）：不建 MTLTexture", t->magic, (unsigned long long)t->serial); return nil; }
-    int packaged = (t->has_layout || tex_cpu_written(t->serial)) && t->mem;
+    int packaged = (t->has_layout || tex_cpu_written(t->serial) || tex_cpu_pool_bc(t)) && t->mem;
     {   // Diagnostic DM_NVN_TEXINFO=WxH: log storage and description of textures of that size on first resolution (to tell whether two textures share storage and why they were not merged)
         static int ti = -1; static uint32_t tw, th; static uint64_t last[64]; static int nl;
         if (ti > 0 && t->d.width == tw && t->d.height == th && g_texinfo_n < 8) { int dup = 0; for (int i = 0; i < g_texinfo_n; i++) dup |= g_texinfo_ser[i] == t->serial; if (!dup && !(t->d.flags & 8)) g_texinfo_ser[g_texinfo_n++] = t->serial; }   // remember the non-render-target ones (no COMPRESSIBLE) for DM_NVN_TEXRAW=info
@@ -5271,7 +5278,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     size_t wb = (size_t)((r->width + bw - 1) / bw) * bpb, hb = (r->height + bh - 1) / bh, x0 = (size_t)(r->xoffset / bw) * bpb, y0 = r->yoffset / bh;
     int nz = r->depth ? r->depth : 1, is3d = t->d.target == 2;
-    if (t->has_layout && t->mem) {
+    if ((t->has_layout || tex_cpu_pool_bc(t)) && t->mem) {
         uint32_t lw = MAX(t->d.width >> level, 1u), lh = MAX(t->d.height >> level, 1u), lz = is3d ? MAX(t->d.depth >> level, 1u) : 1;
         size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
         uint8_t *lin = malloc(lp * lr * lz);
