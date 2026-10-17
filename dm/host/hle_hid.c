@@ -32,6 +32,7 @@ void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry
     uint64_t old = atomic_exchange(&g_pad_btn, buttons); atomic_fetch_or(&g_pad_latch, buttons & ~old); atomic_store(&g_pad_axes, pack(lx, ly, rx, ry));
 }
 uint64_t dm_input_samples(void) { return (uint64_t)atomic_load(&g_sampling); }
+static const char *const g_btn_names[16] = {"A", "B", "X", "Y", "LS", "RS", "L", "R", "ZL", "ZR", "Plus", "Minus", "Left", "Up", "Right", "Down"};
 // DM_KEYS scripted input (for tests): "seconds:key[+key][~hold seconds][*count/interval seconds],...", e.g. "8:A,12:A,15:Down~0.5,16:A+B,40:A*80/2" (A every 2 s from 40 s on, 80 times). Key names A B X Y LS RS L R ZL ZR Plus Minus Left Up Right Down, left stick LLeft LUp LRight LDown;
 //   held 0.15 s by default, at most 1024 steps (counted after repeats are expanded). Goes through the controller path (dm_pad_set), ORed with keyboard / touch, neither overrides the other. Times are counted from host start.
 //   An f before the time means a presented frame number ("f7600:A", and the repeat interval counts frames too): when the machine is busy seconds drift from the game's progress, frame numbers do not (used for the Zelda BotW opening route)
@@ -50,7 +51,6 @@ static void *keys_main(void *arg) {
 }
 void hid_keys_init(void) {
     const char *e = getenv("DM_KEYS"); if (!e || !*e) return;
-    static const char *names[16] = {"A", "B", "X", "Y", "LS", "RS", "L", "R", "ZL", "ZR", "Plus", "Minus", "Left", "Up", "Right", "Down"};
     char buf[4096]; snprintf(buf, sizeof buf, "%s", e);
     for (char *tok = strtok(buf, ","); tok && g_nsteps < KEY_STEPS; tok = strtok(NULL, ",")) {
         char *c = strchr(tok, ':'); if (!c) { LOG("【红】DM_KEYS 步骤缺「秒:」：%s", tok); continue; }
@@ -59,7 +59,7 @@ void hid_keys_init(void) {
         char *r = strchr(c + 1, '*'); if (r) { *r = 0; rep = atoi(r + 1); char *sl = strchr(r + 1, '/'); every = sl ? atof(sl + 1) : 1; if (rep < 1) rep = 1; }
         char *h = strchr(c + 1, '~'); if (h) { *h = 0; st.hold = atof(h + 1); }
         for (char *k = c + 1; k && *k;) { char *plus = strchr(k, '+'); if (plus) *plus = 0;
-            int found = 0; for (int b = 0; b < 16; b++) if (!strcasecmp(k, names[b])) { st.btn |= 1ull << b; found = 1; }
+            int found = 0; for (int b = 0; b < 16; b++) if (!strcasecmp(k, g_btn_names[b])) { st.btn |= 1ull << b; found = 1; }
             // left stick fully pushed: LLeft LUp LRight LDown (for games that move on the map by stick only, such as Super Mario 3D World)
             static const char *const sticks[4] = {"LLeft", "LUp", "LRight", "LDown"};
             static const int sx[4] = {-32767, 0, 32767, 0}, sy[4] = {0, 32767, 0, -32767};
@@ -76,6 +76,14 @@ uint32_t hle_hid_connected_npad(void) { return connected_id(); }   // nfp's NFC 
 static uint32_t style_of(uint32_t id) { return id != connected_id() ? 0 : id == NPAD_HANDHELD ? STYLE_HANDHELD : STYLE_FULLKEY; }
 static int32_t ax(uint64_t v, int i) { return (int16_t)(v >> (16 * i)); }
 static int32_t pick(int32_t a, int32_t b) { return (a < 0 ? -a : a) >= (b < 0 ? -b : b) ? a : b; }   // whichever of the two paths is deflected more
+// DM_PAD_LOG=1: log each button press / release as the game reads it, to check the whole path from a controller to the game
+static void pad_log(uint64_t b) {
+    static int on = -1; static _Atomic uint64_t last;
+    if (on < 0) on = getenv("DM_PAD_LOG") != NULL;
+    if (!on) return;
+    uint64_t ch = atomic_exchange(&last, b) ^ b;
+    for (int i = 0; i < 16; i++) if (ch >> i & 1) LOG("hid 游戏读到 %s %s", g_btn_names[i], b >> i & 1 ? "按下" : "松开");
+}
 
 static void fill(NpadState *s, uint32_t id, uint32_t style) {
     memset(s, 0, sizeof *s);
@@ -85,6 +93,7 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     uint64_t k = atomic_load(&g_axes), p = atomic_load(&g_pad_axes);
     s->lx = pick(ax(k, 0), ax(p, 0)); s->ly = pick(ax(k, 1), ax(p, 1)); s->rx = pick(ax(k, 2), ax(p, 2)); s->ry = pick(ax(k, 3), ax(p, 3));
     b &= 0xffffull;
+    pad_log(b);
     if (s->lx < -STICK_THRESH) b |= 1u << 16;
     if (s->ly > STICK_THRESH) b |= 1u << 17;
     if (s->lx > STICK_THRESH) b |= 1u << 18;
