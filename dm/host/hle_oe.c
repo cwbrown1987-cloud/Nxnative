@@ -72,6 +72,8 @@ HLE_FORCE("_ZN2nn2oe15EnableRecordingEv", "录像开关；宿主无系统录像"
 HLE_FORCE("_ZN2nn6applet23GetAppletResourceUserIdEv", "小程序资源用户号；宿主固定非 0", uint64_t, h_applet_Aruid, void) { return 0x80; }
 // Launch parameter (present only when another program launched this one with one; returns bool): the host never passes one
 HLE_FORCE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", "启动参数：没有", unsigned, h_oe_PopLaunchParam, size_t *out, void *buf, size_t n) { (void)buf; (void)n; if (out) *out = 0; return 0; }
+// Index of the program of the same application that launched this one, -1 = launched normally: SDK 20 asks am's application proxy (null on the host); TotK 1.4.2's nnMain asks
+HLE_FORCE("_ZN2nn2oe23GetPreviousProgramIndexEv", "前一个程序号：-1（正常启动）", int, h_oe_PrevProgIdx, void) { return -1; }
 HLE_FORCE("_ZN2nn2oe16DisableRecordingEv", "录像开关；宿主无系统录像", void, h_oe_DisableRec, void) {}
 HLE_FORCE("_ZN2nn2oe16EnableScreenShotEv", "截图开关；宿主无系统截图", void, h_oe_EnableShot, void) {}
 HLE_FORCE("_ZN2nn2oe17DisableScreenShotEv", "截图开关；宿主无系统截图", void, h_oe_DisableShot, void) {}
