@@ -98,6 +98,9 @@ Instruments' Metal Resource Events didn't record this process from the command l
 
 See [04](04-graphics.md) section 7. Notes: pass dumps are large and may contain non-UTF-8 bytes; filter with `LC_ALL=C grep -a "\[pass\] F600 " | grep -av " o cmd"`. A Python one-liner with PIL (the dm venv has it) gives mean colour and non-black share of each dumped PNG, which is quicker than opening 20 images.
 
+- A later pass that wipes what an earlier pass drew: first check whether its clears run under a render-enable condition. `O` lines are render-enable changes and their evaluation (`条件渲染 … → 画 / 跳过`); `c` lines are the clear commands (index, channel mask, colour, mid-pass or not) and the ones a condition skipped. Tears of the Kingdom clears every render target at most once per frame this way.
+- Intermediate values of one shader: edit a copy of `<key>_b.metal` to write them to its colour output, compile it (`xcrun -sdk macosx metal -c x.metal -o x.air && xcrun -sdk macosx metallib x.air -o x.metallib`), put it in place of `b-<chain>/<key>_b.metallib` for one run with an empty `DM_CACHE`, read the target with `DM_NVN_TEXSNAP=k:<key>` and `DM_NVN_SNAPRAW=1`, then copy the original back and compare its hash.
+
 ## On-device diagnostics (iOS)
 
 The phone runs an unsigned IPA the user sideloads; nothing is attached to a debugger. The loop is: build an IPA with switches, the user plays and sends `Documents/log.txt` (the previous launch is `log.prev.txt`), read it, repeat.
