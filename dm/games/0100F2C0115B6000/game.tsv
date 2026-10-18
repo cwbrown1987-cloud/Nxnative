@@ -56,3 +56,5 @@ shader_note	王国之泪着色器
 # ---- 贴图 | Textures ----
 # Model textures are decoded by the CPU straight into CPU-visible pools; without this every 3D material samples 0 and the 3D view is black
 cpu_pool_tex	on
+# Opening a menu copies the final image into a full-size target and blurs it into the menu background; with the 60 fps patch that copy runs a frame after the world stopped and got only the menu (black background)
+menu_capture	dd3d1e0ebf732428

@@ -2052,6 +2052,16 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
                 RED_ONCE(68, "渲染目标视图格式 %#x 挂不上（底图 Metal 格式 %lu 建时没有换格式用途）：按底图格式画", v->format, (unsigned long)base.pixelFormat); }
     }
 }
+// Depth16Unorm clear value. Apple GPUs store a clear as trunc(v·65535) but a drawn or shader-written depth rounded to nearest (standalone probe: 0.5 clears to 32767 and draws to 32768;
+// 0.25: 16383 / 16384), whereas Maxwell rounds both. TotK writes material classes into a D16 buffer cleared to 0.5 and shades each class with a full-screen draw at that depth under EQUAL:
+// class 0 at 0.5 missed every cleared pixel and hit only the redrawn 64x64 tiles, which showed as boxes around Ultrahand targets. Clear to the value whose truncation is the rounded code
+// (DM_NVN_D16_RAWCLEAR=1 restores the raw value, for A/B)
+static double d16_clear(MTLPixelFormat pf, double v) {
+    static int raw = -1; if (raw < 0) raw = getenv("DM_NVN_D16_RAWCLEAR") != NULL;
+    if (raw || pf != MTLPixelFormatDepth16Unorm || !(v > 0) || v >= 1) return v;
+    double n = rint(v * 65535.0);
+    return n >= 65535.0 ? 1.0 : (n + 0.25) / 65535.0;
+}
 // mode 1 (clear_only): a pass opened only to land pending clears, attaching only the attachments that have clears; mode 2: the lookahead proves this pass does not use depth-stencil, so depth is not attached.
 // clear_only: a pass opened only to land pending clears, attaching only the attachments that have clears - the other attachments are not touched by this pass, and attaching them costs a pointless load and store on TBDR
 // (Mac character select screen: the color-clear pass drags along a 400x225 depth load and store)
@@ -2111,7 +2121,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         if (pd.depthAttachment.texture) {
             any = 1;
             pd.depthAttachment.loadAction = R.clear_d ? MTLLoadActionClear : MTLLoadActionLoad;
-            pd.depthAttachment.clearDepth = R.cd; pd.depthAttachment.storeAction = MTLStoreActionStore;
+            pd.depthAttachment.clearDepth = d16_clear(pd.depthAttachment.texture.pixelFormat, R.cd); pd.depthAttachment.storeAction = MTLStoreActionStore;
             if (R.clear_d) PD("C %llu d 清成 %g", g_stat_pass + 1, R.cd);
             MTLPixelFormat pf = pd.depthAttachment.texture.pixelFormat;
             if (clear_only != 4 && (pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatStencil8)) {   // 4: depth only
@@ -3402,6 +3412,37 @@ static uint32_t ubo_handle(int stage, int reg, int off) {
     if (!mtl_addr(u->addr + off, 4, &mb, &mo) || !(base = [(__bridge id<MTLBuffer>)mb contents])) return 0;
     uint32_t h; memcpy(&h, base + mo, 4); return h;
 }
+// Menu background capture (game profile menu_capture: fragment shader key prefixes). Opening a menu, Tears of the Kingdom copies its final image (the texture its present pass samples) into a
+// full-size target and blurs the copy into the menu background. At its native 30 fps the copy runs at the end of the last world frame; with the 60 fps patch it runs one frame later, after the world
+// has stopped and the final image was cleared to hold only the menu, so the background was black. Such a copy reads the window texture presented last instead: the previous frame's final image
+// (at 30 fps one frame older than the game's own copy, which the blur hides). DM_NVN_MENU_CAPTURE=0 turns it off, =<keys> replaces the list
+static char g_mc_keys[8][20]; static int g_mc_nk = -1; static uint64_t g_mc_src, g_mc_win_ser, g_mc_n; static __strong id<MTLTexture> g_mc_win;
+static id<MTLTexture> mc_swap(NvShader *sh, id<MTLTexture> t, uint64_t ser, uint64_t *rid) {
+    if (g_mc_nk < 0) { g_mc_nk = 0; const char *e = getenv("DM_NVN_MENU_CAPTURE"), *src = e && *e ? e : DM_GAME_MENU_CAPTURE;
+        if (strcmp(src, "0")) for (const char *q = src; *q && g_mc_nk < 8;) { size_t n = strcspn(q, ", "); if (n) { if (n > 16) n = 16; memcpy(g_mc_keys[g_mc_nk], q, n); g_mc_keys[g_mc_nk++][n] = 0; } q += n; q += strspn(q, ", "); }
+        if (g_mc_nk) MLOG("菜单底图截取：%s%s", src, e && *e ? "（DM_NVN_MENU_CAPTURE）" : "（游戏档案 menu_capture）"); }
+    const tex_t *rt0 = R.rt.n > 0 ? R.rt.color[0] : NULL;
+    if (!g_mc_nk || !rt0) return nil;
+    if (xv_present(rt0->serial)) { g_mc_src = ser; g_mc_win = tex_mtl(rt0); g_mc_win_ser = rt0->serial; return nil; }   // the present pass: its source and the window texture it writes
+    int hit = 0; for (int i = 0; i < g_mc_nk && !hit; i++) hit = !strncmp(sh->key, g_mc_keys[i], strlen(g_mc_keys[i]));
+    if (!hit || !g_mc_win || ser != g_mc_src) return nil;
+    id<MTLTexture> w = g_mc_win, d = tex_mtl(rt0);
+    if (!w || !d || w.width != t.width || w.height != t.height || d.width != t.width || d.height != t.height) return nil;
+    // The window texture holds sRGB-encoded bytes (the present pass writes it through an sRGB view): sample it through one too, so the copy gets the same linear values the final image had
+    static __strong id<MTLTexture> views[2]; static __unsafe_unretained id<MTLTexture> bases[2]; static int vi;
+    MTLPixelFormat pf = w.pixelFormat == MTLPixelFormatRGBA8Unorm ? MTLPixelFormatRGBA8Unorm_sRGB : w.pixelFormat == MTLPixelFormatBGRA8Unorm ? MTLPixelFormatBGRA8Unorm_sRGB : w.pixelFormat;
+    id<MTLTexture> v = w;
+    if (pf != w.pixelFormat) {
+        int k = bases[0] == w ? 0 : bases[1] == w ? 1 : -1;
+        if (k < 0) { k = vi; vi ^= 1; views[k] = [w newTextureViewWithPixelFormat:pf]; bases[k] = w; }
+        if (!views[k]) return nil;
+        v = views[k];
+    }
+    *rid = v.gpuResourceID._impl;
+    if (!g_mc_n++) MLOG("菜单底图截取：首例 帧 %llu 通道 %llu，读上一帧出图 ser=%llu 代 ser=%llu", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, (unsigned long long)g_mc_win_ser, (unsigned long long)ser);
+    PD("b %llu 菜单底图截取：读上一帧出图 ser=%llu 代 ser=%llu", g_stat_pass, (unsigned long long)g_mc_win_ser, (unsigned long long)ser);
+    return v;
+}
 static uint32_t g_dispatch_dim[3];   // the current dispatch's workgroup counts (driver segment c0 + 0x200 for compute)
 static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex);
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) { AP_B; int r = encode_args_(en, sh, nvn_stage, metal_vertex); AP_E(3); return r; }
@@ -3456,6 +3497,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             int tid = b->kind == NVN_RB_TEXU ? (int)(ubo_handle(nvn_stage, reg, b->off) & 0xfffff) : reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
             if (t && g_fb_n && g_fb_seq == g_draw_seq && nvn_stage == 1) for (int q = 0; q < g_fb_n; q++) if (t == g_fb_src[q]) { t = g_fb_use[q]; trid = g_fb_rid[q]; break; }   // same-pass feedback sampling: read the snapshot instead (see fb_prepare)
+            if (t && nvn_stage == 1 && tid < g_ntreg && g_mc_nk) { uint64_t r2 = 0; id<MTLTexture> v = mc_swap(sh, t, g_treg[tid].t.serial, &r2); if (v) { t = v; trid = r2; } }   // menu background capture: see mc_swap
             if (t && tid < g_ntreg) use_rec("tex", (uint64_t)g_treg[tid].t.mem, g_treg[tid].t.L.size, tid, &g_treg[tid].t);
             if (t && passdump() && tid < g_ntreg) PD("R %llu st%d ser=%llu", g_stat_pass, nvn_stage, g_treg[tid].t.serial);
             if (bl) PD("B %llu st%d tex reg%d tid=%d %s ser=%llu fmt=%lu %lux%lux%lu view_lv=%lu+%lu view_sl=%lu array=%lu target=%lu swz=%d%d%d%d mtl=%p", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull,
@@ -3687,7 +3729,7 @@ static void sd_finish(void) {
         g_sd_n_all++; if (dead) { g_sd_n_dead++; g_sd_dead_bytes += t->bytes; g_bw_store -= t->bytes; if (udc_dead) g_udc_saved_bytes += t->bytes; }
         if (!t->state) t->why = 5;
         PD("Z %llu %s ser=%llu lv%u sl%u %s why=%d by=%s slot=%d", g_stat_pass, t->depth == 1 ? "d" : t->depth == 2 ? "s" : "c", (unsigned long long)t->ser, t->lv, t->sl, xvdead ? "dontcare-xv" : dead ? "dontcare" : "store", dead ? 0 : t->why, t->why == 1 && t->wkey ? t->wkey : "-", t->wslot);
-        if (udc_on()) PD("U %llu %s ser=%llu lv%u sl%u runtime=%s reason=%s state=%d load=%d", g_stat_pass, t->depth == 1 ? "d" : t->depth == 2 ? "s" : "c", (unsigned long long)t->ser, t->lv, t->sl, t->wrote ? "写过" : "没写", t->wwhy == 1 ? "图像写" : t->wwhy == 2 ? "颜色写掩码" : t->wwhy == 3 ? "片元输出" : t->wwhy == 4 ? "深度写" : t->wwhy == 5 ? "模板写" : "无", t->state, t->load);
+        if (udc_on()) PD("U %llu %s ser=%llu lv%u sl%u runtime=%s reason=%s state=%d load=%d", g_stat_pass, t->depth == 1 ? "d" : t->depth == 2 ? "s" : "c", (unsigned long long)t->ser, t->lv, t->sl, t->wrote ? "写过" : "没写", t->wwhy == 1 ? "图像写" : t->wwhy == 2 ? "颜色写掩码" : t->wwhy == 3 ? "片元输出" : t->wwhy == 4 ? "深度写" : t->wwhy == 5 ? "模板写" : t->wwhy == 6 ? "清色改画" : "无", t->state, t->load);
     }
     g_nsd = 0;
 }
@@ -5893,7 +5935,7 @@ static void clear_tex(const p_clear_tex *c) {
         MTLRenderPassAttachmentDescriptor *a = depth ? rp.depthAttachment : stencil ? rp.stencilAttachment : rp.colorAttachments[0];
         a.texture = t; a.level = lv; a.loadAction = MTLLoadActionClear; a.storeAction = MTLStoreActionStore;
         if (is3d) a.depthPlane = c->r.zoffset + z; else a.slice = l0 + c->r.zoffset + z;
-        if (depth) { rp.depthAttachment.clearDepth = c->c.f[0];
+        if (depth) { rp.depthAttachment.clearDepth = d16_clear(pf, c->c.f[0]);
             if (stencil) { rp.stencilAttachment.texture = t; rp.stencilAttachment.level = lv; rp.stencilAttachment.slice = a.slice; rp.stencilAttachment.loadAction = MTLLoadActionClear;
                            rp.stencilAttachment.storeAction = MTLStoreActionStore; rp.stencilAttachment.clearStencil = c->c.u[1]; } }
         else if (stencil) rp.stencilAttachment.clearStencil = c->c.u[0];
@@ -6101,6 +6143,62 @@ static int frz_op(unsigned op, const void *a) {   // Returns 1 = this operation 
     return 0;
 }
 
+// Color clears the load action cannot express (inside a pass, with a channel mask, or cut by a scissor smaller than the target) are drawn as a full-screen triangle in the pass,
+// cut by the scissor and the attachment's channel mask. They used to be skipped: TotK clears an object's screen box in a 1600x896 mask target (to 1, then 0) around its Ultrahand /
+// silhouette highlights, and the skipped clears left the previous contents there. Float formats only; an integer attachment keeps the old skip
+static id<MTL4ArgumentTable> g_cq_args; static id<MTLDepthStencilState> g_cq_dss; static id<MTLFunction> g_cq_vs, g_cq_fs[8];
+static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *g_cq_pso; static uint64_t g_cq_n;
+static int clear_quad(int index, int mask, const float rgba[4]) {
+    if (index < 0 || index >= 8 || !R.rt.color[index]) return 0;
+    id<MTLTexture> t = tex_mtl(R.rt.color[index]); if (!t || mtl_fmt_int_kind(t.pixelFormat)) return 0;
+    if (!(mask & 0xf)) return 1;
+    if (!g_cq_vs) {
+        NSMutableString *src = [NSMutableString stringWithString:@"#include <metal_stdlib>\nusing namespace metal;\nstruct C { float4 c; };\n"
+            "vertex float4 cq_vs(uint id [[vertex_id]]) { float2 p = float2((id << 1) & 2, id & 2); return float4(p * 2 - 1, 0, 1); }\n"];
+        for (int i = 0; i < 8; i++) [src appendFormat:@"struct O%d { float4 c [[color(%d)]]; }; fragment O%d cq_fs%d(constant C &k [[buffer(0)]]) { return { k.c }; }\n", i, i, i, i];
+        NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&e];
+        if (!lib) { RED_ONCE(87, "清色改画：着色器编译失败 %s", e.localizedDescription.UTF8String); return 0; }
+        for (int i = 0; i < 8; i++) g_cq_fs[i] = [lib newFunctionWithName:[NSString stringWithFormat:@"cq_fs%d", i]];
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1;
+        g_cq_args = [g_dev newArgumentTableWithDescriptor:ad error:&e];
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new]; dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = NO;
+        g_cq_dss = [g_dev newDepthStencilStateWithDescriptor:dd]; g_cq_pso = [NSMutableDictionary dictionary];
+        if (!g_cq_args || !g_cq_dss) { RED_ONCE(88, "清色改画：参数表 / 深度状态建不出"); return 0; }
+        g_cq_vs = [lib newFunctionWithName:@"cq_vs"];
+    }
+    id<MTL4RenderCommandEncoder> en = rp_begin_ex(0); if (!en || !g_pass.cfmt[index]) return 0;
+    long x0 = 0, y0 = 0, x1 = (long)g_pass.tw, y1 = (long)g_pass.th;
+    if (R.has_sc) { x0 = MAX(R.sc.x, 0); y0 = MAX(R.sc.y, 0); x1 = MIN(x1, (long)R.sc.x + R.sc.w); y1 = MIN(y1, (long)R.sc.y + R.sc.h); }
+    if (x1 <= x0 || y1 <= y0) return 1;
+    MTLColorWriteMask wm = (mask & 1 ? MTLColorWriteMaskRed : 0) | (mask & 2 ? MTLColorWriteMaskGreen : 0) | (mask & 4 ? MTLColorWriteMaskBlue : 0) | (mask & 8 ? MTLColorWriteMaskAlpha : 0);
+    struct { uint32_t cf[8], df, sf, samples, index, wm; } k = {{0}, g_pass.dfmt, g_pass.sfmt, MAX(g_pass.samples, 1), (uint32_t)index, (uint32_t)wm};
+    memcpy(k.cf, g_pass.cfmt, sizeof k.cf);
+    NSData *key = [NSData dataWithBytes:&k length:sizeof k];
+    id<MTLRenderPipelineState> ps = g_cq_pso[key];
+    if (!ps) {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = g_cq_vs; pd.fragmentFunction = g_cq_fs[index];
+        for (int i = 0; i < 8; i++) if (k.cf[i]) { pd.colorAttachments[i].pixelFormat = (MTLPixelFormat)k.cf[i]; pd.colorAttachments[i].writeMask = i == index ? wm : MTLColorWriteMaskNone; }
+        pd.depthAttachmentPixelFormat = (MTLPixelFormat)k.df; pd.stencilAttachmentPixelFormat = (MTLPixelFormat)k.sf; pd.rasterSampleCount = k.samples;
+        NSError *e = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!ps) { RED_ONCE(89, "清色改画：管线建不出 %s", e.localizedDescription.UTF8String); return 0; }
+        g_cq_pso[key] = ps;
+    }
+    if (g_enc_vis) { enc_r_visibility(en, MTLVisibilityResultModeDisabled, 0); g_enc_vis = 0; }   // not counted by an occlusion query; the next draw turns counting back on
+    [en setRenderPipelineState:ps]; g_enc_pso = ps; [en setDepthStencilState:g_cq_dss]; g_enc_dss = g_cq_dss;   // draws set the rest of their state each time
+    enc_r_viewport(en, (MTLViewport){0, 0, (double)g_pass.tw, (double)g_pass.th, 0, 1}); enc_r_scissor(en, (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)});
+    enc_r_cull(en, MTLCullModeNone); enc_r_fill(en, MTLTriangleFillModeFill);
+    id<MTLBuffer> ab; size_t off = arena_alloc(16, &ab); memcpy((uint8_t *)ab.contents + off, rgba, 16);
+    [g_cq_args setAddress:ab.gpuAddress + off atIndex:0];
+    [en setArgumentTable:g_cq_args atStages:MTLRenderStageFragment];
+    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [en setArgumentTable:g_ft atStages:MTLRenderStageFragment];
+    for (int i = 0; i < g_nsd; i++) if (g_sd[i].depth == 0 && g_sd[i].idx == index) { g_sd[i].wrote = 1; g_sd[i].wwhy = 6; }   // a pass whose draws never write it must still store it
+    zskip_clear();
+    if (!g_cq_n++) MLOG("清色改画：首例 通道 %llu 目标%d %ldx%ld @%ld,%ld 掩码=%#x（目标 %lux%lu）", g_stat_pass, index, x1 - x0, y1 - y0, x0, y0, mask, (unsigned long)g_pass.tw, (unsigned long)g_pass.th);
+    PD("c %llu 清色改画 目标%d %ldx%ld @%ld,%ld 掩码=%#x", g_stat_pass, index, x1 - x0, y1 - y0, x0, y0, mask);
+    return 1;
+}
+
 // Hand a submission to the GPU in segments (DM_NVN_CUT=draw count, 0 = off; default 64): when the game holds back the next frame's submit until this frame's GPU work is done (The Legend of Zelda: Breath of the Wild: the main thread's nvnSyncWait on the fence of the frame just submitted),
 // the GPU sits idle for the milliseconds the host spends translating inside the submit (in the shrine each frame is GPU 13 ms + translation 7 ms back to back). Each time this many draws have accumulated, the command buffer encoded so far is committed between two passes: the GPU runs the earlier passes while the CPU translates the later ones.
 // Cut only when no encoder is open and no pass is deferred / merged / hoisted; commit this batch's uploads first (later draws use them). The fence signal and completion work stay on the last segment only: the queue executes in commit order and every encoder starts with a queue barrier
@@ -6231,8 +6329,10 @@ void mtl_exec(const uint8_t *p) {
                 if (g_rt_merged) rp_end();   // A clear arrived in a continued render pass: end it here, and the clear is attached to the start of the next render pass as usual
                 if (c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) { RED_ONCE(5, "清色目标 %d 无效", c->index); break; }
                 if (g_enc || c->mask != 0xf || !scissor_full(R.rt.color[c->index], &R.rt.cview[c->index], R.rt.has_cview[c->index])) {
-                    RED_ONCE(6, "通道中途 / 部分掩码 / 部分剪裁的清色未实现（首例 掩码 %#x）", c->mask);
-                    static uint64_t n; if (getenv("DM_NVN_CLEARLOG") && n++ < 40) MLOG("清色跳过 帧%llu 通道%llu 目标%d ser=%llu %ux%u 中途=%d 掩码=%#x 剪裁=%d,%d,%d,%d 色=%g,%g,%g,%g", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, c->index,
+                    if (clear_quad(c->index, c->mask, c->rgba)) break;
+                    RED_ONCE(6, "通道中途 / 部分掩码 / 部分剪裁的清色没能改画（首例 掩码 %#x）", c->mask);
+                    static uint64_t n; static long lim = -1; if (lim < 0) { const char *cl = getenv("DM_NVN_CLEARLOG"); lim = cl ? MAX(atol(cl), 40) : 0; }   // DM_NVN_CLEARLOG=<n>: log the first n (at least 40)
+                    if (n++ < (uint64_t)lim) MLOG("清色跳过 帧%llu 通道%llu 目标%d ser=%llu %ux%u 中途=%d 掩码=%#x 剪裁=%d,%d,%d,%d 色=%g,%g,%g,%g", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, c->index,
                         (unsigned long long)R.rt.color[c->index]->serial, R.rt.color[c->index]->d.width, R.rt.color[c->index]->d.height, g_enc != nil, c->mask, R.sc.x, R.sc.y, R.sc.w, R.sc.h, c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]);
                     break; }
                 R.clear_c[c->index] = 1; R.cc[c->index] = MTLClearColorMake(c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]);
