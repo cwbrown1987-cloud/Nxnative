@@ -24,8 +24,7 @@ DM_ENV_FILE = ''                        # optional: environment switches for a d
 SURVEY_ONLY = False                     # a game with no profile in dm/games: only write the survey, no provisional profile and no IPA
 PROFILE_OUT = ''                        # where a provisional profile goes (empty = <NSP folder>/<title ID>_build/profile; the profile is <this>/<title ID>/)
 
-BEAT = 60                               # progress interval of quiet steps (seconds)
-TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/local/share/dotnet', os.path.expanduser('~/.dotnet')]   # GUI apps such as Spyder do not get the shell's PATH
+TOOL_PATHS = [p for p in [os.environ.get('DOTNET_ROOT', ''), os.environ.get('DOTNET_ROOT_X64', ''), '/opt/homebrew/bin', '/usr/local/bin', '/usr/local/share/dotnet', os.path.expanduser('~/.dotnet'), os.path.expanduser('~/.local/bin')] if p]   # GUI apps such as Spyder do not get the shell's PATH
 
 
 class BuildError(Exception):
@@ -468,6 +467,11 @@ def main(args=None):
     if not nsp_dir.is_dir(): raise BuildError(f'不是文件夹 | not a folder: {nsp_dir}')
     if not keys.is_file(): raise BuildError(f'没有这个文件 | no such file: {keys}')
     env = dict(os.environ, PATH=os.pathsep.join(TOOL_PATHS + [os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')]))
+    dotnet_bin = shutil.which('dotnet', path=env['PATH'])
+    if dotnet_bin:
+        droot = str(Path(dotnet_bin).resolve().parent)
+        env.setdefault('DOTNET_ROOT', droot)
+        env.setdefault('DOTNET_ROOT_X64', droot)
     env.setdefault('USER', getpass.getuser())   # xcodegen fails without USER (Couldn't find current username)
     py = sys.executable
     app, fam = scan_nsps(nsp_dir)
