@@ -2,10 +2,13 @@
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−.
 // Physical controllers (GameController, window mode only) map by position as in iOS DmGamepad.m: bottom B, right A, left Y, top X, Menu = +, View = −; merged with the keyboard, which owns the left stick while WASD is held.
+// The game's rumble drives the controller's haptics (CoreHaptics, left / right handle; DM_RUMBLE=<gain>, default 1, 0 = off).
 #import <Cocoa/Cocoa.h>
 #import <GameController/GameController.h>
+#import <CoreHaptics/CoreHaptics.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
+#include <stdatomic.h>
 #include "dm.h"
 #include "dm_input.h"
 #include "dm_uiscreen.h"
@@ -49,15 +52,83 @@ static void read_pad(GCExtendedGamepad *g) {
     push();
 }
 static void pad_release(void) { g_pad_btn = 0; g_pad_lx = g_pad_ly = g_pad_rx = g_pad_ry = 0; push(); }
+// Rumble (front.h front_rumble): the game's left / right motor drives the left / right handle of the first controller with haptics, one looping continuous CoreHaptics event per handle whose
+// intensity = the stronger of the motor's two bands × gain; a controller with a single haptics locality gets the stronger motor. Silent while the window is not key (the app gets no controller input then either).
+// Game threads only store the newest value; one apply 4 ms later on a serial queue reads the newest values, so a 200 Hz vibration graph costs at most one CoreHaptics call per handle per apply
+static dispatch_queue_t g_rq;                     // NULL = rumble off (windowless or DM_RUMBLE=0)
+static float g_rgain = 1;
+static _Atomic uint32_t g_rval[2];                // newest intensity per motor × 1000 (game threads)
+static atomic_flag g_rpend = ATOMIC_FLAG_INIT;
+static _Atomic int g_rfocus = 1, g_rdead;
+static GCController *g_rpad;                      // controller the engines were last requested for (main thread)
+static CHHapticEngine *g_reng[2];                 // this and below: only on g_rq
+static id<CHHapticAdvancedPatternPlayer> g_rpl[2];
+static float g_rsent[2];
+static int g_rmono, g_rgen;
+static NSArray *rumble_level(float a) { return @[[[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:a relativeTime:0]]; }
+static void rumble_apply(void) {
+    atomic_flag_clear(&g_rpend);                  // before reading: a value stored after this schedules another apply
+    float v[2] = {atomic_load(&g_rval[0]) / 1000.f, atomic_load(&g_rval[1]) / 1000.f};
+    if (g_rmono) v[0] = fmaxf(v[0], v[1]);
+    for (int i = 0; i < 2; i++) {
+        float a = atomic_load(&g_rfocus) ? v[i] : 0; NSError *err = nil;
+        if (!g_rpl[i] || fabsf(a - g_rsent[i]) < .004f) continue;
+        g_rsent[i] = a;
+        if (![g_rpl[i] sendParameters:rumble_level(a) atTime:CHHapticTimeImmediate error:&err]) LOG("手柄震动：发强度失败（%s）", err.localizedDescription.UTF8String ?: "?");
+    }
+}
+static void rumble_kick(void) { if (g_rq && !atomic_flag_test_and_set(&g_rpend)) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_MSEC), g_rq, ^{ rumble_apply(); }); }
+void front_rumble(int motor, float amp_low, float freq_low, float amp_high, float freq_high) {
+    (void)freq_low; (void)freq_high;
+    if (motor < 0 || motor > 1) return;
+    uint32_t q = (uint32_t)(fminf(1.f, fmaxf(0.f, fmaxf(amp_low, amp_high) * g_rgain)) * 1000.f + .5f);
+    if (atomic_exchange(&g_rval[motor], q) != q) rumble_kick();
+}
+static void rumble_focus(int on) { atomic_store(&g_rfocus, on); rumble_kick(); }
+// On g_rq: tear down the previous engines, then one engine + looping player per handle of c (nil = none)
+static void rumble_bind(GCController *c) {
+    int gen = ++g_rgen;
+    for (int i = 0; i < 2; i++) { [g_rpl[i] stopAtTime:CHHapticTimeImmediate error:nil]; [g_reng[i] stopWithCompletionHandler:nil]; g_rpl[i] = nil; g_reng[i] = nil; }
+    GCDeviceHaptics *h = c.haptics; if (!h) return;
+    NSSet<GCHapticsLocality> *have = h.supportedLocalities;
+    int two = [have containsObject:GCHapticsLocalityLeftHandle] && [have containsObject:GCHapticsLocalityRightHandle];
+    GCHapticsLocality loc[2] = {two ? GCHapticsLocalityLeftHandle : GCHapticsLocalityDefault, two ? GCHapticsLocalityRightHandle : nil};
+    for (int i = 0; i < 2 && loc[i]; i++) {
+        NSError *err = nil; CHHapticEngine *e = [h createEngineWithLocality:loc[i]];
+        if (!e || ![e startAndReturnError:&err]) { LOG("手柄震动：%s 引擎起不来（%s）", loc[i].UTF8String, e ? err.localizedDescription.UTF8String ?: "?" : "建不了"); continue; }
+        CHHapticEvent *ev = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous parameters:@[
+            [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1],
+            [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness value:.5f]] relativeTime:0 duration:30];   // 30 s is the longest continuous event; the player loops it
+        CHHapticPattern *p = [[CHHapticPattern alloc] initWithEvents:@[ev] parameters:@[] error:&err];
+        id<CHHapticAdvancedPatternPlayer> pl = p ? [e createAdvancedPlayerWithPattern:p error:&err] : nil;
+        pl.loopEnabled = YES;
+        if (!pl || ![pl sendParameters:rumble_level(0) atTime:CHHapticTimeImmediate error:&err] || ![pl startAtTime:CHHapticTimeImmediate error:&err]) {
+            LOG("手柄震动：%s 播放器起不来（%s）", loc[i].UTF8String, err.localizedDescription.UTF8String ?: "?"); [e stopWithCompletionHandler:nil]; continue;
+        }
+        // The haptics server restarted: rebuild right away (Apple's recommended handling). The engine stopped on its own (controller asleep, system error): rebuild at the next focus / connect
+        e.resetHandler = ^{ dispatch_async(g_rq, ^{ if (gen == g_rgen) rumble_bind(c); }); };
+        e.stoppedHandler = ^(CHHapticEngineStoppedReason why) { if (gen == g_rgen) { atomic_store(&g_rdead, 1); LOG("手柄震动：引擎停了（原因 %ld），下次获得焦点重建", (long)why); } };
+        g_reng[i] = e; g_rpl[i] = pl; g_rsent[i] = 0;
+    }
+    g_rmono = !two;
+    if (g_reng[0] || g_reng[1]) LOG("手柄震动：%s，%s，增益 %.2f", c.vendorName.UTF8String ?: "?", two ? "左右手柄各一路" : "整只手柄一路（取两马达较强者）", g_rgain);
+    rumble_kick();                                // values that arrived before the engines existed
+}
+static void rumble_rebind(GCController *c) {      // main thread
+    if (!g_rq || (c == g_rpad && !atomic_exchange(&g_rdead, 0))) return;
+    g_rpad = c; dispatch_async(g_rq, ^{ rumble_bind(c); });
+}
 // On connect / disconnect and when the window regains focus, rebind the handlers and read the current state; an unfocused app gets no controller events, so focus loss releases everything first to avoid stuck keys and sticks
 static void pads_bind(int log) {
-    int any = 0;
+    int any = 0; GCController *hc = nil;
     for (GCController *c in GCController.controllers) if (c.extendedGamepad) {
         any = 1; c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; read_pad(g); };
         if (log) LOG("手柄：%s（%s），按位置映射，对游戏是全键手柄", c.vendorName.UTF8String ?: "?", c.productCategory.UTF8String ?: "?");
         read_pad(c.extendedGamepad);
+        if (!hc && c.haptics) hc = c;
     }
     if (!any) { if (log) LOG("手柄：没有接上的扩展手柄"); pad_release(); }
+    rumble_rebind(hc);
 }
 static int key_bit(unsigned short code) {
     switch (code) {
@@ -161,12 +232,14 @@ void front_run(void (*guest)(void)) {
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
         [nc addObserverForName:NSWindowDidResizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; fit_drawable(win); }];
         [nc addObserverForName:NSWindowDidChangeBackingPropertiesNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; fit_drawable(win); }];
-        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; pad_release(); if (!win.miniaturized) dm_focus_set(2); }];
-        [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; pads_bind(0); dm_focus_set(1); }];
+        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; pad_release(); rumble_focus(0); if (!win.miniaturized) dm_focus_set(2); }];
+        [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; pads_bind(0); rumble_focus(1); dm_focus_set(1); }];
         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
         [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); }];
         [nc addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; pads_bind(1); }];
         [nc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; pads_bind(1); }];
+        const char *rg = getenv("DM_RUMBLE"); if (rg && *rg) g_rgain = (float)atof(rg);
+        if (g_rgain > 0) g_rq = dispatch_queue_create("dm.rumble", DISPATCH_QUEUE_SERIAL);
         pads_bind(0);   // devices are usually still being discovered at launch; connected controllers report in through the connect notification
         // Guest thread: 64 MiB stack (the Switch main thread stack is specified by npdm; the host gives plenty)
         static guest_arg ga; ga.fn = guest;

@@ -28,3 +28,8 @@ void dm_touch_set(const dm_touch *t, int n);
 // Timing: when a save write fails (disk full etc.) within one of the game's save transactions (between two Commits), so that this Commit is refused and the previously committed save is unchanged, it is called once per refused transaction;
 // the next transaction that succeeds commits as usual, and the front end need not do any recovery. err = the first failing errno (ENOSPC = 28 means out of space). Called on the game thread; the front end switches to the main thread itself and must not block
 void front_save_failed(int err);
+
+// Controller rumble (called by the host's hle_hid.c; Mac front_mac.m drives the controller's haptics, the default weak implementation does nothing): one call per value the game sends to
+// the connected controller's motor = 0 left / 1 right; amplitudes 0–1 and frequencies (Hz) of the low and high bands, as in nn::hid::VibrationValue.
+// Called on game threads up to a few hundred times a second, often with an unchanged value: the front end coalesces and must not block
+void front_rumble(int motor, float amp_low, float freq_low, float amp_high, float freq_high);

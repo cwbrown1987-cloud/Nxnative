@@ -1,8 +1,9 @@
 // nn::hid (controller): on the real device shared memory is read through the hid service; the host takes the current state written by the front end (Mac keyboard / controller, iOS virtual gamepad / controller).
 // Generic, game-independent version: one standard controller. DM_OPMODE=0 (handheld) → handheld controller (Npad id 0x20); otherwise → 1P full-key controller (id 0).
-// Vibration, six-axis, mouse, keyboard: not provided by the host (device count 0 / not connected); the controller applet reports "1 player, current controller selected".
+// Vibration: the connected controller's left / right motors, values passed to the front end (front.h front_rumble). Six-axis, mouse, keyboard: not provided by the host (device count 0 / not connected); the controller applet reports "1 player, current controller selected".
 #include "hle.h"
 #include "dm_input.h"
+#include "front.h"
 #include <stdatomic.h>
 #include <unistd.h>
 #include <strings.h>
@@ -136,15 +137,39 @@ HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS
 HLE_FORCE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", "六轴；宿主不提供", void, h_hid_SixStart, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", "六轴状态；宿主不提供（0 条）",
           int, h_hid_SixStates, void *out, int n, const uint32_t *h) { (void)out; (void)n; (void)h; return 0; }
-// Vibration: no devices
-HLE_FORCE("_ZN2nn3hid20IsVibrationPermittedEv", "震动许可；宿主不支持", unsigned, h_hid_VibPermit, void) { return 0; }
-HLE_FORCE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "震动设备：0 个",
-          int, h_hid_VibHandles, void *h, int n, const uint32_t *id, uint32_t style) { (void)h; (void)n; (void)id; (void)style; return 0; }
-HLE_FORCE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", "震动；宿主不支持", void, h_hid_InitVib, const void *h) { (void)h; }
-HLE_FORCE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", "震动；宿主不支持", void, h_hid_SendVib, const void *h, const void *v) { (void)h; (void)v; }
-// Values queued by the vibration graph (VibrationNode::Update) reach it from the sdk's internal FlushEnqueuedVibrationValues through the PLT, into the hid service proxy (sm abort). Metroid Dread
-// sets handles on its VibrationTargets even when the host reports 0 devices, so values get queued; return success and the flush clears its count as usual
-HLE_FORCE("_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi", "震动（批量，震动图 flush 用）；宿主不支持", Result, h_hid_SendVibs, const void *h, const void *v, int n) { (void)h; (void)v; (void)n; return 0; }
+// Vibration: every style gets handles like on the real device (full-key / handheld / dual Joy-Con two motors, single Joy-Con one), but only values for the connected controller's handles reach the front end;
+// a game that drives the targets of several styles at once sends zeros to the styles that are not connected, which must not cancel the real values.
+// VibrationDeviceHandle = {style index (style bit + 3: 3 full-key, 4 handheld, 5 dual Joy-Con, 6 left, 7 right), npad id, position (0 left / 1 right), 0}
+// VibrationValue = {low band amplitude, low band frequency, high band amplitude, high band frequency} (amplitude 0–1, frequency in Hz; neutral 160 / 320 Hz)
+__attribute__((weak)) void front_rumble(int motor, float amp_low, float freq_low, float amp_high, float freq_high) { (void)motor; (void)amp_low; (void)freq_low; (void)amp_high; (void)freq_high; }
+static float g_vib[2][4] = {{0, 160, 0, 320}, {0, 160, 0, 320}};   // last value sent to the connected controller's left / right motor (GetActualVibrationValue; starts neutral); a torn read across threads only affects that query
+static int vib_ours(const uint8_t *h) { return h[2] < 2 && h[1] == (uint8_t)connected_id() && h[0] == (connected_id() == NPAD_HANDHELD ? 4 : 3); }
+static void vib_send(const uint8_t *h, const float *v) {
+    static atomic_int logged, logged_any;
+    if (!vib_ours(h)) return;
+    memcpy(g_vib[h[2]], v, sizeof g_vib[0]);
+    if (!atomic_exchange(&logged_any, 1)) LOG("震动：游戏开始送值（马达%d 低频 %.3f 高频 %.3f）", h[2], v[0], v[2]);
+    if ((v[0] > 0 || v[2] > 0) && !atomic_exchange(&logged, 1)) LOG("震动：首个非零值 马达%d 低频 %.3f@%.0fHz 高频 %.3f@%.0fHz", h[2], v[0], v[1], v[2], v[3]);
+    front_rumble(h[2], v[0], v[1], v[2], v[3]);
+}
+HLE_FORCE("_ZN2nn3hid20IsVibrationPermittedEv", "震动许可：允许", unsigned, h_hid_VibPermit, void) { return 1; }
+HLE_FORCE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "震动设备：按样式给左右马达",
+          int, h_hid_VibHandles, uint8_t *h, int n, const uint32_t *id, uint32_t style) {
+    int b = style ? __builtin_ctz(style) : 32; if (b > 4) return 0;
+    int first = b == 4, cnt = b >= 3 ? 1 : 2, k = 0;   // left Joy-Con = left motor only, right Joy-Con = right motor only
+    for (; k < cnt && k < n; k++) { h[4 * k] = (uint8_t)(b + 3); h[4 * k + 1] = (uint8_t)*id; h[4 * k + 2] = (uint8_t)(first + k); h[4 * k + 3] = 0; }
+    static atomic_int logged; if (k && !atomic_exchange(&logged, 1)) LOG("震动：游戏首次取句柄（手柄号 %#x 样式 %#x，%d 个）", *id, style, k);
+    return k;
+}
+HLE_FORCE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", "震动设备初始化；宿主无事", void, h_hid_InitVib, const void *h) { (void)h; }
+HLE_FORCE("_ZN2nn3hid24IsVibrationDeviceMountedERKNS0_21VibrationDeviceHandleE", "震动设备在位：接上的手柄的马达", unsigned, h_hid_VibMounted, const uint8_t *h) { return vib_ours(h); }
+HLE_FORCE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", "震动：交给前端", void, h_hid_SendVib, const uint8_t *h, const float *v) { vib_send(h, v); }
+// Values queued by the vibration graph (VibrationNode::Update → VibrationTarget → EnqueueVibrationValue) reach it from the sdk's internal FlushEnqueuedVibrationValues through the PLT
+// (otherwise into the hid service proxy: sm abort); the flush clears its count after success
+HLE_FORCE("_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi", "震动（批量，震动图 flush 用）：交给前端", Result, h_hid_SendVibs, const uint8_t *h, const float *v, int n) {
+    for (int i = 0; i < n; i++) vib_send(h + 4 * i, v + 4 * i);
+    return 0;
+}
 // Mouse / keyboard: not connected
 HLE_FORCE("_ZN2nn3hid15InitializeMouseEv", "鼠标；宿主不提供", void, h_hid_InitMouse, void) {}
 HLE_FORCE("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi", "鼠标状态：0 条", int, h_hid_MouseStates, void *out, int n) { (void)out; (void)n; return 0; }
@@ -218,6 +243,8 @@ HLE_FORCE("_ZN2nn3hid32GetSixAxisSensorFusionParametersEPfS1_RKNS0_19SixAxisSens
 HLE_FORCE("_ZN2nn3hid32SetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHandleEff", "六轴融合参数；宿主忽略", void, h_hid_FusionSet, const uint32_t *h, float a, float b) { (void)h; (void)a; (void)b; }
 HLE_FORCE("_ZN2nn3hid34ResetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHandleE", "六轴融合参数；宿主忽略", void, h_hid_FusionReset, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid41IsFirmwareUpdateAvailableForSixAxisSensorERKNS0_19SixAxisSensorHandleE", "六轴固件更新：无", unsigned, h_hid_SixFw, const uint32_t *h) { (void)h; return 0; }
-// Vibration device info / actual value: no device, zeroed
-HLE_FORCE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", "震动设备信息：无", void, h_hid_VibInfo, uint32_t *info, const void *h) { (void)h; info[0] = 0; info[1] = 0; }
-HLE_FORCE("_ZN2nn3hid23GetActualVibrationValueEPNS0_14VibrationValueERKNS0_21VibrationDeviceHandleE", "实际震动值：0", void, h_hid_VibActual, float *v, const void *h) { (void)h; memset(v, 0, 16); }
+// Vibration device info = {type 1 linear resonant actuator, position 1 left / 2 right}; actual value = the last one sent to the connected controller's motor (other styles' handles: neutral 0)
+HLE_FORCE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", "震动设备信息：线性马达，左 / 右", void, h_hid_VibInfo, uint32_t *info, const uint8_t *h) {
+    int ok = h[0] >= 3 && h[0] <= 7 && h[2] < 2; info[0] = ok; info[1] = ok ? h[2] + 1u : 0; }
+HLE_FORCE("_ZN2nn3hid23GetActualVibrationValueEPNS0_14VibrationValueERKNS0_21VibrationDeviceHandleE", "实际震动值：最后交给前端的值", void, h_hid_VibActual, float *v, const uint8_t *h) {
+    if (vib_ours(h)) memcpy(v, g_vib[h[2]], sizeof g_vib[0]); else { v[0] = 0; v[1] = 160; v[2] = 0; v[3] = 320; } }
