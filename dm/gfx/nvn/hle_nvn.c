@@ -1258,7 +1258,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(f, "@use_call", (double)(uc_ - puc)); trow(f, "@use_skip", (double)(us_ - pus)); puc = uc_; pus = us_;
         static uint64_t pfa, pre_; uint64_t fa_, pr_, up_, re_; nvn_dirty_stats(&fa_, &pr_); mtl_pkg_stats(&up_, &re_);
         trow(f, "@faults", (double)(fa_ - pfa)); trow(f, "@reuploads", (double)(re_ - pre_)); pfa = fa_; pre_ = re_;
-        static uint64_t pun, puc_, pud; uint64_t un_, uc2_, ud_; mtl_ubren_stats(&un_, &uc2_, &ud_); trow(f, "@ubren", (double)(un_ - pun)); trow(f, "@ubren_cut", (double)(uc2_ - puc_)); trow(f, "@ubren_dead", (double)(ud_ - pud)); pun = un_; puc_ = uc2_; pud = ud_;
+        { static uint64_t pu[7]; uint64_t u[7]; mtl_ubren_stats(u); static const char *nm[7] = {"@ubren", "@ubren_cut", "@ubren_dead", "@ubren_land", "@ubren_snap", "@ubren_snap_kb", "@ubren_snap_no"};
+          for (int i = 0; i < 7; i++) trow(f, nm[i], (double)(u[i] - pu[i]) / (i == 5 ? 1024.0 : 1.0)); memcpy(pu, u, sizeof pu); }
         { static uint64_t pr[6]; uint64_t r[6]; mtl_res_stats(r);
           trow(f, "@res_commits", (double)(r[0] - pr[0])); trow(f, "@res_commit_ms", (r[1] - pr[1]) / 1e6); trow(f, "@res_add_tex", (double)(r[2] - pr[2])); trow(f, "@res_add_buf", (double)(r[3] - pr[3])); trow(f, "@res_rm", (double)(r[4] - pr[4])); trow(f, "@res_allocs", (double)r[5]); memcpy(pr, r, sizeof pr); }
         static uint64_t pmc, pmp, pmn; uint64_t mc_, mpg_, mn_; nvn_dirty_mp_stats(&mc_, &mpg_, &mn_);

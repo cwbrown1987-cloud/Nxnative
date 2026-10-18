@@ -82,6 +82,7 @@ run: t_nvn t_dirty_slots t_dirty_race t_builtin t_deswz_gpu t_pace t_refl t_hmap
 	MTL_DEBUG_LAYER=1 ./t_defer_chain
 	MTL_DEBUG_LAYER=1 ./t_cond_render
 	MTL_DEBUG_LAYER=1 ./t_ubren
+	DM_NVN_UBREN=1 MTL_DEBUG_LAYER=1 ./t_ubren   # first version (inside a pass only): same pixels and memory
 	DM_NVN_UBREN=0 MTL_DEBUG_LAYER=1 ./t_ubren   # same pixels and memory, only more passes
 	./t_zskip
 	./t_xv

@@ -174,7 +174,7 @@ double mtl_presented_time(uint64_t n);
 // Texture release (at Finalize)
 void mtl_tex_release(tex_t *t);
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
-void mtl_ubren_stats(uint64_t *n, uint64_t *cuts, uint64_t *dead);   // uniform updates renamed inside a pass / passes still ended by a draw reading a renamed range / renamed copies skipped because a later update rewrote them whole
+void mtl_ubren_stats(uint64_t s[7]);   // cumulative: uniform updates deferred / passes still ended by a draw reading a deferred range / copies skipped as rewritten / landings (copy encoders) / snapshots of partly covered ranges, their bytes, snapshots refused
 void mtl_res_stats(uint64_t s[6]);   // residency set: commits, commit ns, textures added, buffers added, removals (cumulative), allocations now
 uint64_t mtl_pkg_miss(void);
 uint64_t mtl_upload_ns_take(void);   // Take and zero: time spent uploading packaged textures on the submit thread since last time   // DM_NVN_DIRTYCHECK diagnostic: number of missed detections   // Packaged textures: number of first uploads, number of re-uploads due to pool content changes

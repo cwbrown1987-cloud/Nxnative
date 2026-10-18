@@ -562,7 +562,9 @@ static inline void enc_c_pso(id e, id<MTLComputePipelineState> p) { [e setComput
 static inline void enc_c_args(id e, uint64_t gpu, NSUInteger i) { (void)e; [g_ct setAddress:gpu atIndex:i]; }
 static inline void enc_c_dispatch(id e, MTLSize n, MTLSize t) { [e dispatchThreadgroups:n threadsPerThreadgroup:t]; }
 static inline id enc_b_begin(id cb) { return [cb respondsToSelector:@selector(beginCommandBufferWithAllocator:)] ? [cb computeCommandEncoder] : [cb blitCommandEncoder]; }
-static inline void enc_b_end(id e) { m4_end(e); }
+static void pg_blit_begin(id<MTL4ComputeCommandEncoder> e); static void pg_blit_op(void); static void pg_blit_end(id e);   // DM_NVN_PASSGPU (defined with it)
+static char g_pg_bwhy;   // DM_NVN_PASSGPU: source of the next copy operation, listed in its key column (U landing a renamed uniform update, u uniform update, c buffer copy, f fill, t texture)
+static inline void enc_b_end(id e) { if (e == g_blit) pg_blit_end(e); m4_end(e); }
 static inline void enc_b_copy_buffer(id e, id<MTLBuffer> s, NSUInteger so, id<MTLBuffer> d, NSUInteger doff, NSUInteger n) { [e copyFromBuffer:s sourceOffset:so toBuffer:d destinationOffset:doff size:n]; }
 static inline void enc_b_copy_buffer_texture(id e, id<MTLBuffer> s, NSUInteger so, NSUInteger row, NSUInteger img, MTLSize z, id<MTLTexture> d, NSUInteger sl, NSUInteger lv, MTLOrigin o) { [e copyFromBuffer:s sourceOffset:so sourceBytesPerRow:row sourceBytesPerImage:img sourceSize:z toTexture:d destinationSlice:sl destinationLevel:lv destinationOrigin:o]; }
 static inline void enc_b_copy_texture_buffer(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLSize z, id<MTLBuffer> d, NSUInteger doff, NSUInteger row, NSUInteger img) { [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:o sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:row destinationBytesPerImage:img]; }
@@ -573,7 +575,8 @@ static void blit_note(void);   // Per-pass dump: a copy / buffer update ended th
 // Buffer operations check conflicts by guest address range (barrier only when reading or writing a range written earlier); texture operations get one whenever the encoder already holds an operation.
 enum { BW_MAX = 64 };
 static uint64_t g_bw_lo[BW_MAX], g_bw_hi[BW_MAX]; static int g_bw_n, g_blit_ops; static uint64_t g_blit_barriers;
-static id<MTL4ComputeCommandEncoder> blit_raw(void) { blit_note(); rp_end(); if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; g_bw_n = 0; g_blit_ops = 0; } return g_blit; }
+static void ubd_land(void);   // deferred uniform updates go into guest memory before any copy (see g_ubd)
+static id<MTL4ComputeCommandEncoder> blit_raw(void) { blit_note(); rp_end(); ubd_land(); if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; pg_blit_begin(g_blit); g_bw_n = 0; g_blit_ops = 0; } pg_blit_op(); return g_blit; }
 static void blit_barrier(void) {
     static int off = -1; if (off < 0) { const char *e = getenv("DM_NVN_BLIT_ORDER"); off = e && !strcmp(e, "0"); if (off) MLOG("DM_NVN_BLIT_ORDER=0：拷贝编码器内不加屏障（诊断，会复现喷泉竖条）"); }
     if (!off) [g_blit barrierAfterEncoderStages:MTLStageDispatch | MTLStageBlit beforeEncoderStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];   // the copy encoder is a compute encoder: MTLStageAll fails Metal validation
@@ -596,71 +599,141 @@ static id<MTL4ComputeCommandEncoder> blit(void) {
     return e;
 }
 
+// Guest ranges some GPU operation may have written (storage buffer / buffer image bindings, copy / fill / texture → buffer destinations, counter reports and semaphores written at completion); sticky.
+// A uniform snapshot (ubm_get) reads guest memory on the CPU at replay time, which is only right when nothing but landed uniform updates can have changed those bytes on the GPU in between
+enum { UW_MAX = 8192 };
+static uint64_t g_uw_lo[UW_MAX], g_uw_hi[UW_MAX]; static int g_uw_n, g_uw_full;   // sorted, disjoint, not touching
+static int uw_find(uint64_t a) { int lo = 0, hi = g_uw_n; while (lo < hi) { int m = (lo + hi) >> 1; if (g_uw_hi[m] <= a) lo = m + 1; else hi = m; } return lo; }   // first interval ending after a
+static int uw_hit(uint64_t a, uint64_t n) { if (g_uw_full) return 1; int i = uw_find(a); return i < g_uw_n && g_uw_lo[i] < a + n; }
+static void uw_mark(uint64_t a, uint64_t n) {
+    if (!n || g_uw_full) return;
+    uint64_t b = a + n; int i = uw_find(a);
+    if (i < g_uw_n && g_uw_lo[i] <= a && b <= g_uw_hi[i]) return;   // already inside one
+    int s = i > 0 && g_uw_hi[i - 1] == a ? i - 1 : i, e = i;   // merged with every interval it overlaps or touches: [s, e)
+    while (e < g_uw_n && g_uw_lo[e] <= b) e++;
+    uint64_t lo = s < e && g_uw_lo[s] < a ? g_uw_lo[s] : a, hi = s < e && g_uw_hi[e - 1] > b ? g_uw_hi[e - 1] : b;
+    if (s == e) {
+        if (g_uw_n == UW_MAX) { g_uw_full = 1; MLOG("【红】GPU 写过的区间超过 %d 段：此后 uniform 不再做快照", UW_MAX); return; }
+        memmove(g_uw_lo + s + 1, g_uw_lo + s, (size_t)(g_uw_n - s) * 8); memmove(g_uw_hi + s + 1, g_uw_hi + s, (size_t)(g_uw_n - s) * 8); g_uw_n++;
+        if (g_uw_n == 1024 || g_uw_n == 4096) MLOG("GPU 写过的区间：%d 段（满 %d 段后不再做 uniform 快照）", g_uw_n, UW_MAX);
+    } else if (e - s > 1) { memmove(g_uw_lo + s + 1, g_uw_lo + e, (size_t)(g_uw_n - e) * 8); memmove(g_uw_hi + s + 1, g_uw_hi + e, (size_t)(g_uw_n - e) * 8); g_uw_n -= e - s - 1; }
+    g_uw_lo[s] = lo; g_uw_hi[s] = hi;
+}
+
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     if (g_npend < PEND_MAX) { g_pend_lo[g_npend] = dst; g_pend_hi[g_npend++] = dst + n; } else g_pend_over = 1;
+    uw_mark(dst, n);
     void *sb, *db; uint64_t so, dof;
     if (!mtl_addr(src, n, &sb, &so) || !mtl_addr(dst, n, &db, &dof))
         MDIE("缓冲拷贝地址不在任何内存池内 src=%#llx dst=%#llx n=%#llx", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
+    g_pg_bwhy = 'c';
     enc_b_copy_buffer(blit_buf(src, src + n, dst, dst + n), (__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n);
 }
 
 // Inline uniform update (UpdateUniformBuffer): the data is copied into the host's own shared ring at encode time, then copied in order to the destination.
 // Previously it was read from command memory only when the GPU executed - if the game recycles command memory before the GPU runs, it reads the bytes of the next batch of commands (SMBW's fountain water wave simulation got the wrong coefficients and diverged to ±65504).
+// The ring is a pool of 4 MiB blocks: a block that fills up is reused once the submission that last used it has completed (a new block for every fill-up cost a residency commit each time)
+enum { UBS_BLOCK = 4 << 20, UBS_POOL = 8 };
 static id<MTLBuffer> g_ubs_buf; static size_t g_ubs_off, g_ubs_size;
-// Uniform update renaming (DM_NVN_UBREN=0 turns it off; only while the TBDR optimizations are off, whose lookaheads take an update as the end of the pass):
-// an update arriving inside a render pass no longer ends the pass. Its bytes stay in the ring, later draws of the pass bind the ring copy in place of the guest address
-// (the newest deferred update overlapping the bound range must cover all of it), and the copies into guest memory are encoded in order once the pass ends (rp_end),
-// before any later copy / dispatch / commit. A draw reading a deferred range any other way (partly covered uniform, vertex / index / storage / buffer texture) ends the pass first - the old behaviour.
-// Measured on TotK Sky Island (1.4.2, frame 2400): 203 of 348 render passes per frame ended at an update, each loading and storing all of its attachments again
+static struct { __strong id<MTLBuffer> buf; uint64_t fence; } g_ubs_pool[UBS_POOL]; static int g_ubs_pool_n, g_ubs_cur = -1;
+// Room for n bytes in the ring: returns the offset in block g_ubs_buf; place = put them at dst's address modulo 256, so the copy can stand in for guest memory at dst
+static size_t ubs_alloc(uint64_t n, uint64_t dst, int place) {
+    size_t need = ((n + 15u) & ~(size_t)15u) + (place ? 512 : 0);
+    if (!g_ubs_buf || g_ubs_off + need > g_ubs_size) {
+        if (g_ubs_cur >= 0) g_ubs_pool[g_ubs_cur].fence = g_fence + 1;   // encoded copies / bindings still read it: reusable once this submission completes
+        else if (g_ubs_buf) defer_obj_release(g_ubs_buf);   // a one-off block is retired
+        g_ubs_buf = nil; g_ubs_cur = -1;
+        if (need <= UBS_BLOCK) {
+            for (int i = 0; i < g_ubs_pool_n && g_ubs_cur < 0; i++) if (g_ubs_pool[i].fence <= g_done) g_ubs_cur = i;
+            if (g_ubs_cur < 0 && g_ubs_pool_n < UBS_POOL) {
+                id<MTLBuffer> b = [g_dev newBufferWithLength:UBS_BLOCK options:MTLResourceStorageModeShared]; if (!b) MDIE("uniform 更新环分配失败 %#x", UBS_BLOCK);
+                res_add(b); g_ubs_pool[g_ubs_pool_n].buf = b; g_ubs_cur = g_ubs_pool_n++; }
+            if (g_ubs_cur >= 0) { g_ubs_pool[g_ubs_cur].fence = UINT64_MAX; g_ubs_buf = g_ubs_pool[g_ubs_cur].buf; g_ubs_size = UBS_BLOCK; }
+        }
+        if (!g_ubs_buf) {   // larger than a block, or every block still in flight
+            g_ubs_size = MAX((size_t)UBS_BLOCK, need);
+            g_ubs_buf = [g_dev newBufferWithLength:g_ubs_size options:MTLResourceStorageModeShared];
+            if (!g_ubs_buf) MDIE("uniform 更新环分配失败 %#zx", g_ubs_size);
+            res_add(g_ubs_buf);
+        }
+        g_ubs_off = 0;
+    }
+    size_t at = g_ubs_off;
+    if (place) { at = (at + 255) & ~(size_t)255; at += (size_t)((dst - (g_ubs_buf.gpuAddress + at)) & 255); }
+    g_ubs_off = (at + n + 15u) & ~(size_t)15u;
+    return at;
+}
+// Uniform update renaming (DM_NVN_UBREN; only while the TBDR optimizations are off, whose lookaheads take an update as the end of the pass):
+// an update neither ends the pass nor opens a copy encoder between passes. Its bytes stay in the ring, and later draws bind the ring copy in place of the guest address
+// (the newest deferred update overlapping the range the shader reads must cover all of it; a range only partly covered gets a snapshot, ubm_get).
+// The copies into guest memory are encoded in order only when something else needs guest memory: a copy / fill / dispatch, a draw reading a deferred range any other way
+// (vertex / index / storage / buffer texture, or a partly covered uniform that cannot be snapshotted - that draw also ends the pass), and the end of the submission.
+// Measured on TotK Sky Island (1.4.2, frame 2400): 203 of 348 render passes per frame ended at an update, each loading and storing all of its attachments again (first version: inside a pass only).
+// After that (frame 4000) the updates between passes and the landings at each pass end still put ~98 copy encoders per frame between render passes, and every switch from a copy back to
+// rendering left the GPU idle ~8 µs (tail ~80 µs): 2.4 ms per frame, ~6 ms on every 9th frame (cube map filtering: 132 passes of 8x8–64x64, each after five 4–8-byte field updates).
+// DM_NVN_UBREN=0 off, =1 the first version (inside a pass only, landed at the pass end, the whole binding must be covered)
 typedef struct { uint64_t lo, hi, gpu, ro, dof; void *buf, *db; } ubd_ent;   // guest range [lo, hi), ring copy (GPU address, block, offset), destination pool buffer + offset
-enum { UBD_MAX = 512 };
+enum { UBD_MAX = 1024 };
 static ubd_ent g_ubd[UBD_MAX]; static int g_ubd_n;
 static int g_ubd_gap;   // an update was deferred and no draw has continued the pass yet: the old code had no pass open here (clears / counter resets end the pass first, see the replay)
 static uint64_t g_ubd_lo, g_ubd_hi, g_ubd_total, g_ubd_cuts, g_ubd_dead;   // bounds of all deferred ranges (quick rejection); cumulative deferred updates / passes ended by a reader / copies skipped as rewritten
-static int ubd_want(void);   // defined after the render pass code
+static uint64_t g_ubd_gen, g_ubd_lands;   // generation of the deferred and landed sets (snapshot cache key); landings that encoded copies
+static int ubd_mode(void);   // 0 off, 1 first version, 2 default (defined after the render pass code)
+static int ubd_want(void);
 static void ubd_add(uint64_t dst, uint64_t n, id<MTLBuffer> ring, size_t ro, void *db, uint64_t dof);
-static void ubd_flush(void);   // the copies into guest memory, in order (rp_end)
+static void ubd_flush(void);   // the copies into guest memory, in order
+// Landed updates whose submission may still be in flight (mode 2): the CPU sees them in guest memory only once it completes, so a snapshot lays them over the current bytes, in landing order
+typedef struct { uint64_t lo, hi, fence; const uint8_t *src; CFTypeRef blk; } ubl_ent;   // blk: the ring block holding the bytes, retained until pruned
+enum { UBL_MAX = 4096 };
+static ubl_ent g_ubl[UBL_MAX]; static int g_ubl_n; static uint64_t g_ubl_over;   // g_ubl_over: the list overflowed in this submission - no snapshots until it completes
+static void ubl_prune(void) {
+    uint64_t done = g_done; int w = 0;
+    for (int i = 0; i < g_ubl_n; i++) { if (g_ubl[i].fence <= done) { CFRelease(g_ubl[i].blk); continue; } g_ubl[w++] = g_ubl[i]; }
+    g_ubl_n = w;
+}
+static void ubl_add(uint64_t lo, uint64_t n, id<MTLBuffer> blk, size_t off) {
+    if (ubd_mode() < 2) return;
+    if (g_ubl_n == UBL_MAX) ubl_prune();
+    if (g_ubl_n == UBL_MAX) { g_ubl_over = g_fence + 1; return; }
+    g_ubl[g_ubl_n++] = (ubl_ent){lo, lo + n, g_fence + 1, (const uint8_t *)blk.contents + off, CFBridgingRetain(blk)};
+    g_ubd_gen++;
+}
 void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
     if (!n) return;
     if (g_npend < PEND_MAX) { g_pend_lo[g_npend] = dst; g_pend_hi[g_npend++] = dst + n; } else g_pend_over = 1;
     void *db; uint64_t dof;
     if (!mtl_addr(dst, n, &db, &dof)) MDIE("uniform 更新目标不在任何内存池内 dst=%#llx n=%#llx", (unsigned long long)dst, (unsigned long long)n);
     int ren = ubd_want();
-    size_t need = ((n + 15u) & ~(size_t)15u) + (ren ? 512 : 0);   // renamed: room to place the bytes at the destination's address modulo 256 (shaders read them in its place)
-    if (!g_ubs_buf || g_ubs_off + need > g_ubs_size) {
-        if (g_ubs_buf) defer_obj_release(g_ubs_buf);   // copies already encoded still reference the old block: release after this submission completes
-        g_ubs_size = MAX((size_t)1 << 20, need);
-        g_ubs_buf = [g_dev newBufferWithLength:g_ubs_size options:MTLResourceStorageModeShared];
-        if (!g_ubs_buf) MDIE("uniform 更新环分配失败 %#zx", g_ubs_size);
-        res_add(g_ubs_buf); g_ubs_off = 0;
-    }
-    size_t at = g_ubs_off;
-    if (ren) { at = (at + 255) & ~(size_t)255; at += (size_t)((dst - (g_ubs_buf.gpuAddress + at)) & 255); }
+    size_t at = ubs_alloc(n, dst, ren);   // renamed: placed at the destination's address modulo 256 (shaders read them in its place)
     memcpy((uint8_t *)g_ubs_buf.contents + at, data, n);
-    if (ren) { ubd_add(dst, n, g_ubs_buf, at, db, dof); g_ubs_off = (at + n + 15u) & ~(size_t)15u; return; }
-    enc_b_copy_buffer(blit_buf(0, 0, dst, dst + n), g_ubs_buf, at, (__bridge id<MTLBuffer>)db, dof, n);
-    g_ubs_off += need;
+    if (ren) { ubd_add(dst, n, g_ubs_buf, at, db, dof); return; }
+    g_pg_bwhy = 'u';
+    id<MTL4ComputeCommandEncoder> e = blit_buf(0, 0, dst, dst + n);   // lands the deferred updates first
+    ubl_add(dst, n, g_ubs_buf, at);
+    enc_b_copy_buffer(e, g_ubs_buf, at, (__bridge id<MTLBuffer>)db, dof, n);
 }
 
 // In-order buffer fill within the submission: all four bytes equal → fillBuffer; otherwise copied in chunks from a 64 KiB pattern buffer
 void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
     if (!n) return;
     if (g_npend < PEND_MAX) { g_pend_lo[g_npend] = dst; g_pend_hi[g_npend++] = dst + n; } else g_pend_over = 1;
+    uw_mark(dst, n);
     void *db; uint64_t dof;
     if (!mtl_addr(dst, n, &db, &dof)) MDIE("缓冲填充地址不在任何内存池内 dst=%#llx n=%#llx", (unsigned long long)dst, (unsigned long long)n);
     uint8_t b0 = (uint8_t)value;
+    g_pg_bwhy = 'f';
     if (value == (uint32_t)b0 * 0x01010101u) { [blit_buf(0, 0, dst, dst + n) fillBuffer:(__bridge id<MTLBuffer>)db range:NSMakeRange(dof, n) value:b0]; return; }
     enum { PAT = 0x10000 }; static __strong id<MTLBuffer> pat; static uint32_t pat_v; static int pat_ok;
     if (!pat_ok || pat_v != value) { uint32_t *tmp = malloc(PAT); for (unsigned i = 0; i < PAT / 4; i++) tmp[i] = value;
         pat = [g_dev newBufferWithBytes:tmp length:PAT options:MTLResourceStorageModeShared]; free(tmp); pat_v = value; pat_ok = 1; res_add(pat); }
-    for (uint64_t off = 0; off < n; off += PAT) { uint64_t k = n - off < PAT ? n - off : PAT; enc_b_copy_buffer(blit_buf(0, 0, dst + off, dst + off + k), pat, 0, (__bridge id<MTLBuffer>)db, dof + off, k); }
+    for (uint64_t off = 0; off < n; off += PAT) { uint64_t k = n - off < PAT ? n - off : PAT; g_pg_bwhy = 'f'; enc_b_copy_buffer(blit_buf(0, 0, dst + off, dst + off + k), pat, 0, (__bridge id<MTLBuffer>)db, dof + off, k); }
 }
 
 static void post(post_op o) {
     if (g_npost == g_postcap) { g_postcap = g_postcap ? g_postcap * 2 : 64; g_post = realloc(g_post, g_postcap * sizeof *g_post); }
     g_post[g_npost++] = o;
 }
-void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0, NULL}); }
+void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { uw_mark((uint64_t)(uintptr_t)val, 4); post((post_op){1, val, mode, v, 0, 0, NULL}); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) { post((post_op){2, NULL, 0, 0, addr, type, NULL}); }
 void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]) { memcpy(rep, g_cnt_report, sizeof g_cnt_report); memcpy(rst, g_cnt_reset, sizeof g_cnt_reset); }
 
@@ -765,6 +838,7 @@ int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) {
     return *t1 >= *t0 && *t1;
 }
 static void rp_flush(void);
+static void pg_commit4(MTL4CommitOptions *o);   // DM_NVN_PASSGPU: resolve this submission's pass timestamps on completion
 static const char *cctx_snap(void);   // What is in this submission (printed into the failure line on error; defined before mtl_exec)
 uint64_t mtl_sub_commit(void) {
     defer_fallback();   // Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
@@ -800,6 +874,7 @@ uint64_t mtl_sub_commit(void) {
     }];
     void arena_commit(uint64_t fence); arena_commit(fence);
     res_commit();
+    pg_commit4(o);
     [g_cb endCommandBuffer];
     id<MTL4CommandBuffer> buffers[] = {g_cb};
     [g_q4 commit:buffers count:1 options:o];
@@ -1615,119 +1690,135 @@ static void pass_dims(MTL4RenderPassDescriptor *pd, NSUInteger nc, NSUInteger *w
     if (!*w) { *w = MAX(pd.renderTargetWidth, 1); *h = MAX(pd.renderTargetHeight, 1); }   // attachment-less pass: its explicit size
 }
 
-// ---------- DM_NVN_PASSGPU=<file>: per-pass GPU time (stage-boundary timestamp counters) ----------
-// Each render pass samples 4 points (vertex start/end, fragment start/end), a compute pass 2 points; resolved after the command buffer completes and accumulated by 'index of the pass within the frame'.
-// Each line: frame idx kind gpu_ms inc_ms w h fmt0 dfmt load draws t0_ns t1_ns (kind: R render / C compute; load: L load / C clear for each color attachment + depth)
-// On TBDR passes overlap in the pipeline (the later pass's vertex stage is earlier than the end of the earlier pass's fragment stage): gpu_ms = this pass's start-to-end span (including queueing) and cannot be summed;
-// attribution uses the timeline increment inc_ms = t1 − max(t0, latest t1 of the passes completed so far); the sum of the increments of all passes = total time the GPU is busy (command buffers complete in submission order)
-typedef struct { uint64_t frame, pass; int idx, kind, w, h, draws, slot; uint32_t cfmt0, dfmt; char load[12]; } pg_pass;   // pass: global pass number (same as the pass number in the DM_NVN_PASSDUMP lines, for joining the two records)
-#define PG_SLOTS 4096   // Counter sample buffer limit 32768 bytes = 4096 timestamps (measured from the error on this machine)
+// ---------- DM_NVN_PASSGPU=<file>: per-pass GPU time (Metal 4 counter heap timestamps) ----------
+// Each render / compute / copy encoder writes a timestamp when it starts and one when its work is done; resolved when the submission completes.
+// One line per pass: frame idx kind(R render / C compute / B copy) t0_ns t1_ns gap_ns seg w h fmt0 dfmt load draws(copies: operation count) key pass (gap = GPU idle since the previous pass ended; seg changes at each
+// segment commit, so a gap there may be the GPU waiting for the replay; key = first draw's fragment shader). Every 300 frames a summary line goes to the log
+typedef struct { uint64_t frame, pass; int idx, kind, w, h, draws, slot, seg; uint32_t cfmt0, dfmt; char load[12], key[12]; } pg_pass;
+#define PG_SLOTS 4096
 #define PG_RING 8
-static int g_pg = -1; static FILE *g_pg_f;
-static id<MTLCounterSampleBuffer> g_pg_buf[PG_RING]; static int g_pg_b; static uint32_t g_pg_used;
-static pg_pass *g_pg_pass; static int g_pg_np, g_pg_cap, g_pg_open = -1;
+static int g_pg = -1; static FILE *g_pg_f; static double g_pg_ns_per_tick = 1;
+static id<MTL4CounterHeap> g_pg_heap[PG_RING]; static int g_pg_b; static uint32_t g_pg_used;
+static pg_pass *g_pg_pass; static int g_pg_np, g_pg_cap, g_pg_open = -1, g_pg_cslot = -1, g_pg_bopen = -1, g_pg_seg;
 static uint64_t g_pg_frame = ~0ull; static int g_pg_idx;
 static pthread_mutex_t g_pg_mu = PTHREAD_MUTEX_INITIALIZER;
 static inline void args_dirty_all(void);
-typedef struct { double sum, last; uint64_t n; pg_pass meta; } pg_stat;
-static pg_stat g_pg_st[256]; static uint64_t g_pg_rep_frame;
 static int pg_on(void) {
     if (g_pg >= 0) return g_pg;
     const char *e = getenv("DM_NVN_PASSGPU"); g_pg = 0;
     if (!e) return 0;
-    if (![g_dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { MLOG("【红】DM_NVN_PASSGPU：本设备不支持阶段边界计数采样"); return 0; }
-    id<MTLCounterSet> ts = nil; for (id<MTLCounterSet> c in g_dev.counterSets) if ([c.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = c;
-    if (!ts) { MLOG("【红】DM_NVN_PASSGPU：没有时间戳计数器集"); return 0; }
-    MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
-    d.counterSet = ts; d.storageMode = MTLStorageModeShared; d.sampleCount = PG_SLOTS;
-    for (int i = 0; i < PG_RING; i++) { NSError *er = nil; g_pg_buf[i] = [g_dev newCounterSampleBufferWithDescriptor:d error:&er]; if (!g_pg_buf[i]) { MLOG("【红】计数采样缓冲建不出：%s", er.localizedDescription.UTF8String); return 0; } }
+    MTL4CounterHeapDescriptor *d = [MTL4CounterHeapDescriptor new]; d.type = MTL4CounterHeapTypeTimestamp; d.count = PG_SLOTS;
+    for (int i = 0; i < PG_RING; i++) { NSError *er = nil; g_pg_heap[i] = [g_dev newCounterHeapWithDescriptor:d error:&er]; if (!g_pg_heap[i]) { MLOG("【红】DM_NVN_PASSGPU：计数堆建不出：%s", er.localizedDescription.UTF8String); return 0; } }
+    uint64_t hz = [g_dev queryTimestampFrequency]; if (hz) g_pg_ns_per_tick = 1e9 / (double)hz;
     if (!(g_pg_f = fopen(e, "w"))) { MLOG("【红】DM_NVN_PASSGPU 打不开 %s", e); return 0; }
-    fprintf(g_pg_f, "frame\tidx\tkind\tgpu_ms\tinc_ms\tw\th\tfmt0\tdfmt\tload\tdraws\tt0_ns\tt1_ns\tpass\n");
-    MLOG("[passgpu] 逐通道 GPU 计时 → %s", e);
+    fprintf(g_pg_f, "frame\tidx\tkind\tt0_ns\tt1_ns\tgap_ns\tseg\tw\th\tfmt0\tdfmt\tload\tdraws\tkey\tpass\n");
+    MLOG("[passgpu] 逐通道 GPU 计时（Metal 4 计数堆，时间戳 %llu Hz）→ %s", (unsigned long long)hz, e);
     return g_pg = 1;
 }
 static void pg_sub_begin(uint64_t fence) {   // This submission uses block fence % PG_RING of the ring; first wait for the submission that used it PG_RING submissions ago to complete
     if (!pg_on()) return;
     if (fence > PG_RING) mtl_wait(fence - PG_RING, UINT64_MAX);
-    g_pg_b = (int)(fence % PG_RING); g_pg_used = 0; g_pg_np = 0; g_pg_open = -1;
+    g_pg_b = (int)(fence % PG_RING); g_pg_used = 0; g_pg_np = 0; g_pg_open = g_pg_cslot = g_pg_bopen = -1;
 }
 static pg_pass *pg_new(int kind, int nslot) {
     if (!pg_on() || g_pg_used + nslot > PG_SLOTS) return NULL;
     uint64_t f = atomic_load(&g_cur_frame); if (f != g_pg_frame) { g_pg_frame = f; g_pg_idx = 0; }
     if (g_pg_np == g_pg_cap) { g_pg_cap = g_pg_cap ? g_pg_cap * 2 : 128; g_pg_pass = realloc(g_pg_pass, g_pg_cap * sizeof *g_pg_pass); }
     pg_pass *p = &g_pg_pass[g_pg_np++]; memset(p, 0, sizeof *p);
-    p->frame = f; p->pass = g_stat_pass; p->idx = g_pg_idx++; p->kind = kind; p->slot = (int)g_pg_used; p->draws = -(int)g_stat_draw;
+    p->frame = f; p->pass = g_stat_pass; p->idx = g_pg_idx++; p->kind = kind; p->slot = (int)g_pg_used; p->draws = -(int)g_stat_draw; p->seg = g_pg_seg;
     g_pg_used += nslot;
     return p;
 }
-static void pg_render(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
-    (void)pd; (void)nc;
-    return;
-#if 0
-    pg_pass *p = pg_new(0, 4); if (!p) return;
-    MTLRenderPassSampleBufferAttachmentDescriptor *a = pd.sampleBufferAttachments[0];
-    a.sampleBuffer = g_pg_buf[g_pg_b];
-    a.startOfVertexSampleIndex = p->slot; a.endOfVertexSampleIndex = p->slot + 1; a.startOfFragmentSampleIndex = p->slot + 2; a.endOfFragmentSampleIndex = p->slot + 3;
+static void pg_render(MTL4RenderPassDescriptor *pd, NSUInteger nc) {   // before the encoder exists: record the pass (timestamps: pg_render_begin / pg_render_end)
+    pg_pass *p = pg_new(0, 2); if (!p) return;
+    p->pass = g_stat_pass + 1;
     id<MTLTexture> t0 = nil; int k = 0;
     for (NSUInteger i = 0; i < nc && i < 8; i++) { id<MTLTexture> t = pd.colorAttachments[i].texture; if (!t) continue;
         if (!t0) t0 = t; if (k < 10) p->load[k++] = pd.colorAttachments[i].loadAction == MTLLoadActionClear ? 'C' : 'L'; }
-    id<MTLTexture> dt = pd.depthAttachment.texture;
-    if (dt) { if (k < 10) { p->load[k++] = '|'; p->load[k++] = pd.depthAttachment.loadAction == MTLLoadActionClear ? 'C' : 'L'; } p->dfmt = (uint32_t)dt.pixelFormat; }
+    id<MTLTexture> dt = pd.depthAttachment.texture ?: pd.stencilAttachment.texture;
+    if (dt) { if (k < 10) { p->load[k++] = '|'; p->load[k++] = (pd.depthAttachment.texture ? pd.depthAttachment.loadAction : pd.stencilAttachment.loadAction) == MTLLoadActionClear ? 'C' : 'L'; } p->dfmt = (uint32_t)dt.pixelFormat; }
     if (!t0) t0 = dt;
     NSUInteger pw, ph; pass_dims(pd, nc, &pw, &ph);
     p->w = (int)pw; p->h = (int)ph; p->cfmt0 = t0 && t0 != dt ? (uint32_t)t0.pixelFormat : 0;
     g_pg_open = g_pg_np - 1;
-#endif
 }
+static void pg_render_begin(id<MTL4RenderCommandEncoder> e) {
+    if (g_pg_open >= 0) [e writeTimestampWithGranularity:MTL4TimestampGranularityPrecise afterStage:MTLRenderStageVertex intoHeap:g_pg_heap[g_pg_b] atIndex:(NSUInteger)g_pg_pass[g_pg_open].slot];
+}
+static void pg_render_end(id<MTL4RenderCommandEncoder> e) {
+    if (g_pg_open < 0) return;
+    [e writeTimestampWithGranularity:MTL4TimestampGranularityPrecise afterStage:MTLRenderStageFragment intoHeap:g_pg_heap[g_pg_b] atIndex:(NSUInteger)g_pg_pass[g_pg_open].slot + 1];
+    g_pg_pass[g_pg_open].draws += (int)g_stat_draw; g_pg_open = -1;
+}
+static void pg_draw_key(const char *key) { if (g_pg_open >= 0 && !g_pg_pass[g_pg_open].key[0] && key) { memcpy(g_pg_pass[g_pg_open].key, key, 8); g_pg_pass[g_pg_open].key[8] = 0; } }
 static id<MTLComputeCommandEncoder> pg_compute(void) {
     pg_pass *p = pg_new(1, 2);
     ser_gate();
-    if (!p) { args_dirty_all(); return enc_c_begin(NULL); }
-    MTLComputePassDescriptor *cd = [MTLComputePassDescriptor computePassDescriptor];
-    cd.sampleBufferAttachments[0].sampleBuffer = g_pg_buf[g_pg_b];
-    cd.sampleBufferAttachments[0].startOfEncoderSampleIndex = p->slot; cd.sampleBufferAttachments[0].endOfEncoderSampleIndex = p->slot + 1;
-    p->draws = 0;
     args_dirty_all();
-    return enc_c_begin(cd);
+    id<MTL4ComputeCommandEncoder> e = enc_c_begin(NULL);
+    if (p) { p->draws = 0; [e writeTimestampWithGranularity:MTL4TimestampGranularityPrecise intoHeap:g_pg_heap[g_pg_b] atIndex:(NSUInteger)p->slot]; g_pg_cslot = p->slot + 1; }
+    return (id<MTLComputeCommandEncoder>)e;
 }
-static void pg_end_render(void) { if (g_pg_open >= 0) { g_pg_pass[g_pg_open].draws += (int)g_stat_draw; g_pg_open = -1; } }
-static void pg_commit(id<MTLCommandBuffer> cb) {   // Hand this submission's pass table to the completion callback for resolving
-    if (!g_pg || !g_pg_np) return;
-    int n = g_pg_np; pg_pass *ps = malloc(n * sizeof *ps); memcpy(ps, g_pg_pass, n * sizeof *ps);
-    id<MTLCounterSampleBuffer> buf = g_pg_buf[g_pg_b]; uint32_t used = g_pg_used;
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
-        (void)c;
-        NSData *d = [buf resolveCounterRange:NSMakeRange(0, used)];
-        const MTLCounterResultTimestamp *ts = d.bytes;
-        pthread_mutex_lock(&g_pg_mu);
-        for (int i = 0; d && i < n; i++) {
-            pg_pass *p = &ps[i]; uint64_t a, b;
-            #define OK(x) ((x) != MTLCounterErrorValue && (x) != 0)
-            if (p->kind == 0) { a = OK(ts[p->slot].timestamp) ? ts[p->slot].timestamp : ts[p->slot + 2].timestamp; b = OK(ts[p->slot + 3].timestamp) ? ts[p->slot + 3].timestamp : ts[p->slot + 1].timestamp; }
-            else { a = ts[p->slot].timestamp; b = ts[p->slot + 1].timestamp; }
-            if (!OK(a) || !OK(b) || b < a) continue;
-            #undef OK
-            static uint64_t prev_end;   // Latest end time of the passes completed so far (completion callbacks are serialized in submission order)
-            double ms = (b - a) / 1e6;   // Timestamps are in ns, same as the CPU (measured 1:1 via sampleTimestamps on this machine)
-            double inc = b > prev_end ? (b - (a > prev_end ? a : prev_end)) / 1e6 : 0;
-            if (b > prev_end) prev_end = b;
-            fprintf(g_pg_f, "%llu\t%d\t%c\t%.4f\t%.4f\t%d\t%d\t%u\t%u\t%s\t%d\t%llu\t%llu\t%llu\n", (unsigned long long)p->frame, p->idx, p->kind ? 'C' : 'R', ms, inc,
-                    p->w, p->h, p->cfmt0, p->dfmt, p->load, p->draws, (unsigned long long)a, (unsigned long long)b, (unsigned long long)p->pass);
-            if (p->idx < 256 && p->frame > 300) { pg_stat *st = &g_pg_st[p->idx]; st->sum += inc; st->n++; st->last = inc; st->meta = *p; }
-            if (p->frame >= g_pg_rep_frame + 300 && p->frame > 300) {   // Report the top five every 300 frames (accumulated from frame 300)
-                g_pg_rep_frame = p->frame; double tot = 0; int top[5] = {-1, -1, -1, -1, -1};
-                for (int k = 0; k < 256; k++) if (g_pg_st[k].n) { double m = g_pg_st[k].sum / g_pg_st[k].n; tot += m;
-                    for (int j = 0; j < 5; j++) if (top[j] < 0 || m > g_pg_st[top[j]].sum / g_pg_st[top[j]].n) { for (int q = 4; q > j; q--) top[q] = top[q - 1]; top[j] = k; break; } }
-                char line[1024]; size_t o = 0;
-                for (int j = 0; j < 5 && top[j] >= 0; j++) { pg_stat *t = &g_pg_st[top[j]];
-                    o += snprintf(line + o, sizeof line - o, " #%d %.2f ms %dx%d fmt%u d%u %s %d 绘制；", top[j], t->sum / t->n, t->meta.w, t->meta.h, t->meta.cfmt0, t->meta.dfmt, t->meta.load, t->meta.draws); }
-                MLOG("[passgpu] 至帧 %llu 每帧通道均值合计 %.2f ms；前五：%s", (unsigned long long)p->frame, tot, line);
-                fflush(g_pg_f);
+static void pg_compute_end(id e) {
+    if (g_pg_cslot < 0) return;
+    [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityPrecise intoHeap:g_pg_heap[g_pg_b] atIndex:(NSUInteger)g_pg_cslot]; g_pg_cslot = -1;
+}
+static void pg_blit_begin(id<MTL4ComputeCommandEncoder> e) {
+    pg_pass *p = pg_new(2, 2); if (!p) return;
+    p->draws = 0; [e writeTimestampWithGranularity:MTL4TimestampGranularityPrecise intoHeap:g_pg_heap[g_pg_b] atIndex:(NSUInteger)p->slot]; g_pg_bopen = g_pg_np - 1;
+}
+static void pg_blit_op(void) {
+    char c = g_pg_bwhy ? g_pg_bwhy : 't'; g_pg_bwhy = 0;
+    if (g_pg_bopen < 0) return;
+    pg_pass *p = &g_pg_pass[g_pg_bopen]; p->draws++;
+    size_t k = strlen(p->key); if (k < sizeof p->key - 1) p->key[k] = c;
+}
+static void pg_blit_end(id e) {
+    if (g_pg_bopen < 0) return;
+    [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityPrecise intoHeap:g_pg_heap[g_pg_b] atIndex:(NSUInteger)g_pg_pass[g_pg_bopen].slot + 1]; g_pg_bopen = -1;
+}
+// Completion of a submission: resolve its timestamps in pass order (submissions complete in order, so prev_end carries across them)
+static void pg_resolve(id<MTL4CounterHeap> heap, uint32_t used, pg_pass *ps, int n) {
+    NSData *d = [heap resolveCounterRange:NSMakeRange(0, used)];
+    const MTL4TimestampHeapEntry *ts = d.bytes;
+    pthread_mutex_lock(&g_pg_mu);
+    static uint64_t prev_end, cur_frame = ~0ull; static int prev_seg = -1;
+    static double f_busy, f_gap, f_gap_seg, f_pass, w_busy, w_gap, w_gap_seg, w_pass, w_frames;
+    for (int i = 0; d && i < n; i++) {
+        pg_pass *p = &ps[i];
+        uint64_t a = ts[p->slot].timestamp, b = ts[p->slot + 1].timestamp;
+        if (!a || !b || b < a) continue;
+        uint64_t a_ns = (uint64_t)(a * g_pg_ns_per_tick), b_ns = (uint64_t)(b * g_pg_ns_per_tick);
+        int64_t gap = prev_end ? (int64_t)a_ns - (int64_t)prev_end : 0;
+        if (p->frame != cur_frame) {   // a frame's passes are all resolved before the next frame's: close its totals
+            if (cur_frame != ~0ull && cur_frame > 300) { w_busy += f_busy; w_gap += f_gap; w_gap_seg += f_gap_seg; w_pass += f_pass; w_frames++; }
+            f_busy = f_gap = f_gap_seg = f_pass = 0; cur_frame = p->frame;
+            if (w_frames >= 300) {
+                MLOG("[passgpu] 至帧 %llu 每帧：通道 %.1f 个，GPU 忙 %.2f ms，通道间空闲 %.2f ms（同一段内）+ %.2f ms（换段处，可能在等回放）", (unsigned long long)p->frame,
+                     w_pass / w_frames, w_busy / w_frames, w_gap / w_frames, w_gap_seg / w_frames);
+                w_busy = w_gap = w_gap_seg = w_pass = w_frames = 0; fflush(g_pg_f);
             }
         }
-        pthread_mutex_unlock(&g_pg_mu);
-        free(ps);
-    }];
+        double inc = b_ns > prev_end ? (b_ns - (a_ns > prev_end ? a_ns : prev_end)) / 1e6 : 0;
+        f_busy += inc; f_pass++;
+        if (gap > 0) { if (p->seg == prev_seg) f_gap += gap / 1e6; else f_gap_seg += gap / 1e6; }
+        fprintf(g_pg_f, "%llu\t%d\t%c\t%llu\t%llu\t%lld\t%d\t%d\t%d\t%u\t%u\t%s\t%d\t%s\t%llu\n", (unsigned long long)p->frame, p->idx, "RCB"[p->kind],
+                (unsigned long long)a_ns, (unsigned long long)b_ns, (long long)gap, p->seg, p->w, p->h, p->cfmt0, p->dfmt, p->load[0] ? p->load : "-", p->draws, p->key[0] ? p->key : "-", (unsigned long long)p->pass);
+        if (b_ns > prev_end) prev_end = b_ns;
+        prev_seg = p->seg;
+    }
+    [heap invalidateCounterRange:NSMakeRange(0, used)];
+    pthread_mutex_unlock(&g_pg_mu);
+    free(ps);
+}
+// At commit: hand this submission's pass table to the completion feedback
+static void pg_commit4(MTL4CommitOptions *o) {
+    g_pg_seg++;
+    if (g_pg <= 0 || !g_pg_np) return;
+    g_pg_open = -1;
+    int n = g_pg_np; pg_pass *ps = malloc(n * sizeof *ps); memcpy(ps, g_pg_pass, n * sizeof *ps);
+    id<MTL4CounterHeap> heap = g_pg_heap[g_pg_b]; uint32_t used = g_pg_used;
+    [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; pg_resolve(heap, used, ps, n); }];
 }
 void ts_after(void);
 void ms_after(void);
@@ -1854,16 +1945,15 @@ static void rp_end(void) { if (g_enc) { AP_B;
 #ifdef NVN_RT_RANGE_TEST
     int ranged=g_rt_range_active && !g_rt_range_pending;
 #endif
-    sd_finish(); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
+    sd_finish(); pg_render_end(g_enc); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
     if (g_nbcrt) bcrt_flush();
-    if (g_ubd_n) ubd_flush();   // after the ghost draw (ghost_flush) and the end of the encoder: every draw of the pass has been encoded
+    if (g_ubd_n && ubd_mode() < 2) ubd_flush();   // first version: lands at the end of the pass (after the ghost draw (ghost_flush) and the end of the encoder: every draw of the pass has been encoded)
 #ifdef NVN_RT_RANGE_TEST
     rr_finish(ranged);
 #endif
     AP_E(0);
 } }
 void pg_sub_begin_ext(uint64_t fence) { pg_sub_begin(fence); }
-void pg_commit_ext(id<MTLCommandBuffer> cb) { pg_commit(cb); }
 // Rendering into BC-compressed textures (TotK draws into BC4 textures through an RGBA16UI view: one pixel = one 4x4 block, compressing textures on the GPU): Metal forbids views between compressed and uncompressed formats,
 // and building the pipeline with the base format trips a Metal assertion (BC4 is not color renderable). The pass instead draws into an uncompressed shadow of blocks x blocks: the blocks are moved in through a buffer before the pass and moved back unchanged after it (byte for byte).
 // Only "BC base with an uncompressed view whose bytes per pixel equal the block size" takes this path; everything else is unchanged
@@ -2122,6 +2212,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }   // moving blocks into a BC shadow opened the copy encoder (bcrt_attach)
     ser_gate();
     g_enc = enc_r_begin(pd);
+    pg_render_begin(g_enc);
     args_dirty_all();
     g_stat_pass++;
     if (enc_label_on()) { id<MTLTexture> lt = pd.colorAttachments[0].texture ?: pd.depthAttachment.texture ?: pd.stencilAttachment.texture; g_el_w = (int)lt.width; g_el_h = (int)lt.height; g_el_draws = 0; g_el_key[0] = 0; }
@@ -2213,6 +2304,7 @@ static void shmap_load(void) {
 }
 
 @interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+    uint32_t cb_len[16];   // bytes uniform slot r can read from the start of its binding (msl_cb_len); 0 = unknown, the whole binding
     // The argument buffer encoded last time
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; } @end   // bflib: readable-tile version <key>_bf (merge B step 2)
@@ -2338,6 +2430,36 @@ static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
     dispatch_data_t d = dispatch_data_create(m, len, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ munmap(m, len); });
     return [g_dev newLibraryWithData:d error:err];
 }
+// Static read length of a uniform binding in translated MSL: every use of the binding's name must be its declaration or `<name>)._m0[<decimal>]` (a float4 index, u suffix allowed).
+// Returns 16 x (highest index + 1); 0 = unknown (a non-constant index, any other kind of use). Over the TotK library 91.7% of uniform bindings are static, most read under 4 KiB of a 64 KiB block
+static uint32_t msl_cb_len(const char *s, size_t n, const char *name) {
+    static const char acc[] = ")._m0[";
+    size_t k = strlen(name); int other = 0; long hi = -1;
+    if (!k) return 0;
+    for (const char *p = s, *end = s + n; (size_t)(end - p) >= k;) {
+        const char *q = memmem(p, (size_t)(end - p), name, k); if (!q) break;
+        p = q + k;
+        if ((q > s && (isalnum((unsigned char)q[-1]) || q[-1] == '_')) || (p < end && (isalnum((unsigned char)*p) || *p == '_'))) continue;   // part of a longer name
+        if ((size_t)(end - p) > sizeof acc - 1 && !memcmp(p, acc, sizeof acc - 1)) {
+            const char *d = p + sizeof acc - 1; long v = 0; int nd = 0;
+            while (d < end && *d >= '0' && *d <= '9' && nd < 6) { v = v * 10 + (*d++ - '0'); nd++; }
+            if (d < end && *d == 'u') d++;
+            if (!nd || d >= end || *d != ']') return 0;
+            if (v > hi) hi = v;
+        } else if (++other > 1) return 0;   // the declaration is the one other use allowed
+    }
+    return hi < 0 ? 16 : (uint32_t)(hi + 1) * 16;
+}
+static void cb_lens(NvShader *o, NSDictionary *j, NSString *pc) {   // from <key>.metal next to the library; none there (packaged builds) = unknown
+    NSArray *bs = j[@"bindings"]; NSData *d = nil;
+    if (![bs isKindOfClass:[NSArray class]]) return;
+    for (NSDictionary *b in bs) {
+        if (![b isKindOfClass:[NSDictionary class]] || ![b[@"kind"] isEqual:@"cbuf"] || ![b[@"msl_name"] isKindOfClass:[NSString class]] || ![b[@"reg"] isKindOfClass:[NSNumber class]]) continue;
+        int reg = [b[@"reg"] intValue]; if (reg < 0 || reg >= 16) continue;
+        if (!d && !(d = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"%@/%@.metal", g_msl_dir, pc] options:NSDataReadingMappedIfSafe error:nil])) return;
+        o->cb_len[reg] = msl_cb_len(d.bytes, d.length, [b[@"msl_name"] UTF8String]);
+    }
+}
 static NvShader *shader_load(NSString *pc, int stage) {
     NSError *e = nil;
     NSString *lp = [NSString stringWithFormat:@"%@/%@.metallib", g_msl_dir, pc];
@@ -2350,6 +2472,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
     char err[160];
     if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("【红】着色器 %s 反射转换失败：%s", pc.UTF8String, err); return nil; }
     if (rt_range_on()) o->range_ro=rt_range_bindings_ro(j);
+    cb_lens(o, j, pc);
     o->fn = [lib newFunctionWithName:j[@"entry"]]; o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key);
     if (o->rf.nb) {
         o->ae = [o->fn newArgumentEncoderWithBufferIndex:o->rf.abi];
@@ -3146,26 +3269,37 @@ static uint8_t g_args_dirty[6] = {1, 1, 1, 1, 1, 1};
 static uint64_t g_args_reg_seen, g_args_dirty_seen;
 static inline void args_dirty_all(void) { memset(g_args_dirty, 1, sizeof g_args_dirty); }
 // ---------- Uniform update renaming (see g_ubd before mtl_sub_update) ----------
-static int ubd_want(void) {
-    static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_UBREN"); v = !(e && !strcmp(e, "0")); MLOG("uniform 更新改名：%s（DM_NVN_UBREN=0 关；TBDR 优化开时不改名）", v ? "开" : "关"); }
-    return v && g_enc && g_ubd_n < UBD_MAX && !tbdr_on();
+static int ubd_mode(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_NVN_UBREN"); v = e && (!strcmp(e, "0") || !strcmp(e, "1")) ? *e - '0' : 2;
+        MLOG("uniform 更新改名：%s（DM_NVN_UBREN=0 关，=1 只在通道内；TBDR 优化开时不改名）", v == 2 ? "开（通道之间也推迟，部分覆盖做快照）" : v ? "只在通道内" : "关"); }
+    return v;
 }
+static int ubd_want(void) { int m = ubd_mode(); return m && (g_enc || m == 2) && g_ubd_n < UBD_MAX && !tbdr_on(); }
 static void ubd_add(uint64_t dst, uint64_t n, id<MTLBuffer> ring, size_t ro, void *db, uint64_t dof) {
+    // An older deferred update the new one covers whole is dead: drop it now (draws already encoded keep their ring addresses, and landing would skip it anyway); keeps the list short across passes
+    int w = 0;
+    for (int i = 0; i < g_ubd_n; i++) { if (dst <= g_ubd[i].lo && g_ubd[i].hi <= dst + n) { g_ubd_dead++; continue; } g_ubd[w++] = g_ubd[i]; }
+    g_ubd_n = w;
     if (!g_ubd_n || dst < g_ubd_lo) g_ubd_lo = dst;
     if (!g_ubd_n || dst + n > g_ubd_hi) g_ubd_hi = dst + n;
     g_ubd[g_ubd_n++] = (ubd_ent){dst, dst + n, ring.gpuAddress + ro, ro, dof, (__bridge void *)ring, db};
-    g_ubd_gap = 1; g_ubd_total++;
+    g_ubd_gap = 1; g_ubd_total++; g_ubd_gen++;
     args_dirty_all();   // the same binding now resolves to another address: argument blocks encoded earlier in this pass must not be reused
     if (g_ubd_total == 1) MLOG("uniform 更新改名：首例 帧 %llu 通道 %llu", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass);
     PD("Y ubren %llu k=%d dst=%#llx bytes=%llu", g_stat_pass, g_ubd_n, (unsigned long long)dst, (unsigned long long)n);
 }
 static void ubd_flush(void) {   // in order, into the replay's copy encoder (blit_buf orders overlapping ranges with barriers)
-    int n = g_ubd_n; g_ubd_n = 0; g_ubd_gap = 0;
+    int n = g_ubd_n; g_ubd_n = 0; g_ubd_gap = 0; g_ubd_gen++;
+    if (n) g_ubd_lands++;
     for (int i = 0; i < n; i++) { const ubd_ent *e = &g_ubd[i]; int dead = 0;
         for (int j = i + 1; j < n && !dead; j++) dead = g_ubd[j].lo <= e->lo && e->hi <= g_ubd[j].hi;   // rewritten whole by a later update: draws read every version from the ring, memory only needs the last
         if (dead) { g_ubd_dead++; continue; }
-        enc_b_copy_buffer(blit_buf(0, 0, e->lo, e->hi), (__bridge id<MTLBuffer>)e->buf, e->ro, (__bridge id<MTLBuffer>)e->db, e->dof, e->hi - e->lo); }
+        g_pg_bwhy = 'U';
+        enc_b_copy_buffer(blit_buf(0, 0, e->lo, e->hi), (__bridge id<MTLBuffer>)e->buf, e->ro, (__bridge id<MTLBuffer>)e->db, e->dof, e->hi - e->lo);
+        ubl_add(e->lo, e->hi - e->lo, (__bridge id<MTLBuffer>)e->buf, e->ro); }
 }
+static void ubd_land(void) { if (g_ubd_n) ubd_flush(); }
 static int ubd_hit(uint64_t a, uint64_t n) {   // does [a, a + n) overlap any deferred update
     if (!g_ubd_n || a >= g_ubd_hi || a + n <= g_ubd_lo) return 0;
     for (int i = 0; i < g_ubd_n; i++) if (a < g_ubd[i].hi && a + n > g_ubd[i].lo) return 1;
@@ -3178,7 +3312,46 @@ static uint64_t ubd_rename(uint64_t a, uint64_t n, void **buf) {
         if (a < e->hi && a + n > e->lo) { if (e->lo > a || a + n > e->hi) return 1; if (buf) *buf = e->buf; return e->gpu + (a - e->lo); } }
     return 0;
 }
-void mtl_ubren_stats(uint64_t *n, uint64_t *cuts, uint64_t *dead) { *n = g_ubd_total; *cuts = g_ubd_cuts; *dead = g_ubd_dead; }
+// Bytes of a uniform binding the shader can read: its static read length (cb_len, from the MSL) when known, else the whole binding (always the whole binding in the first version)
+static uint64_t ubd_eff(NvShader *sh, const nvn_rbind *b, const p_bind_buf *u) {
+    uint64_t n = u->size ? u->size : 1;
+    if (b->kind == NVN_RB_CBUF && b->reg < 16 && ubd_mode() == 2 && sh->cb_len[b->reg] && sh->cb_len[b->reg] < n) n = sh->cb_len[b->reg];
+    return n;
+}
+// Snapshot of a uniform range only partly covered by deferred updates (mode 2): the bytes the GPU would read there at this point = guest memory now, with the updates landed
+// in submissions that may still be in flight and then the deferred ones laid over it in order. Refused (0) when the range is too large, some GPU operation may have written it (uw_hit),
+// or the landed list overflowed: the draw then lands the updates and ends the pass, as before. Cached per (range, generation): the vertex and fragment stages usually bind the same block
+enum { UBM_MAX = 64 << 10 };
+static struct { uint64_t a, n, gen, gpu; void *buf; } g_ubm_c[4]; static int g_ubm_ci;
+static uint64_t g_ubm_n, g_ubm_bytes, g_ubm_refused;
+static void ubm_lay(uint8_t *d, uint64_t a, uint64_t n, uint64_t lo, uint64_t hi, const uint8_t *src) {   // the part of [lo, hi) (bytes at src) inside [a, a + n)
+    uint64_t x = lo > a ? lo : a, y = hi < a + n ? hi : a + n;
+    if (x < y) memcpy(d + (x - a), src + (x - lo), y - x);
+}
+static uint64_t ubm_get(uint64_t a, uint64_t n, void **buf) {
+    for (int i = 0; i < 4; i++) if (g_ubm_c[i].gpu && g_ubm_c[i].gen == g_ubd_gen && g_ubm_c[i].a == a && g_ubm_c[i].n >= n) { if (buf) *buf = g_ubm_c[i].buf; return g_ubm_c[i].gpu; }
+    void *mb; uint64_t mo; const uint8_t *src;
+    if (ubd_mode() < 2 || n > UBM_MAX || g_ubl_over > g_done || uw_hit(a, n) || !mtl_addr(a, n, &mb, &mo) || !(src = [(__bridge id<MTLBuffer>)mb contents])) { g_ubm_refused++; return 0; }
+    size_t at = ubs_alloc(n, a, 1); uint8_t *d = (uint8_t *)g_ubs_buf.contents + at;
+    memcpy(d, src + mo, n);
+    ubl_prune();
+    for (int i = 0; i < g_ubl_n; i++) ubm_lay(d, a, n, g_ubl[i].lo, g_ubl[i].hi, g_ubl[i].src);
+    for (int i = 0; i < g_ubd_n; i++) ubm_lay(d, a, n, g_ubd[i].lo, g_ubd[i].hi, (const uint8_t *)[(__bridge id<MTLBuffer>)g_ubd[i].buf contents] + g_ubd[i].ro);
+    uint64_t gpu = g_ubs_buf.gpuAddress + at;
+    g_ubm_c[g_ubm_ci] = (typeof(g_ubm_c[0])){a, n, g_ubd_gen, gpu, (__bridge void *)g_ubs_buf}; g_ubm_ci = (g_ubm_ci + 1) & 3;
+    if (!g_ubm_n++) MLOG("uniform 快照：首例 帧 %llu 通道 %llu（%#llx+%llu）", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass + !g_enc, (unsigned long long)a, (unsigned long long)n);
+    g_ubm_bytes += n;
+    PD("Y ubmat %llu %#llx+%llu", g_stat_pass + !g_enc, (unsigned long long)a, (unsigned long long)n);
+    if (buf) *buf = (__bridge void *)g_ubs_buf;
+    return gpu;
+}
+// Address to bind for uniform binding b of shader sh: the ring copy or a snapshot when deferred updates overlap what it reads; 0 = bind the guest address, 1 = partly covered and no snapshot
+static uint64_t ubd_bind(NvShader *sh, const nvn_rbind *b, const p_bind_buf *u, void **buf) {
+    uint64_t n = ubd_eff(sh, b, u), r = ubd_rename(u->addr, n, buf);
+    if (r == 1) { uint64_t s = ubm_get(u->addr, n, buf); if (s) r = s; }
+    return r;
+}
+void mtl_ubren_stats(uint64_t s[7]) { s[0] = g_ubd_total; s[1] = g_ubd_cuts; s[2] = g_ubd_dead; s[3] = g_ubd_lands; s[4] = g_ubm_n; s[5] = g_ubm_bytes; s[6] = g_ubm_refused; }
 static inline void args_sync_dirty(void) {
     uint64_t reg = g_reg_gen, dirty = nvn_dirty_now();
     if (reg != g_args_reg_seen || dirty != g_args_dirty_seen) {
@@ -3255,7 +3428,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             void *mb; uint64_t mo, gpu;
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
             use_rec("buf", u->addr, u->size, 0, NULL);
-            if (g_ubd_n) { void *rb = NULL; uint64_t rg = ubd_rename(u->addr, u->size ? u->size : 1, &rb); if (rg > 1) { gpu = rg; mb = rb; } else if (rg) RED_ONCE(86, "uniform 改名：阶段 %d cb%d 只被部分覆盖却没在绘制前结束通道（读到旧内容）", nvn_stage, reg); }
+            if (g_ubd_n) { void *rb = NULL; uint64_t rg = ubd_bind(sh, b, u, &rb); if (rg > 1) { gpu = rg; mb = rb; } else if (rg) RED_ONCE(86, "uniform 改名：阶段 %d cb%d 只被部分覆盖却没在绘制前结束通道（读到旧内容）", nvn_stage, reg); }
             if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
@@ -3300,6 +3473,8 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             if (passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "图像槽绑的贴图没有可写用途（贴图号 %d）", tid); t = nil; }
             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
+            else if (t.textureType == MTLTextureTypeTextureBuffer && tid < g_ntreg && g_treg[tid].ok && g_treg[tid].t.mem)   // an image over pool memory: the GPU may write it (no uniform snapshot there)
+                uw_mark((uint64_t)(uintptr_t)g_treg[tid].t.mem, g_treg[tid].t.L.size ? g_treg[tid].t.L.size : (uint64_t)g_treg[tid].t.d.width * 16);
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
         } else if (b->kind == NVN_RB_TBUF) {   // Typed buffer: the buffer texture (target BUFFER) in texture slot r
@@ -3314,6 +3489,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             const p_bind_buf *u = reg < 16 ? (b->kind == NVN_RB_UBOP ? &S.ubo[nvn_stage][reg] : &S.ssbo[nvn_stage][reg]) : NULL;
             void *mb; uint64_t mo, gpu;
             if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { use_rec("buf", u->addr, u->size, 0, NULL);
+                if (b->kind == NVN_RB_SBUFP) uw_mark(u->addr, u->size ? u->size : 1);   // writable as far as anyone knows (TotK reflection has no rw): no uniform snapshot there
                 if (g_ubd_n && b->kind == NVN_RB_UBOP) { void *rb = NULL; uint64_t rg = ubd_rename(u->addr, u->size ? u->size : 1, &rb); if (rg > 1) { gpu = rg; mb = rb; } }   // partial coverage / storage overlap: ubd_conflict already ended the pass
                 slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
@@ -4956,16 +5132,16 @@ static void fb_prepare(NvProg *pr) {
         } }
     if (g_fb_n) { g_fb_seq = g_draw_seq; args_dirty_all(); g_fb_rebind = 1; }
 }
-// A draw about to continue a pass holding renamed uniform updates: nonzero = it reads a deferred range other than through a fully covered uniform binding
-// (1 vertex buffer, 2 index buffer, 3 partly covered uniform, 4 storage buffer, 5 buffer texture) - the pass has to end (landing the updates) before it, as the old code always did
+// A draw about to use bindings while uniform updates are deferred: nonzero = it reads a deferred range other than through a uniform binding that is fully covered or can be snapshotted
+// (1 vertex buffer, 2 index buffer, 3 partly covered uniform, 4 storage buffer, 5 buffer texture) - the updates have to land (ending the pass) before it, as the old code always did
 static int ubd_conflict(NvProg *pr, const p_draw_idx *di) {
     for (int s_ = 0; s_ < 16; s_++) if (S.vbuf[s_].address && ubd_hit(S.vbuf[s_].address, S.vbuf[s_].size ? S.vbuf[s_].size : 1ull << 32)) return 1;
     if (di && di->ibuf && ubd_hit(di->ibuf, (uint64_t)(di->count ? di->count : 1) << (di->itype == 2 ? 2 : di->itype == 1 ? 1 : 0))) return 2;
     int hit = 0;
     for (int st = 0; st < 2 && !hit; st++) { NvShader *sh = pr->sh[st]; if (!sh) continue;
         for (int i = 0; i < sh->rf.nb && !hit; i++) { const nvn_rbind *b = &sh->rf.b[i]; int reg = b->reg;
-            if (b->kind == NVN_RB_CBUF || b->kind == NVN_RB_UBOP) { const p_bind_buf *u = reg < 16 ? &S.ubo[st][reg] : NULL; hit = u && u->addr && ubd_rename(u->addr, u->size ? u->size : 1, NULL) == 1 ? 3 : 0;
-                if (hit) PD("E %llu 部分覆盖：阶段 %d cb%d %#llx+%llu", g_stat_pass, st, reg, (unsigned long long)u->addr, (unsigned long long)u->size); }
+            if (b->kind == NVN_RB_CBUF || b->kind == NVN_RB_UBOP) { const p_bind_buf *u = reg < 16 ? &S.ubo[st][reg] : NULL; hit = u && u->addr && ubd_bind(sh, b, u, NULL) == 1 ? 3 : 0;
+                if (hit) PD("E %llu 部分覆盖：阶段 %d cb%d %#llx+%llu（读 %llu）", g_stat_pass, st, reg, (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)ubd_eff(sh, b, u)); }
             else if (b->kind == NVN_RB_SBUFP) { const p_bind_buf *u = reg < 16 ? &S.ssbo[st][reg] : NULL; hit = u && u->addr && ubd_hit(u->addr, u->size ? u->size : 1) ? 4 : 0; }
             else if (b->kind == NVN_RB_TBUF || b->kind == NVN_RB_TEX || b->kind == NVN_RB_IMG) {   // buffer textures read pool memory in place (tex_mtl, target 10)
                 int tid = b->kind == NVN_RB_IMG ? (reg < 32 ? (int)(S.img[st][reg] & 0xfffff) : 0) : reg < 128 ? (int)(S.tex[st][reg] & 0xfffff) : 0;
@@ -5059,10 +5235,10 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (g_fz.active && g_enc && g_fz.phase == 2 && !fz_p2_draw(pr, dw, di, g_fz.lmap2, &fz_fn)) {   // Cannot be proven: end the merged render pass (the earlier pass's result is stored as usual) and reopen with the later pass's original targets
         static int once3; if (!once3++) MLOG("可读 tile 通道合并：后一个通道的绘制证不出，退回分开（首例 通道 %llu）", g_stat_pass);
         g_fz_fallback++; rp_end(); }
-    int ubc = g_ubd_n && g_enc && !g_gh.busy ? ubd_conflict(pr, di) : 0;
+    int ubc = g_ubd_n && (g_enc || ubd_mode() == 2) && !g_gh.busy ? ubd_conflict(pr, di) : 0;
     if (ubc) {
         if (!g_ubd_cuts++) MLOG("uniform 更新改名：绘制以别的方式读到改名中的区间，在此结束通道（首例 通道 %llu）", g_stat_pass);
-        PD("E %llu 绘制读到改名中的 uniform 区间：结束渲染通道 why=%d（1 顶点 2 索引 3 部分覆盖 4 存储 5 缓冲贴图）", g_stat_pass, ubc); rp_end(); }
+        PD("E %llu 绘制读到改名中的 uniform 区间：结束渲染通道 why=%d（1 顶点 2 索引 3 部分覆盖 4 存储 5 缓冲贴图）", g_stat_pass, ubc); rp_end(); ubd_land(); }
     fb_prepare(pr);   // same-pass feedback sampling: copy the snapshot first (see fb_prepare)
     if (R.has_sc && (!g_enc || g_ubd_gap)) {   // in the gap after a renamed update the old code had no pass open here
         NSUInteger tw0 = 0, th0 = 0; rt_dims(&tw0, &th0);
@@ -5170,6 +5346,7 @@ frz_plain:;
         if (e && sscanf(e, "%f,%f,%f,%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) == 8) mtl_ui_ghost(1, v[0], v[1], &v[2], v[6], v[7]); } }
     if (dw && atomic_load(&g_ghost_on)) ghost_note(dw);
     if (enc_label_on() && !g_el_draws++ && pr->sh[1]) { memcpy(g_el_key, pr->sh[1]->key, 8); g_el_key[8] = 0; }
+    if (pr->sh[1]) pg_draw_key(pr->sh[1]->key);
     if (passdump()) {   // Characteristics of a render pass's first draw (to judge whether the load can be omitted: full screen, no blending, writes all channels, does not depend on depth); with DM_NVN_PASSDUMP_ALL every draw is recorded
         static uint64_t last_pass = ~0ull; static int all = -1; if (all < 0) all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
         if (all || g_kd_force) PD("d %llu bv=%d bi=%d first=%d vs=%s fs=%s vc=%d inst=%d blend=%#x b0=%#llx dt=%d dw=%d df=%d cull=%d st=%d sf=%d,%d sop=%d,%d,%d/%d,%d,%d smask=%#x,%#x/%#x,%#x sref=%#x,%#x ib=%#llx it=%d cmask=%#x b1=%#llx b2=%#llx b3=%#llx", g_stat_pass, di ? di->base_vertex : 0, di ? di->base_instance : 0, dw ? dw->first : 0, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
@@ -5374,22 +5551,24 @@ static void dispatch(const p_dispatch *dp) {
             MLOG("内嵌计算核 %s 首次派发：调用点 %s+%#llx，线程组 %dx%dx%d，元素数（CPU 侧当前值）%u", cs->builtin, m ? m->name : "?",
                  m ? (unsigned long long)(dp->caller - (uint64_t)m->base) : (unsigned long long)dp->caller, dp->x, dp->y, dp->z, *(uint32_t *)u->addr);
         }
-        rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+        rp_end(); ubd_land(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
         id<MTLComputeCommandEncoder> ce = pg_compute();
         enc_c_pso(ce, ps);
         enc_c_args(ce, ((__bridge id<MTLBuffer>)ub).gpuAddress + uo, 0); enc_c_args(ce, ((__bridge id<MTLBuffer>)sb).gpuAddress + so, 1); enc_c_args(ce, ((__bridge id<MTLBuffer>)db).gpuAddress + dof, 2);   // Built-in compute kernel: cold path, take the addresses directly
         enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(32, 1, 1));
+        pg_compute_end(ce);
         enc_c_end(ce);
         return;
     }
     const uint16_t *tg = cs->rf.tg;
     if (!tg[0]) { RED_ONCE(29, "计算着色器缺线程组大小反射"); return; }
-    rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    rp_end(); ubd_land(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }   // compute reads and writes guest memory directly: deferred uniform updates land first
     id<MTLComputeCommandEncoder> ce = pg_compute();
     enc_c_pso(ce, ps);
     g_dispatch_dim[0] = (uint32_t)dp->x; g_dispatch_dim[1] = (uint32_t)dp->y; g_dispatch_dim[2] = (uint32_t)dp->z;   // read back by the driver segment c0 (encode_args_)
     encode_args(ce, cs, 5, 0);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
+    pg_compute_end(ce);
     enc_c_end(ce);
     bright_lut(cs);   // 3D picture brightening: rewrite after the game finishes computing the color lookup table
 }
@@ -5405,6 +5584,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
     void *mb; uint64_t mo;
     if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(31, "贴图→缓冲拷贝的目标不在内存池里"); return; }
+    uw_mark(c->src, img * nz);
     id<MTL4ComputeCommandEncoder> b = blit();
     if (is3d)
         enc_b_copy_texture_buffer(b, t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset), MTLSizeMake(c->r.width, c->r.height, nz), (__bridge id<MTLBuffer>)mb, mo, row, img);
@@ -5945,7 +6125,7 @@ static void sub_cut(void) {
     [g_q4 commit:buffers count:1 options:o];
     g_cb = [g_dev newCommandBuffer];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]];   // one allocator encodes several command buffers in sequence; it is reset only once its fence (the last segment) has passed, when a later submission starts
-    g_cut_draw0 = g_stat_draw;
+    g_cut_draw0 = g_stat_draw; g_pg_seg++;
     if (!g_cuts++) MLOG("分段提交：首段在帧 %llu 通道 %llu 交出", (unsigned long long)f, (unsigned long long)g_stat_pass);
 }
 
@@ -6007,6 +6187,7 @@ void mtl_exec(const uint8_t *p) {
                 PD("Y signal_event cmd=%p dst=%p mode=%u value=%u", p, val, m, v); mtl_sub_event(val, m, v); break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
+                uw_mark(ad, 16);   // written at completion: no uniform snapshot over it
                 if (g_ren_nrep < 1024) g_ren_rep[g_ren_nrep++] = (ren_rep){ad, 0, t != NVN_COUNTER_TYPE_SAMPLES_PASSED};
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) g_sp_ring[g_sp_i++ % SP_RING] = (sp_rep){ad, g_fence + 1};   // This submission's fence once committed
                 g_ren_known = -1;
