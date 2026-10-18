@@ -19,6 +19,8 @@ uint64_t now_ns(void) { return bp_now(); }
 static int failed, cases;
 #define EXPECT(n, w, v) do { int a=(w),b=(v); cases++; printf("%s 期望 %d → 真结果 %d %s\n",n,a,b,a==b?"✓":"✗");failed+=a!=b; } while(0)
 static const uint8_t colors[4][4]={{255,0,0,255},{0,255,0,255},{0,0,255,255},{255,255,0,255}};
+static int g_tol;   // per-channel tolerance: 0 (byte exact) except for the MetalFX case, whose perceptual processing lands 1 LSB off flat colors
+static int px_ne(const uint8_t *a, const uint8_t *b) { for(int k=0;k<4;k++) if(abs(a[k]-b[k])>g_tol) return 1; return 0; }
 
 static void check(id<MTLTexture> src, const char *name, const int crop[4], int w, int h, int color) {
     MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
@@ -32,14 +34,14 @@ static void check(id<MTLTexture> src, const char *name, const int crop[4], int w
         int q=color;
         if(q==4) { // square valid area onto a 2:1 target: 4 black columns on each side, the middle 8 columns all red.
             static const uint8_t black[4]={0,0,0,255};
-            const uint8_t *want=x<4||x>=12?black:colors[0];bad+=memcmp(out+4*(y*w+x),want,4)!=0;continue;
+            const uint8_t *want=x<4||x>=12?black:colors[0];bad+=px_ne(out+4*(y*w+x),want);continue;
         }
         if(q==-2) { // crop=(1,1,4,4): 3×3 red, last column green, last row blue, bottom-right 1 cell yellow.
             q=(x+1>=4)+2*(y+1>=4);
         } else if(q<0) { // same-size default whole frame: the boundary is dead center.
             q=(x>=w/2)+2*(y>=h/2);
         }
-        bad+=memcmp(out+4*(y*w+x),colors[q],4)!=0;
+        bad+=px_ne(out+4*(y*w+x),colors[q]);
     }
     EXPECT(name,0,bad);free(out);
 }
@@ -60,6 +62,13 @@ int main(void) { @autoreleasepool {
     check(src,"单纹素放大不跨边界256像素全红",one,16,16,0);
     check(src,"非零双偏移16像素逐字节等手写子矩形",inset,4,4,-2);
     check(src,"有效区比例保留，128像素中间红/两侧黑",tl,16,8,4);
+#ifndef CROP_LEGACY_HEADER
+    if(fx_on()) {   // MetalFX takes only whole-texture upscales (partial crops stay bilinear: the scaler reads past its content rectangle)
+        id<MTLTexture> red=[g_dev newTextureWithDescriptor:d];uint8_t rp[8*8*4];for(int i=0;i<64;i++)memcpy(rp+4*i,colors[0],4);
+        [red replaceRegion:MTLRegionMake2D(0,0,8,8) mipmapLevel:0 withBytes:rp bytesPerRow:32];
+        g_tol=2;check(red,"MetalFX整帧放大256像素近红（容差2）",zero,16,16,0);g_tol=0;
+    }
+#endif
 #ifndef CROP_LEGACY_HEADER
     {
         // sRGB swapchain: present sends the raw bytes (as the Switch's scan-out does) without decoding first; unfixed, 128/64/200 decode to about 55/13/148

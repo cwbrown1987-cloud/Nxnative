@@ -5,6 +5,7 @@ module_t *module_of(const void *p) { (void)p; return NULL; }
 module_t g_mod[MAX_MOD]; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
+uint64_t nvn_new_serial(void) { static uint64_t n = 1ull << 40; return ++n; }   // hle_nvn.c is not linked
 static int fail, count;
 #define EXPECT(name, want, got) do { long long w=(want), g=(got); count++; printf("%s 期望 %lld → 真结果 %lld %s\n", name, w, g, w==g?"OK":"FAIL"); if(w!=g) fail++; } while(0)
 int g_t_ub_var = 7, g_t_ub_var2 = -3;   // global variables found by @set via symbol name

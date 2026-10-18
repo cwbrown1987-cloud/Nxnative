@@ -6,6 +6,7 @@ module_t *module_of(const void *p){(void)p;return NULL;}
 module_t g_mod[MAX_MOD];int g_nmod;
 void svc_thread_dump(void){}
 uint64_t now_ns(void){return bp_now();}
+uint64_t nvn_new_serial(void){static uint64_t n=1ull<<40;return ++n;}   // hle_nvn.c is not linked
 static int cases,bad,enabled,small_depth,force_invalid,sample_attachment,both_flags;
 #define E(n,w,a) do{uint64_t actual=(a),want=(w);cases++;printf("%s 期望%llu → 真结果%llu\n",n,(unsigned long long)want,(unsigned long long)actual);bad+=want!=actual;}while(0)
 typedef struct{uint8_t b[8192];size_t n;} code;

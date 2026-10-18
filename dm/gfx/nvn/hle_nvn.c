@@ -1258,6 +1258,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(f, "@use_call", (double)(uc_ - puc)); trow(f, "@use_skip", (double)(us_ - pus)); puc = uc_; pus = us_;
         static uint64_t pfa, pre_; uint64_t fa_, pr_, up_, re_; nvn_dirty_stats(&fa_, &pr_); mtl_pkg_stats(&up_, &re_);
         trow(f, "@faults", (double)(fa_ - pfa)); trow(f, "@reuploads", (double)(re_ - pre_)); pfa = fa_; pre_ = re_;
+        static uint64_t pun, puc_, pud; uint64_t un_, uc2_, ud_; mtl_ubren_stats(&un_, &uc2_, &ud_); trow(f, "@ubren", (double)(un_ - pun)); trow(f, "@ubren_cut", (double)(uc2_ - puc_)); trow(f, "@ubren_dead", (double)(ud_ - pud)); pun = un_; puc_ = uc2_; pud = ud_;
         static uint64_t pmc, pmp, pmn; uint64_t mc_, mpg_, mn_; nvn_dirty_mp_stats(&mc_, &mpg_, &mn_);
         trow(f, "@mprotect_calls", (double)(mc_ - pmc)); trow(f, "@mprotect_pages", (double)(mpg_ - pmp)); trow(f, "@mprotect_ms", (mn_ - pmn) / 1e6); pmc = mc_; pmp = mpg_; pmn = mn_;
         double up_ms = mtl_upload_ns_take() / 1e6; trow(f, "@upload_ms", up_ms);

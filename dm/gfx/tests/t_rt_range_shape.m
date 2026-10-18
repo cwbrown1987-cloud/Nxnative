@@ -5,6 +5,7 @@ module_t *module_of(const void *p){(void)p;return NULL;}
 module_t g_mod[MAX_MOD];int g_nmod;
 void svc_thread_dump(void){}
 uint64_t now_ns(void){return bp_now();}
+uint64_t nvn_new_serial(void){static uint64_t n=1ull<<40;return ++n;}   // hle_nvn.c is not linked
 static int cases,bad;
 #define E(label,w,a) do{int actual=(a);cases++;printf("%s 期望%d → 真结果%d\n",label,w,actual);bad+=(w)!=actual;}while(0)
 static int shape(const p_set_rt *a,const p_set_rt *b){

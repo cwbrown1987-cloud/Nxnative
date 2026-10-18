@@ -44,6 +44,8 @@ t_defer_chain: t_defer_chain.m ../../host/crash.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_defer_chain.m ../../host/crash.c $(filter-out ../nvn/nvn_mtl.m ../nvn/nvn_entry.S ../nvn/nvn_thunks.S,$(GFX)) $(FW)
 t_cond_render: t_cond_render.m ../../host/crash.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_cond_render.m ../../host/crash.c $(filter-out ../nvn/nvn_mtl.m ../nvn/nvn_entry.S ../nvn/nvn_thunks.S,$(GFX)) $(FW)
+t_ubren: t_ubren.m ../../host/crash.c $(GFX) $(GFX_H)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_ubren.m ../../host/crash.c $(filter-out ../nvn/nvn_mtl.m ../nvn/nvn_entry.S ../nvn/nvn_thunks.S,$(GFX)) $(FW)
 t_zskip: t_zskip.m ../../host/crash.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_zskip.m ../../host/crash.c $(filter-out ../nvn/nvn_mtl.m ../nvn/nvn_entry.S ../nvn/nvn_thunks.S,$(GFX)) $(FW)
 t_xv: t_xv.m ../../host/crash.c $(GFX) $(GFX_H)
@@ -64,7 +66,7 @@ t_pso_skey: t_pso_skey.m ../nvn/nvn_pso_skey.h ../nvn/nvn_obj.h
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_skey.m -framework Foundation
 t_pfv: t_pfv.m ../../host/crash.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pfv.m ../../host/crash.c $(filter-out ../nvn/nvn_mtl.m ../nvn/nvn_entry.S ../nvn/nvn_thunks.S,$(GFX)) $(FW)
-run: t_nvn t_dirty_slots t_dirty_race t_builtin t_deswz_gpu t_pace t_refl t_hmap t_cover t_fuse_check t_present_crop t_reorder_chain t_defer_chain t_cond_render t_zskip t_xv t_ub t_mip_extent t_rt_range_shape t_rt_range_ro t_rt_range t_rt_depth_ro t_pso_skey t_pfv
+run: t_nvn t_dirty_slots t_dirty_race t_builtin t_deswz_gpu t_pace t_refl t_hmap t_cover t_fuse_check t_present_crop t_reorder_chain t_defer_chain t_cond_render t_ubren t_zskip t_xv t_ub t_mip_extent t_rt_range_shape t_rt_range_ro t_rt_range t_rt_depth_ro t_pso_skey t_pfv
 	./t_nvn
 	./t_dirty_slots
 	./t_dirty_race
@@ -79,6 +81,8 @@ run: t_nvn t_dirty_slots t_dirty_race t_builtin t_deswz_gpu t_pace t_refl t_hmap
 	MTL_DEBUG_LAYER=1 ./t_reorder_chain
 	MTL_DEBUG_LAYER=1 ./t_defer_chain
 	MTL_DEBUG_LAYER=1 ./t_cond_render
+	MTL_DEBUG_LAYER=1 ./t_ubren
+	DM_NVN_UBREN=0 MTL_DEBUG_LAYER=1 ./t_ubren   # same pixels and memory, only more passes
 	./t_zskip
 	./t_xv
 	./t_ub

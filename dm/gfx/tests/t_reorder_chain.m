@@ -7,6 +7,7 @@ module_t *module_of(const void *p) { (void)p; return NULL; }
 module_t g_mod[MAX_MOD]; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
+uint64_t nvn_new_serial(void) { static uint64_t n = 1ull << 40; return ++n; }   // hle_nvn.c is not linked
 static int fail, count, all_independent;
 #define EXPECT(n,w,v) do { uint64_t a=(w), b=(v); count++; \
     printf("%s 期望 %llu → 真结果 %llu %s\n",n,(unsigned long long)a,(unsigned long long)b,a==b?"✓":"✗"); fail+=a!=b; } while(0)

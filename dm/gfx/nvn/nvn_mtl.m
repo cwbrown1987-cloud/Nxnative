@@ -574,7 +574,7 @@ static uint64_t g_bw_lo[BW_MAX], g_bw_hi[BW_MAX]; static int g_bw_n, g_blit_ops;
 static id<MTL4ComputeCommandEncoder> blit_raw(void) { blit_note(); rp_end(); if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; g_bw_n = 0; g_blit_ops = 0; } return g_blit; }
 static void blit_barrier(void) {
     static int off = -1; if (off < 0) { const char *e = getenv("DM_NVN_BLIT_ORDER"); off = e && !strcmp(e, "0"); if (off) MLOG("DM_NVN_BLIT_ORDER=0：拷贝编码器内不加屏障（诊断，会复现喷泉竖条）"); }
-    if (!off) [g_blit barrierAfterEncoderStages:MTLStageAll beforeEncoderStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    if (!off) [g_blit barrierAfterEncoderStages:MTLStageDispatch | MTLStageBlit beforeEncoderStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];   // the copy encoder is a compute encoder: MTLStageAll fails Metal validation
     g_bw_n = 0; g_blit_ops = 0; g_blit_barriers++;
 }
 uint64_t mtl_blit_barriers(void) { return g_blit_barriers; }
@@ -605,12 +605,26 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
 // Inline uniform update (UpdateUniformBuffer): the data is copied into the host's own shared ring at encode time, then copied in order to the destination.
 // Previously it was read from command memory only when the GPU executed - if the game recycles command memory before the GPU runs, it reads the bytes of the next batch of commands (SMBW's fountain water wave simulation got the wrong coefficients and diverged to ±65504).
 static id<MTLBuffer> g_ubs_buf; static size_t g_ubs_off, g_ubs_size;
+// Uniform update renaming (DM_NVN_UBREN=0 turns it off; only while the TBDR optimizations are off, whose lookaheads take an update as the end of the pass):
+// an update arriving inside a render pass no longer ends the pass. Its bytes stay in the ring, later draws of the pass bind the ring copy in place of the guest address
+// (the newest deferred update overlapping the bound range must cover all of it), and the copies into guest memory are encoded in order once the pass ends (rp_end),
+// before any later copy / dispatch / commit. A draw reading a deferred range any other way (partly covered uniform, vertex / index / storage / buffer texture) ends the pass first - the old behaviour.
+// Measured on TotK Sky Island (1.4.2, frame 2400): 203 of 348 render passes per frame ended at an update, each loading and storing all of its attachments again
+typedef struct { uint64_t lo, hi, gpu, ro, dof; void *buf, *db; } ubd_ent;   // guest range [lo, hi), ring copy (GPU address, block, offset), destination pool buffer + offset
+enum { UBD_MAX = 512 };
+static ubd_ent g_ubd[UBD_MAX]; static int g_ubd_n;
+static int g_ubd_gap;   // an update was deferred and no draw has continued the pass yet: the old code had no pass open here (clears / counter resets end the pass first, see the replay)
+static uint64_t g_ubd_lo, g_ubd_hi, g_ubd_total, g_ubd_cuts, g_ubd_dead;   // bounds of all deferred ranges (quick rejection); cumulative deferred updates / passes ended by a reader / copies skipped as rewritten
+static int ubd_want(void);   // defined after the render pass code
+static void ubd_add(uint64_t dst, uint64_t n, id<MTLBuffer> ring, size_t ro, void *db, uint64_t dof);
+static void ubd_flush(void);   // the copies into guest memory, in order (rp_end)
 void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
     if (!n) return;
     if (g_npend < PEND_MAX) { g_pend_lo[g_npend] = dst; g_pend_hi[g_npend++] = dst + n; } else g_pend_over = 1;
     void *db; uint64_t dof;
     if (!mtl_addr(dst, n, &db, &dof)) MDIE("uniform 更新目标不在任何内存池内 dst=%#llx n=%#llx", (unsigned long long)dst, (unsigned long long)n);
-    size_t need = (n + 15u) & ~(size_t)15u;
+    int ren = ubd_want();
+    size_t need = ((n + 15u) & ~(size_t)15u) + (ren ? 512 : 0);   // renamed: room to place the bytes at the destination's address modulo 256 (shaders read them in its place)
     if (!g_ubs_buf || g_ubs_off + need > g_ubs_size) {
         if (g_ubs_buf) defer_obj_release(g_ubs_buf);   // copies already encoded still reference the old block: release after this submission completes
         g_ubs_size = MAX((size_t)1 << 20, need);
@@ -618,8 +632,11 @@ void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
         if (!g_ubs_buf) MDIE("uniform 更新环分配失败 %#zx", g_ubs_size);
         res_add(g_ubs_buf); g_ubs_off = 0;
     }
-    memcpy((uint8_t *)g_ubs_buf.contents + g_ubs_off, data, n);
-    enc_b_copy_buffer(blit_buf(0, 0, dst, dst + n), g_ubs_buf, g_ubs_off, (__bridge id<MTLBuffer>)db, dof, n);
+    size_t at = g_ubs_off;
+    if (ren) { at = (at + 255) & ~(size_t)255; at += (size_t)((dst - (g_ubs_buf.gpuAddress + at)) & 255); }
+    memcpy((uint8_t *)g_ubs_buf.contents + at, data, n);
+    if (ren) { ubd_add(dst, n, g_ubs_buf, at, db, dof); g_ubs_off = (at + n + 15u) & ~(size_t)15u; return; }
+    enc_b_copy_buffer(blit_buf(0, 0, dst, dst + n), g_ubs_buf, at, (__bridge id<MTLBuffer>)db, dof, n);
     g_ubs_off += need;
 }
 
@@ -750,6 +767,7 @@ static const char *cctx_snap(void);   // What is in this submission (printed int
 uint64_t mtl_sub_commit(void) {
     defer_fallback();   // Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
     rp_flush();
+    if (g_ubd_n) ubd_flush();   // rp_end has already done this; kept so that no renamed update can outlive its submission
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     up_flush();
     uint64_t fence = ++g_fence;
@@ -1827,6 +1845,7 @@ static void rp_end(void) { if (g_enc) { AP_B;
 #endif
     sd_finish(); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
     if (g_nbcrt) bcrt_flush();
+    if (g_ubd_n) ubd_flush();   // after the ghost draw (ghost_flush) and the end of the encoder: every draw of the pass has been encoded
 #ifdef NVN_RT_RANGE_TEST
     rr_finish(ranged);
 #endif
@@ -3115,6 +3134,40 @@ static __unsafe_unretained id<MTLTexture> g_fb_src[4]; static __strong id<MTLTex
 static uint8_t g_args_dirty[6] = {1, 1, 1, 1, 1, 1};
 static uint64_t g_args_reg_seen, g_args_dirty_seen;
 static inline void args_dirty_all(void) { memset(g_args_dirty, 1, sizeof g_args_dirty); }
+// ---------- Uniform update renaming (see g_ubd before mtl_sub_update) ----------
+static int ubd_want(void) {
+    static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_UBREN"); v = !(e && !strcmp(e, "0")); MLOG("uniform 更新改名：%s（DM_NVN_UBREN=0 关；TBDR 优化开时不改名）", v ? "开" : "关"); }
+    return v && g_enc && g_ubd_n < UBD_MAX && !tbdr_on();
+}
+static void ubd_add(uint64_t dst, uint64_t n, id<MTLBuffer> ring, size_t ro, void *db, uint64_t dof) {
+    if (!g_ubd_n || dst < g_ubd_lo) g_ubd_lo = dst;
+    if (!g_ubd_n || dst + n > g_ubd_hi) g_ubd_hi = dst + n;
+    g_ubd[g_ubd_n++] = (ubd_ent){dst, dst + n, ring.gpuAddress + ro, ro, dof, (__bridge void *)ring, db};
+    g_ubd_gap = 1; g_ubd_total++;
+    args_dirty_all();   // the same binding now resolves to another address: argument blocks encoded earlier in this pass must not be reused
+    if (g_ubd_total == 1) MLOG("uniform 更新改名：首例 帧 %llu 通道 %llu", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass);
+    PD("Y ubren %llu k=%d dst=%#llx bytes=%llu", g_stat_pass, g_ubd_n, (unsigned long long)dst, (unsigned long long)n);
+}
+static void ubd_flush(void) {   // in order, into the replay's copy encoder (blit_buf orders overlapping ranges with barriers)
+    int n = g_ubd_n; g_ubd_n = 0; g_ubd_gap = 0;
+    for (int i = 0; i < n; i++) { const ubd_ent *e = &g_ubd[i]; int dead = 0;
+        for (int j = i + 1; j < n && !dead; j++) dead = g_ubd[j].lo <= e->lo && e->hi <= g_ubd[j].hi;   // rewritten whole by a later update: draws read every version from the ring, memory only needs the last
+        if (dead) { g_ubd_dead++; continue; }
+        enc_b_copy_buffer(blit_buf(0, 0, e->lo, e->hi), (__bridge id<MTLBuffer>)e->buf, e->ro, (__bridge id<MTLBuffer>)e->db, e->dof, e->hi - e->lo); }
+}
+static int ubd_hit(uint64_t a, uint64_t n) {   // does [a, a + n) overlap any deferred update
+    if (!g_ubd_n || a >= g_ubd_hi || a + n <= g_ubd_lo) return 0;
+    for (int i = 0; i < g_ubd_n; i++) if (a < g_ubd[i].hi && a + n > g_ubd[i].lo) return 1;
+    return 0;
+}
+// Address to bind for uniform range [a, a + n): the ring copy when the newest deferred update overlapping it covers all of it; 0 = nothing deferred overlaps (bind the guest address), 1 = only partly covered
+static uint64_t ubd_rename(uint64_t a, uint64_t n, void **buf) {
+    if (!g_ubd_n || a >= g_ubd_hi || a + n <= g_ubd_lo) return 0;
+    for (int i = g_ubd_n - 1; i >= 0; i--) { const ubd_ent *e = &g_ubd[i];
+        if (a < e->hi && a + n > e->lo) { if (e->lo > a || a + n > e->hi) return 1; if (buf) *buf = e->buf; return e->gpu + (a - e->lo); } }
+    return 0;
+}
+void mtl_ubren_stats(uint64_t *n, uint64_t *cuts, uint64_t *dead) { *n = g_ubd_total; *cuts = g_ubd_cuts; *dead = g_ubd_dead; }
 static inline void args_sync_dirty(void) {
     uint64_t reg = g_reg_gen, dirty = nvn_dirty_now();
     if (reg != g_args_reg_seen || dirty != g_args_dirty_seen) {
@@ -3191,6 +3244,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             void *mb; uint64_t mo, gpu;
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
             use_rec("buf", u->addr, u->size, 0, NULL);
+            if (g_ubd_n) { void *rb = NULL; uint64_t rg = ubd_rename(u->addr, u->size ? u->size : 1, &rb); if (rg > 1) { gpu = rg; mb = rb; } else if (rg) RED_ONCE(86, "uniform 改名：阶段 %d cb%d 只被部分覆盖却没在绘制前结束通道（读到旧内容）", nvn_stage, reg); }
             if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
@@ -3248,7 +3302,9 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
         } else if (b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_UBOP) {   // B: storage buffers / compute-stage uniforms are device pointers; the address is taken by NVN slot
             const p_bind_buf *u = reg < 16 ? (b->kind == NVN_RB_UBOP ? &S.ubo[nvn_stage][reg] : &S.ssbo[nvn_stage][reg]) : NULL;
             void *mb; uint64_t mo, gpu;
-            if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { use_rec("buf", u->addr, u->size, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
+            if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { use_rec("buf", u->addr, u->size, 0, NULL);
+                if (g_ubd_n && b->kind == NVN_RB_UBOP) { void *rb = NULL; uint64_t rg = ubd_rename(u->addr, u->size ? u->size : 1, &rb); if (rg > 1) { gpu = rg; mb = rb; } }   // partial coverage / storage overlap: ubd_conflict already ended the pass
+                slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) PD("B %llu st%d sbufp reg%d %s addr=%#llx size=%llu %s", g_stat_pass, nvn_stage, reg, u && u->addr ? "实" : "哑", u ? (unsigned long long)u->addr : 0ull, u ? (unsigned long long)u->size : 0ull, b->rw ? "rw" : "ro");
         } else if (b->kind == NVN_RB_C1) {      // B: the shader's own constant segment, built when the shader is fetched
@@ -4115,7 +4171,7 @@ static void defer_replay(void) {
 static void defer_fallback(void) {
     if (g_defer_replaying || !defer_has_active()) return;
     g_defer_fallbacks++; MLOG("【红】推迟合并通道：提交结束仍有未回放组，按各组 P 原目标兜底");
-    if (g_enc) { enc_r_end(g_enc); g_enc = nil; }
+    if (g_enc) { enc_r_end(g_enc); g_enc = nil; if (g_ubd_n) ubd_flush(); }
     typeof(S) save; memcpy(&save, &S, sizeof S); p_set_rt rt = R.rt; g_defer_replaying = 1;
     for (int gi, after = 0; (gi = defer_next(0, after)) >= 0;) { defer_t *d = &g_defer_slots[gi]; after = d->born; g_defer_cur = d; R.rt = d->p_rt; R.has_rt = 1; memcpy(R.clear_c, d->clear_c, 8); memcpy(R.cc, d->cc, sizeof R.cc);
         R.clear_d = d->clear_d; R.clear_s = d->clear_s; R.cd = d->cd; R.cs = d->cs;
@@ -4889,6 +4945,26 @@ static void fb_prepare(NvProg *pr) {
         } }
     if (g_fb_n) { g_fb_seq = g_draw_seq; args_dirty_all(); g_fb_rebind = 1; }
 }
+// A draw about to continue a pass holding renamed uniform updates: nonzero = it reads a deferred range other than through a fully covered uniform binding
+// (1 vertex buffer, 2 index buffer, 3 partly covered uniform, 4 storage buffer, 5 buffer texture) - the pass has to end (landing the updates) before it, as the old code always did
+static int ubd_conflict(NvProg *pr, const p_draw_idx *di) {
+    for (int s_ = 0; s_ < 16; s_++) if (S.vbuf[s_].address && ubd_hit(S.vbuf[s_].address, S.vbuf[s_].size ? S.vbuf[s_].size : 1ull << 32)) return 1;
+    if (di && di->ibuf && ubd_hit(di->ibuf, (uint64_t)(di->count ? di->count : 1) << (di->itype == 2 ? 2 : di->itype == 1 ? 1 : 0))) return 2;
+    int hit = 0;
+    for (int st = 0; st < 2 && !hit; st++) { NvShader *sh = pr->sh[st]; if (!sh) continue;
+        for (int i = 0; i < sh->rf.nb && !hit; i++) { const nvn_rbind *b = &sh->rf.b[i]; int reg = b->reg;
+            if (b->kind == NVN_RB_CBUF || b->kind == NVN_RB_UBOP) { const p_bind_buf *u = reg < 16 ? &S.ubo[st][reg] : NULL; hit = u && u->addr && ubd_rename(u->addr, u->size ? u->size : 1, NULL) == 1 ? 3 : 0;
+                if (hit) PD("E %llu 部分覆盖：阶段 %d cb%d %#llx+%llu", g_stat_pass, st, reg, (unsigned long long)u->addr, (unsigned long long)u->size); }
+            else if (b->kind == NVN_RB_SBUFP) { const p_bind_buf *u = reg < 16 ? &S.ssbo[st][reg] : NULL; hit = u && u->addr && ubd_hit(u->addr, u->size ? u->size : 1) ? 4 : 0; }
+            else if (b->kind == NVN_RB_TBUF || b->kind == NVN_RB_TEX || b->kind == NVN_RB_IMG) {   // buffer textures read pool memory in place (tex_mtl, target 10)
+                int tid = b->kind == NVN_RB_IMG ? (reg < 32 ? (int)(S.img[st][reg] & 0xfffff) : 0) : reg < 128 ? (int)(S.tex[st][reg] & 0xfffff) : 0;
+                if (!tid) continue;
+                pthread_mutex_lock(&g_rmu);
+                if (tid < g_ntreg && g_treg[tid].ok && g_treg[tid].t.d.target == 10 && g_treg[tid].t.mem)
+                    hit = ubd_hit((uint64_t)(uintptr_t)g_treg[tid].t.mem, g_treg[tid].t.L.size ? g_treg[tid].t.L.size : (uint64_t)g_treg[tid].t.d.width * 16) ? 5 : 0;
+                pthread_mutex_unlock(&g_rmu); } } }
+    return hit;
+}
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); PD("Z %llu 绘制跳过：没有绑定程序", g_stat_pass + !g_enc); return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
@@ -4972,8 +5048,12 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (g_fz.active && g_enc && g_fz.phase == 2 && !fz_p2_draw(pr, dw, di, g_fz.lmap2, &fz_fn)) {   // Cannot be proven: end the merged render pass (the earlier pass's result is stored as usual) and reopen with the later pass's original targets
         static int once3; if (!once3++) MLOG("可读 tile 通道合并：后一个通道的绘制证不出，退回分开（首例 通道 %llu）", g_stat_pass);
         g_fz_fallback++; rp_end(); }
+    int ubc = g_ubd_n && g_enc && !g_gh.busy ? ubd_conflict(pr, di) : 0;
+    if (ubc) {
+        if (!g_ubd_cuts++) MLOG("uniform 更新改名：绘制以别的方式读到改名中的区间，在此结束通道（首例 通道 %llu）", g_stat_pass);
+        PD("E %llu 绘制读到改名中的 uniform 区间：结束渲染通道 why=%d（1 顶点 2 索引 3 部分覆盖 4 存储 5 缓冲贴图）", g_stat_pass, ubc); rp_end(); }
     fb_prepare(pr);   // same-pass feedback sampling: copy the snapshot first (see fb_prepare)
-    if (R.has_sc && !g_enc) {
+    if (R.has_sc && (!g_enc || g_ubd_gap)) {   // in the gap after a renamed update the old code had no pass open here
         NSUInteger tw0 = 0, th0 = 0; rt_dims(&tw0, &th0);
         long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y, x1 = (long)R.sc.x + R.sc.w, y1 = (long)R.sc.y + R.sc.h;
         if (x1 > (long)tw0) x1 = tw0; if (y1 > (long)th0) y1 = th0;
@@ -4993,6 +5073,7 @@ frz_plain:;
     int skip_d = mode != 0;
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
+    g_ubd_gap = 0;   // this draw continues the pass (the old code would have opened a new one here)
     g_fd_dw = NULL; g_fd_di = NULL;
     if (!en) { PD("Z %llu 绘制跳过：没开成渲染通道 vs=%.16s fs=%.16s", g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-"); return; }   // Z lines: why a draw was dropped at these early returns
     if (defer_q_draw) defer_replay();
@@ -5923,6 +6004,7 @@ void mtl_exec(const uint8_t *p) {
                 break; }
             case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); g_cnt_reset[t & 31]++; PD("Q reset type=%llu cmd=%p", (unsigned long long)t, p);
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
+                    if (g_ubd_gap && !g_enc_has_vis) rp_end();   // the old code had no pass open here: the next draw opens one with the visibility buffer attached
 #ifdef NVN_RT_RANGE_TEST
                     rr_reset();
 #endif
@@ -5948,6 +6030,7 @@ void mtl_exec(const uint8_t *p) {
             }
             case OP_CLEAR_COLOR: {
                 const p_clear_color *c = a;
+                if (g_ubd_gap) rp_end();   // a renamed update kept the pass open: the old code had ended it, so the clear lands at the start of the next pass
                 PD("c %llu 清色 目标%d 掩码=%#x 色=%g,%g,%g,%g 通道中=%d", g_stat_pass, c->index, c->mask, c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3], g_enc != nil);
                 if (!ren_on()) { g_stat_ren_skip++; PD("c %llu 条件渲染不成立：清色跳过", g_stat_pass); break; }
                 // A scissored clear to 0 outside a pass with all channels (SMBW clears pyramid levels as sub-rectangles of 480×272 and other targets): copy from the zero buffer into the scissor rectangle in the replay stream
@@ -5965,6 +6048,7 @@ void mtl_exec(const uint8_t *p) {
             }
             case OP_CLEAR_DS: {
                 const p_clear_ds *c = a;
+                if (g_ubd_gap) rp_end();   // same as the color clear above
                 PD("c %llu 深度模板清除 depth=%g dmask=%d stencil=%d smask=%#x 通道中=%d", g_stat_pass, c->depth, c->depth_mask, c->stencil, c->stencil_mask, g_enc != nil);
                 if (!ren_on()) { g_stat_ren_skip++; PD("c %llu 条件渲染不成立：深度模板清除跳过", g_stat_pass); break; }
                 if (g_rt_merged) rp_end();
@@ -6449,7 +6533,7 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     if (memcmp(last_vp, &vp, sizeof last_vp)) { memcpy(last_vp, &vp, sizeof last_vp);
         MLOG("出图视口 %.0f,%.0f %.0fx%.0f / 画布 %.0fx%.0f（游戏画面 %lux%lu）", vp.originX, vp.originY, vp.width, vp.height, dw, dh, (unsigned long)src.width, (unsigned long)src.height); }
     id<MTLTexture> tex = present_raw_src(src);
-    if (fx_on() && !cx && !cy && vp.width > cw && vp.height > ch) {
+    if (fx_on() && !cx && !cy && cw == tex.width && ch == tex.height && vp.width > cw && vp.height > ch) {   // whole texture only: the scaler reads past inputContentWidth / Height (t_present_crop: a 4×4 crop picked up its green / blue neighbors at the edge)
         id<MTLTexture> up = fx_encode(cb, tex, cw, ch, (NSUInteger)vp.width, (NSUInteger)vp.height);
         if (up) { tex = up; cw = up.width; ch = up.height; }
     }
@@ -6482,7 +6566,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
     id<MTLTexture> tex = present_raw_src(src), up = nil;
-    if (fx_on() && !cx && !cy && vp.width > cw && vp.height > ch && (up = fx4_encode(cb, tex, cw, ch, (NSUInteger)vp.width, (NSUInteger)vp.height, uv_i))) { tex = up; cw = up.width; ch = up.height; }
+    if (fx_on() && !cx && !cy && cw == tex.width && ch == tex.height && vp.width > cw && vp.height > ch && (up = fx4_encode(cb, tex, cw, ch, (NSUInteger)vp.width, (NSUInteger)vp.height, uv_i))) { tex = up; cw = up.width; ch = up.height; }   // whole texture only (see present_encode)
     atomic_store(&g_fx4_used, up != nil);
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = dst;

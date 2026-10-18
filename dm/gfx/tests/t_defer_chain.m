@@ -5,6 +5,7 @@ module_t *module_of(const void *p) { (void)p; return NULL; }
 module_t g_mod[MAX_MOD]; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
+uint64_t nvn_new_serial(void) { static uint64_t n = 1ull << 40; return ++n; }   // hle_nvn.c is not linked
 static int fail, count;
 #define EXPECT(name, want, got) do { uint64_t w=(want), g=(got); count++; printf("%s 期望 %llu → 真结果 %llu %s\n", name, (unsigned long long)w, (unsigned long long)g, w==g?"✓":"✗"); fail += w != g; } while (0)
 typedef struct { uint8_t *p; size_t n; } chain;

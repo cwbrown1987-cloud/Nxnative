@@ -7,6 +7,7 @@ module_t g_mod[MAX_MOD]; int g_nmod;
 void svc_thread_dump(void) {}
 int prog_key(const prog_t *p, unsigned stage, uint8_t key[8]) { (void)p; (void)stage; memset(key, 0, 8); return 0; }   // shader keys from hle_nvn.c: this test does not link it, so a zero key (the missing stub broke the link)
 uint64_t now_ns(void) { return bp_now(); }
+uint64_t nvn_new_serial(void) { static uint64_t n = 1ull << 40; return ++n; }   // hle_nvn.c is not linked
 
 static int fail, count;
 #define EXPECT(name, want, got) do { uint64_t w = (want), v = (got); count++; \
