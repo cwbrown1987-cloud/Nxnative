@@ -106,13 +106,14 @@ static _Atomic int g_up_pending;
 
 static pthread_mutex_t g_res_mu = PTHREAD_MUTEX_INITIALIZER;   // Dedicated lock for the residency set: res_add is called on paths that hold g_mu (arena_new), so it cannot share g_mu
 static NSHashTable *g_res_objects;
+static uint64_t g_res_add_tex, g_res_add_buf, g_res_rm, g_res_commits, g_res_commit_ns;   // per-frame TSV @res_*
 static void res_add(id<MTLResource> r) {
     if (!r) return;
     pthread_mutex_lock(&g_res_mu);
     [g_res addAllocation:(id<MTLAllocation>)r];
     if (!g_res_objects) g_res_objects = [NSHashTable weakObjectsHashTable];
     [g_res_objects addObject:r];
-    g_res_dirty = 1;
+    g_res_dirty = 1; if ([r conformsToProtocol:@protocol(MTLTexture)]) g_res_add_tex++; else g_res_add_buf++;
     pthread_mutex_unlock(&g_res_mu);
 }
 static void res_remove(id<MTLResource> r) {
@@ -120,7 +121,7 @@ static void res_remove(id<MTLResource> r) {
     pthread_mutex_lock(&g_res_mu);
     [g_res removeAllocation:(id<MTLAllocation>)r];
     [g_res_objects removeObject:r];
-    g_res_dirty = 1;
+    g_res_dirty = 1; g_res_rm++;
     pthread_mutex_unlock(&g_res_mu);
 }
 // DM_RES_CHECK=1 (diagnostic): if textures / buffers the shader accesses through the argument block are not in the residency set, print the first 40 (textures are attributed to the actual allocation via parent texture / underlying buffer)
@@ -139,9 +140,10 @@ static void res_check(id r, const char *what, int reg) {
 }
 static void res_commit(void) {
     pthread_mutex_lock(&g_res_mu);
-    if (g_res_dirty) { [g_res commit]; g_res_dirty = 0; }
+    if (g_res_dirty) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); [g_res commit]; g_res_dirty = 0; g_res_commits++; g_res_commit_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; }
     pthread_mutex_unlock(&g_res_mu);
 }
+void mtl_res_stats(uint64_t s[6]) { pthread_mutex_lock(&g_res_mu); s[0] = g_res_commits; s[1] = g_res_commit_ns; s[2] = g_res_add_tex; s[3] = g_res_add_buf; s[4] = g_res_rm; s[5] = g_res.allocationCount; pthread_mutex_unlock(&g_res_mu); }
 
 @interface NvDeferredRelease : NSObject { @public id object; uint64_t fence; int keep_resident; } @end
 @implementation NvDeferredRelease @end
@@ -1046,6 +1048,7 @@ static id<MTLComputePipelineState> bcd_pso(void) {
 static NSMutableArray *g_up_texs;   // Target textures in the batch: before the flush, textures may be replaced / released within the same submission
 static id<MTLBuffer> g_up_block;
 static size_t g_up_block_off, g_up_block_size;
+static int g_up_block_owned;   // g_up_block is the slot's permanent block (up_alloc): never retired
 static NSMutableArray *g_up_keep;
 
 
@@ -1098,7 +1101,7 @@ static void up_flush(void) {
     [cb endCommandBuffer];
     id<MTL4CommandBuffer> buffers[] = {cb};
     [g_q4 commit:buffers count:1 options:o];
-    g_up_cb = nil; if (g_up_block) { defer_obj_release(g_up_block); g_up_block = nil; } g_up_block_off = g_up_block_size = 0;
+    g_up_cb = nil; if (g_up_block) { if (!g_up_block_owned) defer_obj_release(g_up_block); g_up_block = nil; } g_up_block_off = g_up_block_size = 0; g_up_block_owned = 0;
     for (id obj in g_up_keep) defer_obj_release(obj);
     [g_up_keep removeAllObjects];
     up_diag();
@@ -1137,13 +1140,21 @@ static void up_diag(void) {
          (unsigned long long)g_up_blocks_new, (unsigned long long)g_up_swaps, (unsigned long long)(g_up_swap_bytes >> 20), alive, (unsigned long long)(abytes >> 20), inres, (unsigned long long)(g_dev.currentAllocatedSize >> 20), nres, ndef);
 }
 static id<MTLBuffer> up_alloc(size_t n, size_t *off) {
+    // The first block of a batch is the slot's own, kept resident and reused (up_begin waited for the slot's previous batch to finish on the GPU):
+    // a new 32 MB block per batch cost about 0.8 ms of residency commit each time, ~5 times per frame in TotK
+    static id<MTLBuffer> slot_block[3]; unsigned slot = (g_up_seq - 1) % 3;
     size_t need = (n + 255u) & ~((size_t)255u);
+    if (!g_up_block && need <= UP_BLOCK_SIZE) {
+        if (!slot_block[slot]) { slot_block[slot] = [g_dev newBufferWithLength:UP_BLOCK_SIZE options:MTLResourceStorageModePrivate]; if (!slot_block[slot]) MDIE("建预排布上传暂存块失败 %#x", UP_BLOCK_SIZE); res_add(slot_block[slot]); g_up_blocks_new++; }
+        g_up_block = slot_block[slot]; g_up_block_size = UP_BLOCK_SIZE; g_up_block_off = 0; g_up_block_owned = 1;
+    }
     if (!g_up_block || g_up_block_off + need > g_up_block_size) {
         // Block switch: the old block is still referenced by copy / decompress commands already recorded in this batch and cannot be freed on the spot; hand it to g_up_keep, to be retired later with the other staging after the flush commits (removed from the residency set on retire).
         // Previously g_up_block was simply replaced with the new block here: nobody retired the old block, yet it stayed in the residency set, so each extra block switch in an upload batch leaked one block (usually 32 MB) of GPU memory.
         // The old block and the "current block" retired at flush are two objects, so nothing is retired twice
         g_up_blocks_new++; if (g_up_block) { g_up_swaps++; g_up_swap_bytes += g_up_block_size; if (!g_up_old) g_up_old = [NSHashTable weakObjectsHashTable]; [g_up_old addObject:g_up_block]; static int leak = -1; if (leak < 0) leak = getenv("DM_TEST_UP_LEAK") != NULL;   // test switch DM_TEST_UP_LEAK=1: do not retire the old block, as before the fix (for comparison, to measure the leak)
-            if (!leak) { if (!g_up_keep) g_up_keep = [NSMutableArray array]; [g_up_keep addObject:g_up_block]; } }
+            if (!leak && !g_up_block_owned) { if (!g_up_keep) g_up_keep = [NSMutableArray array]; [g_up_keep addObject:g_up_block]; } }
+        g_up_block_owned = 0;
         g_up_block_size = n > UP_BLOCK_SIZE ? need : UP_BLOCK_SIZE;
         g_up_block = [g_dev newBufferWithLength:g_up_block_size options:MTLResourceStorageModePrivate];
         if (!g_up_block) MDIE("建预排布上传暂存块失败 %#zx", g_up_block_size);

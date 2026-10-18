@@ -95,7 +95,8 @@ static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the
           if (xd > 0) { uint64_t at = uc->uc_mcontext->__ss.__x[2]; uint8_t b[512]; vm_size_t got = 0; long n = xd > 512 ? 512 : xd;
             if (!vm_read_overwrite(mach_task_self(), at, n, (vm_address_t)b, &got)) { fprintf(stderr, "[dm]   [x2]:"); for (long k = 0; k < (long)got; k += 8) { uint64_t v; memcpy(&v, b + k, 8); fprintf(stderr, "%s%llx", k % 32 ? " " : "\n[dm]   ", (unsigned long long)v); } fputc('\n', stderr); } } }
         if (g_probe[i].hreg >= 0) probe_heapwalk(uc->uc_mcontext->__ss.__x[g_probe[i].hreg]);
-        dm_backtrace(uc->uc_mcontext->__ss.__fp);
+        { static int nobt = -1; if (nobt < 0) nobt = getenv("DM_PROBE_NOBT") != NULL;   // DM_PROBE_NOBT=1: one line per hit (per-frame probes)
+          if (!nobt) dm_backtrace(uc->uc_mcontext->__ss.__fp); }
         uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot;
         return 1;
     }

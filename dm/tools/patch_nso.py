@@ -164,6 +164,13 @@ CUTS = {
     (0x2d501c, '880240b9', '28008052', '降档停在下限：ldr w8,[x20] → mov w8,#1', '仅宿主'),
     (0x2d503c, 'bf01086b', 'bf050071', '升档时记的降档目标：cmp w13,w8 → cmp w13,#1', '仅宿主'),
     (0x2d5048, 'acc1881a', 'acc59f1a', '升档时记的降档目标：csel w12,w13,w8,gt → csinc w12,w13,wzr,gt（max(当前 − 1, 1)）', '仅宿主'),
+    # The controller steps down only when its target (+0x44) is below the current interval; its setup (main+0xbb9d7c, from the owner constructor at main+0xbb9c9c) sets both to the
+    # floor 2, so from a fresh start it never tried 60 fps (only after a hitch had pushed it up to 3). The target now starts at 1; the interval stays 2 until 6 frames fit 60 fps
+    (0xbb9d98, '680240b9', '28008052', '起始降档目标：ldr w8,[x19]（下限 2）→ mov w8,#1', '仅宿主'),
+    # Leaving the fixed-interval mode (flag +0x58; e.g. a forced 30) re-arms the step-down only when floor < current: the helper and its two inlined copies read the floor
+    (0x2b2a7a0, '0a0040b9', '2a008052', '退出固定间隔时的下限：ldr w10,[x0] → mov w10,#1', '仅宿主'),
+    (0xd28f44, '0a0042b9', '2a008052', '退出固定间隔（内联）的下限：ldr w10,[x0,#0x200] → mov w10,#1', '仅宿主'),
+    (0x1fefd38, '0a0142b9', '2a008052', '退出固定间隔（内联）的下限：ldr w10,[x8,#0x200] → mov w10,#1', '仅宿主'),
   ],
   '56ec24747ec9e7f19b3efb062483a19d': [
     (0x346430, '08fca752', '087ca052', 'AddressRegionManager 构造：节点区上限 mov w8,#0x3fe00000 → mov w8,#0x3e00000', '仅宿主'),

@@ -1259,6 +1259,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         static uint64_t pfa, pre_; uint64_t fa_, pr_, up_, re_; nvn_dirty_stats(&fa_, &pr_); mtl_pkg_stats(&up_, &re_);
         trow(f, "@faults", (double)(fa_ - pfa)); trow(f, "@reuploads", (double)(re_ - pre_)); pfa = fa_; pre_ = re_;
         static uint64_t pun, puc_, pud; uint64_t un_, uc2_, ud_; mtl_ubren_stats(&un_, &uc2_, &ud_); trow(f, "@ubren", (double)(un_ - pun)); trow(f, "@ubren_cut", (double)(uc2_ - puc_)); trow(f, "@ubren_dead", (double)(ud_ - pud)); pun = un_; puc_ = uc2_; pud = ud_;
+        { static uint64_t pr[6]; uint64_t r[6]; mtl_res_stats(r);
+          trow(f, "@res_commits", (double)(r[0] - pr[0])); trow(f, "@res_commit_ms", (r[1] - pr[1]) / 1e6); trow(f, "@res_add_tex", (double)(r[2] - pr[2])); trow(f, "@res_add_buf", (double)(r[3] - pr[3])); trow(f, "@res_rm", (double)(r[4] - pr[4])); trow(f, "@res_allocs", (double)r[5]); memcpy(pr, r, sizeof pr); }
         static uint64_t pmc, pmp, pmn; uint64_t mc_, mpg_, mn_; nvn_dirty_mp_stats(&mc_, &mpg_, &mn_);
         trow(f, "@mprotect_calls", (double)(mc_ - pmc)); trow(f, "@mprotect_pages", (double)(mpg_ - pmp)); trow(f, "@mprotect_ms", (mn_ - pmn) / 1e6); pmc = mc_; pmp = mpg_; pmn = mn_;
         double up_ms = mtl_upload_ns_take() / 1e6; trow(f, "@upload_ms", up_ms);
@@ -1296,6 +1298,11 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     dump_frame();
     if (g_frame % TWIN == 0) tsummary(g_frame);
     mtl_set_frame(g_frame);
+#if TARGET_OS_OSX
+    { static long at = -2, secs; static char path[1024];   // DM_SAMPLE=<present>,<seconds>,<file>: /usr/bin/sample of this process starting at that present (call tree of every thread)
+      if (at == -2) { const char *e = getenv("DM_SAMPLE"); at = -1; if (e && sscanf(e, "%ld,%ld,%1023s", &at, &secs, path) != 3) { at = -1; LOG("[nvn] 【红】DM_SAMPLE 格式：出图次数,秒数,文件"); } }
+      if (at >= 0 && (long)g_frame == at) { char c[1200]; snprintf(c, sizeof c, "/usr/bin/sample %d %ld -mayDie -f '%s' >/dev/null 2>&1 &", (int)getpid(), secs, path); LOG("[nvn] DM_SAMPLE：第 %ld 次出图起采样 %ld 秒 → %s（%s）", at, secs, path, system(c) ? "启动失败" : "已启动"); } }
+#endif
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
     uint64_t period = present_period(o), now = dm_detclock_enabled() ? guest_ns() : now_ns();
     nvn_pacer pc = {o->pace};
