@@ -3,6 +3,8 @@
 // Environment switches: DM_OPMODE=0 handheld / 1 console (default: the profile's op_mode, console unless set; console corresponds to the console-mode render profile); DM_LANG=language code (default en-US).
 #include "hle.h"
 #include "dm_uiscreen.h"
+#include <errno.h>
+#include <time.h>
 
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
 #include <stdatomic.h>
@@ -12,7 +14,7 @@ int dm_opmode(void) {
     if (m < 0) { const char *e = getenv("DM_OPMODE"); int v = e ? atoi(e) : DM_GAME_OPMODE; int exp = -1; atomic_compare_exchange_strong(&g_opmode, &exp, v); m = g_opmode; }
     return m;
 }
-// ---------- System notification queue (AppletMessage): front end state changes → fetched by the game every frame with TryPopNotificationMessage ----------
+// ---------- System notification queue (AppletMessage): front end state changes → fetched by the game on its own worker thread with the blocking PopNotificationMessage; TryPopNotificationMessage shares the same queue ----------
 // Message numbers (those actually handled by the game at main 0xe10d30): 15 focus change, 30 operation mode change, 31 performance mode change
 enum { MSG_FOCUS = 15, MSG_OPMODE = 30, MSG_PERFMODE = 31 };
 #define MQ 32
@@ -43,6 +45,20 @@ static void mq_push_(uint32_t m) {
     g_mq[(g_mqh + g_mqn++) % MQ] = m;
     pthread_cond_broadcast(&g_mq_cond);
     pthread_mutex_unlock(&g_mq_lock);
+}
+// Focus round trip when a system applet (controller / keyboard / user selector / friends / shop ...) closes: on hardware the applet owns the focus, and on close the application gets it back and receives AppletMessage 15.
+// The host has no system UI, so play the hardware order: remember the focus -> go to 2 (out of focus) -> restore; dm_focus_set returns early for an unchanged value, so at least one MSG_FOCUS is queued here.
+// Fallback switch DM_APPLET_NO_FOCUS=1 (reproduces the old "game keeps waiting for a message after the applet returns" behaviour)
+int dm_focus_now(void);   // defined below
+void dm_focus_set(int st);   // defined below
+void dm_applet_roundtrip(const char *name) {
+    static int off = -1; if (off < 0) { const char *e = getenv("DM_APPLET_NO_FOCUS"); off = e && e[0] == '1' && !e[1]; }
+    if (off) return;
+    int cur = dm_focus_now();
+    dm_focus_set(2);
+    mq_push(MSG_FOCUS);
+    if (cur != 2) dm_focus_set(cur);
+    LOG("[oe] 系统小程序往返：%s（焦点 %d → 2 → %d）", name, cur, cur);
 }
 void dm_oe_res_changed(void) { if (getenv("DM_TEST_OE_FOCUS_FIRST")) mq_push(MSG_FOCUS);   /* Test: queue 31 behind a focus notification (the order at iOS app startup) */
     if (g_ntf_perfmode) mq_push(MSG_PERFMODE); else LOG("[RED] the resolution needs to change, but the game has not enabled performance mode change notifications"); }   // the render resolution should change (dm_uiscreen.c): make the game re-read the parameter bits
@@ -261,13 +277,26 @@ HLE_FORCE("_ZN2nn2oe25TryPopNotificationMessageEPj", "system notification queue;
     return ok;
 }
 // The blocking form (Link's Awakening pops on a thread of its own, main+0xfa1ff8): the SDK's version waits on the system event oe::Initialize would have created,
-// and the host's oe::Initialize is a no-op, so it aborted on an uninitialized event. Wait for the host queue instead, then take the message the Try path's way
+// and the host's oe::Initialize is a no-op, so it aborted on an uninitialized event. Wait for the host queue instead, then take the message the Try path's way.
+// On hardware this call blocks (TryPop is the non-blocking one): Mario Kart 8 runs a worker thread that loops on main+0x8da05c with no sleep, and the old
+// always-0 implementation made that thread spin ~1.1e8 times a second (a whole core) while never receiving focus/resume messages (the character-select freeze).
+// The wait uses a 100 ms timeout and then returns 0 with no message, so process shutdown is never stuck.
+// Fallback switch DM_OE_POP_LEGACY=1: the old always-0 behaviour.
 HLE_FORCE("_ZN2nn2oe22PopNotificationMessageEv", "system notification queue (blocking); waits on the host queue", uint32_t, h_oe_PopMsg, void) {
+    static int legacy = -1; if (legacy < 0) { const char *e = getenv("DM_OE_POP_LEGACY"); legacy = e && e[0] == '1' && !e[1]; }
+    if (legacy) { scale3d_tick(); pthread_once(&g_oe_once, oe_script_start); return 0; }
     uint32_t m = 0;
     for (;;) {
         pthread_mutex_lock(&g_mq_lock);
-        while (!g_mqn) pthread_cond_wait(&g_mq_cond, &g_mq_lock);
+        while (!g_mqn) {
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 100 * 1000 * 1000;                                  // 100 ms
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            if (pthread_cond_timedwait(&g_mq_cond, &g_mq_lock, &ts) == ETIMEDOUT) break;   // nothing yet: return 0 so shutdown is never stuck
+        }
+        int have = g_mqn > 0;
         pthread_mutex_unlock(&g_mq_lock);
+        if (!have) return 0;
         if (h_oe_TryPopMsg(&m)) return m;   // another thread may have taken it in between: wait again
     }
 }

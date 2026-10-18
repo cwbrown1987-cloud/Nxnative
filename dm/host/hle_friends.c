@@ -41,12 +41,12 @@ HLE_FORCE("_ZN2nn7friends21StartFriendInvitationERKNS_7account3UidEiRKNS0_35Frie
 HLE_FORCE("_ZN2nn7friends28StartSendingFriendInvitationERKNS_7account3UidEPKNS1_23NetworkServiceAccountIdEiRKNS0_35FriendInvitationGameModeDescriptionEPKvm", "invitations unavailable (cut)",
           Result, h_fr_SendInv, const void *uid, const void *ids, int n, const void *d, const void *p, size_t sz) { (void)uid; (void)ids; (void)n; (void)d; (void)p; (void)sz; return RES_FAIL; }
 HLE_FORCE("_ZN2nn7friends18ShowUserDetailInfoERKNS_7account3UidERKNS1_23NetworkServiceAccountIdERKNS0_15InAppScreenNameESA_", "friend detail applet (cut)",
-          Result, h_fr_ShowDetail, const void *uid, const void *id, const void *a, const void *b) { (void)uid; (void)id; (void)a; (void)b; return RES_FAIL; }
+          Result, h_fr_ShowDetail, const void *uid, const void *id, const void *a, const void *b) { (void)uid; (void)id; (void)a; (void)b; dm_applet_roundtrip("friend detail applet"); return RES_FAIL; }
 // Friend list applets (Engage's friends menu): the original starts an applet, the host has no applet proxy
-HLE_FORCE("_ZN2nn7friends14ShowFriendListERKNS_7account3UidE", "friend list applet (cut)", Result, h_fr_ShowList, const void *uid) { (void)uid; return RES_FAIL; }
-HLE_FORCE("_ZN2nn7friends19ShowBlockedUserListERKNS_7account3UidE", "blocked user list applet (cut)", Result, h_fr_ShowBlocked, const void *uid) { (void)uid; return RES_FAIL; }
-HLE_FORCE("_ZN2nn7friends29ShowReceivedFriendRequestListERKNS_7account3UidE", "received friend request applet (cut)", Result, h_fr_ShowRecv, const void *uid) { (void)uid; return RES_FAIL; }
-HLE_FORCE("_ZN2nn7friends33ShowMethodsOfSendingFriendRequestERKNS_7account3UidE", "send friend request applet (cut)", Result, h_fr_ShowSend, const void *uid) { (void)uid; return RES_FAIL; }
+HLE_FORCE("_ZN2nn7friends14ShowFriendListERKNS_7account3UidE", "friend list applet (cut)", Result, h_fr_ShowList, const void *uid) { (void)uid; dm_applet_roundtrip("friend list applet"); return RES_FAIL; }
+HLE_FORCE("_ZN2nn7friends19ShowBlockedUserListERKNS_7account3UidE", "blocked user list applet (cut)", Result, h_fr_ShowBlocked, const void *uid) { (void)uid; dm_applet_roundtrip("blocked user list applet"); return RES_FAIL; }
+HLE_FORCE("_ZN2nn7friends29ShowReceivedFriendRequestListERKNS_7account3UidE", "received friend request applet (cut)", Result, h_fr_ShowRecv, const void *uid) { (void)uid; dm_applet_roundtrip("received friend request applet"); return RES_FAIL; }
+HLE_FORCE("_ZN2nn7friends33ShowMethodsOfSendingFriendRequestERKNS_7account3UidE", "send friend request applet (cut)", Result, h_fr_ShowSend, const void *uid) { (void)uid; dm_applet_roundtrip("send friend request applet"); return RES_FAIL; }
 // Presence
 HLE_FORCE("_ZN2nn7friends12UserPresence10InitializeERKNS_7account3UidE", "presence unavailable (cut)", Result, h_fr_UpInit, void *self, const void *uid) { (void)self; (void)uid; return RES_FAIL; }
 HLE_FORCE("_ZN2nn7friends12UserPresence14SetDescriptionEPKc", "presence unavailable (cut)", Result, h_fr_UpDesc, void *self, const char *s) { (void)self; (void)s; return RES_FAIL; }
