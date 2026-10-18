@@ -2,6 +2,8 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CAMetalDisplayLink.h>
+#import <MetalFX/MetalFX.h>
+#undef I   // MetalFX pulls in <complex.h>; its I macro breaks local names below
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <dlfcn.h>
@@ -6354,6 +6356,74 @@ static id<MTLTexture> present_raw_src(id<MTLTexture> src) {
     if (!v) { RED_ONCE(69, "出图：sRGB 交换链贴图的非 sRGB 视图建不出（格式 %lu），按解码后的值出图", (unsigned long)src.pixelFormat); return src; }
     return v;
 }
+// MetalFX spatial upscaling of the game picture to the canvas, replacing the bilinear stretch (DM_MTLFX=0 turns it off; on by default on macOS).
+// The input is the raw-byte view (sRGB-encoded values), hence the perceptual mode; MetalFX reads its content from the texture origin, so only crops at 0,0 qualify
+static int fx_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_MTLFX"); v = e && *e ? atoi(e) != 0 : TARGET_OS_OSX; } return v; }
+static MTLFXSpatialScalerDescriptor *fx_desc(id<MTLTexture> in, NSUInteger ow, NSUInteger oh) {
+    MTLFXSpatialScalerDescriptor *d = [MTLFXSpatialScalerDescriptor new];
+    d.colorTextureFormat = d.outputTextureFormat = in.pixelFormat;
+    d.inputWidth = in.width; d.inputHeight = in.height; d.outputWidth = ow; d.outputHeight = oh;
+    d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+    return d;
+}
+static id<MTLTexture> fx_out_tex(MTLPixelFormat f, NSUInteger w, NSUInteger h, MTLTextureUsage u) {
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:w height:h mipmapped:NO];
+    td.usage = u | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
+    return [g_dev newTextureWithDescriptor:td];
+}
+// Old queue (screenshots, whole-window grabs): a fresh output texture per call
+static id<MTLTexture> fx_encode(id<MTLCommandBuffer> cb, id<MTLTexture> in, NSUInteger cw, NSUInteger ch, NSUInteger ow, NSUInteger oh) {
+    static id<MTLFXSpatialScaler> s; static NSUInteger key[5]; static int bad;
+    NSUInteger k[5] = {in.width, in.height, ow, oh, in.pixelFormat};
+    if (bad) return nil;
+    if (!s || memcmp(k, key, sizeof k)) {
+        s = [fx_desc(in, ow, oh) newSpatialScalerWithDevice:g_dev];
+        if (!s || (in.usage & s.colorTextureUsage) != s.colorTextureUsage) { bad = 1; s = nil;
+            MLOG("【红】截图的 MetalFX 空间放大器建不出（%lux%lu → %lux%lu），改用双线性", (unsigned long)in.width, (unsigned long)in.height, (unsigned long)ow, (unsigned long)oh); return nil; }
+        memcpy(key, k, sizeof k);
+    }
+    id<MTLTexture> out = fx_out_tex(in.pixelFormat, ow, oh, s.outputTextureUsage);
+    if (!out) return nil;
+    s.colorTexture = in; s.inputContentWidth = cw; s.inputContentHeight = ch; s.outputTexture = out;
+    [s encodeToCommandBuffer:cb];
+    return out;
+}
+// Metal 4 present: one output texture per present slot (a slot is reused only after its present completed); the barriers every pass carries order it after the game's frame and before the present pass
+static id<MTL4FXSpatialScaler> g_fx4; static id<MTLTexture> g_fx4_out[3]; static NSUInteger g_fx4_key[5];
+static _Atomic int g_fx4_used;
+static id<MTLTexture> fx4_encode(id<MTL4CommandBuffer> cb, id<MTLTexture> in, NSUInteger cw, NSUInteger ch, NSUInteger ow, NSUInteger oh, int slot) {
+    static id<MTL4Compiler> comp; static int bad;
+    NSUInteger k[5] = {in.width, in.height, ow, oh, in.pixelFormat};
+    if (bad) return nil;
+    if (!g_fx4 || memcmp(k, g_fx4_key, sizeof k)) {
+        NSError *e = nil;
+        if (!comp && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev]) comp = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&e];
+        pthread_mutex_lock(&g_pq_mu); while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu); pthread_mutex_unlock(&g_pq_mu);   // presents in flight may still read the old outputs
+        for (int i = 0; i < 3; i++) if (g_fx4_out[i]) { res_remove(g_fx4_out[i]); g_fx4_out[i] = nil; }
+        g_fx4 = comp ? [fx_desc(in, ow, oh) newSpatialScalerWithDevice:g_dev compiler:comp] : nil;
+        if (g_fx4 && (in.usage & g_fx4.colorTextureUsage) != g_fx4.colorTextureUsage) g_fx4 = nil;
+        for (int i = 0; g_fx4 && i < 3; i++) if (!(g_fx4_out[i] = fx_out_tex(in.pixelFormat, ow, oh, g_fx4.outputTextureUsage))) g_fx4 = nil;
+        if (!g_fx4) { bad = 1; for (int i = 0; i < 3; i++) g_fx4_out[i] = nil;
+            MLOG("【红】MetalFX 空间放大器建不出（Metal 4，%lux%lu → %lux%lu%s%s），出图改用双线性", (unsigned long)in.width, (unsigned long)in.height, (unsigned long)ow, (unsigned long)oh,
+                 e ? "：" : "", e ? e.localizedDescription.UTF8String : ""); return nil; }
+        for (int i = 0; i < 3; i++) res_add(g_fx4_out[i]);
+        res_commit();
+        memcpy(g_fx4_key, k, sizeof k);
+        MLOG("出图放大：MetalFX 空间放大 %lux%lu → %lux%lu", (unsigned long)cw, (unsigned long)ch, (unsigned long)ow, (unsigned long)oh);
+    }
+    g_fx4.colorTexture = in; g_fx4.inputContentWidth = cw; g_fx4.inputContentHeight = ch; g_fx4.outputTexture = g_fx4_out[slot];
+    [g_fx4 encodeToCommandBuffer:cb];
+    return g_fx4_out[slot];
+}
+static int fx_dcmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+static void present_gpu_note(double ms) {   // feedback queue (serial): GPU time of the present command buffer, one line per 300 presents
+    static double v[300]; static int n; static uint64_t total;
+    if (ms <= 0) return;
+    v[n++] = ms; total++;
+    if (n < 300) return;
+    qsort(v, n, sizeof *v, fx_dcmp); n = 0;
+    MLOG("出图 GPU 至第 %llu 次：p50 %.3f / p95 %.3f ms（%s）", (unsigned long long)total, v[150], v[285], atomic_load(&g_fx4_used) ? "MetalFX" : "双线性");
+}
 static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4]) {
     NSUInteger cx = 0, cy = 0, cw = src.width, ch = src.height;
     if (crop && (crop[2] || crop[3])) {
@@ -6378,14 +6448,19 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     static double last_vp[4];   // Log one line when the viewport changes (used by the real-device screen-level acceptance screen_check.py to check the aspect ratio)
     if (memcmp(last_vp, &vp, sizeof last_vp)) { memcpy(last_vp, &vp, sizeof last_vp);
         MLOG("出图视口 %.0f,%.0f %.0fx%.0f / 画布 %.0fx%.0f（游戏画面 %lux%lu）", vp.originX, vp.originY, vp.width, vp.height, dw, dh, (unsigned long)src.width, (unsigned long)src.height); }
+    id<MTLTexture> tex = present_raw_src(src);
+    if (fx_on() && !cx && !cy && vp.width > cw && vp.height > ch) {
+        id<MTLTexture> up = fx_encode(cb, tex, cw, ch, (NSUInteger)vp.width, (NSUInteger)vp.height);
+        if (up) { tex = up; cw = up.width; ch = up.height; }
+    }
     rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
     [en setViewport:vp];
-    [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
-    float uv[8] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
-                   (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
+    [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:tex atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
+    float uv[8] = {(float)cx / tex.width, (float)cy / tex.height, (float)cw / tex.width, (float)ch / tex.height,
+                   (cx + 0.5f) / tex.width, (cy + 0.5f) / tex.height, (cx + cw - 0.5f) / tex.width, (cy + ch - 0.5f) / tex.height};
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [en setFragmentBytes:uv length:sizeof uv atIndex:0];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -6406,6 +6481,9 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
     if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
+    id<MTLTexture> tex = present_raw_src(src), up = nil;
+    if (fx_on() && !cx && !cy && vp.width > cw && vp.height > ch && (up = fx4_encode(cb, tex, cw, ch, (NSUInteger)vp.width, (NSUInteger)vp.height, uv_i))) { tex = up; cw = up.width; ch = up.height; }
+    atomic_store(&g_fx4_used, up != nil);
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = dst;
     rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
@@ -6415,11 +6493,11 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     if (!en) { MLOG("【红】M4 出图渲染编码器创建失败"); return 0; }
     [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
     [en setArgumentTable:g_present_args atStages:MTLRenderStageFragment];
-    [g_present_args setTexture:present_raw_src(src).gpuResourceID atIndex:0];
+    [g_present_args setTexture:tex.gpuResourceID atIndex:0];
     [g_present_args setSamplerState:g_blit_samp.gpuResourceID atIndex:0];
     float *uv = g_present_uv[uv_i].contents;
-    uv[0] = (float)cx / src.width; uv[1] = (float)cy / src.height; uv[2] = (float)cw / src.width; uv[3] = (float)ch / src.height;
-    uv[4] = (cx + 0.5f) / src.width; uv[5] = (cy + 0.5f) / src.height; uv[6] = (cx + cw - 0.5f) / src.width; uv[7] = (cy + ch - 0.5f) / src.height;
+    uv[0] = (float)cx / tex.width; uv[1] = (float)cy / tex.height; uv[2] = (float)cw / tex.width; uv[3] = (float)ch / tex.height;
+    uv[4] = (cx + 0.5f) / tex.width; uv[5] = (cy + 0.5f) / tex.height; uv[6] = (cx + cw - 0.5f) / tex.width; uv[7] = (cy + ch - 0.5f) / tex.height;
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [g_present_args setAddress:g_present_uv[uv_i].gpuAddress atIndex:0];
     [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
@@ -6503,6 +6581,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     MTL4CommitOptions *o = [MTL4CommitOptions new];
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         if (f.error) MLOG("【红】上屏命令缓冲错误：%s", f.error.description.UTF8String);
+        present_gpu_note((f.GPUEndTime - f.GPUStartTime) * 1000.0);
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }];
     id<MTL4CommandBuffer> buffers[] = {cb};

@@ -115,8 +115,9 @@ void front_run(void (*guest)(void)) {
         fit_drawable(win);
         [win makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
-        const char *fs = getenv("DM_FULLSCREEN");
-        if (fs && atoi(fs)) dispatch_async(dispatch_get_main_queue(), ^{ [win toggleFullScreen:nil]; });   // DM_FULLSCREEN=1: start in full screen
+        const char *fs = getenv("DM_FULLSCREEN");   // DM_FULLSCREEN=1: start in full screen once launching finished (toggled earlier, it once bounced back to the window)
+        if (fs && atoi(fs)) [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidFinishLaunchingNotification object:NSApp queue:nil
+                                                                        usingBlock:^(NSNotification *n) { (void)n; [win toggleFullScreen:nil]; }];
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
