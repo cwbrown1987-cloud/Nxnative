@@ -1,4 +1,4 @@
-// Host lifecycle: graceful exit (SIGTERM; on iOS the App termination callback calls dm_host_shutdown).
+// Host lifecycle: graceful exit (SIGTERM / SIGINT; the Mac window's close button and quit, front_mac.m; on iOS the App termination callback calls dm_host_shutdown).
 // Stop background threads (boot block prefetch), pause audio, suspend graphics (wait for in-flight NVN calls to end and drain GPU work), then _exit(0); a 1.5 s fallback goes straight to _exit(0).
 // The default action also exits in about 0.08 s (exit code 143); the value of this function is stopping background threads in order, exit code 0, and giving the iOS lifecycle callback an entry.
 #include "hle.h"
@@ -22,10 +22,13 @@ void dm_host_shutdown(const char *why) {
     LOG("优雅退出完成（%.3f 秒）", (now_ns() - t0) / 1e9);
     _exit(0);
 }
-void dm_term_install(void) {
-    signal(SIGTERM, SIG_IGN);                       // do not take the default action: hand over to the GCD signal source to wrap up on an ordinary thread
-    static dispatch_source_t src;
-    src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
-    dispatch_source_set_event_handler(src, ^{ dm_host_shutdown("SIGTERM"); });
-    dispatch_resume(src);
+void dm_term_install(void) {   // SIGTERM, and SIGINT (Ctrl-C in the terminal that started it)
+    static dispatch_source_t src[2]; static const int sig[2] = {SIGTERM, SIGINT};
+    for (int i = 0; i < 2; i++) {
+        signal(sig[i], SIG_IGN);                    // do not take the default action: hand over to the GCD signal source to wrap up on an ordinary thread
+        src[i] = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, sig[i], 0, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+        const char *why = sig[i] == SIGINT ? "SIGINT" : "SIGTERM";
+        dispatch_source_set_event_handler(src[i], ^{ dm_host_shutdown(why); });
+        dispatch_resume(src[i]);
+    }
 }

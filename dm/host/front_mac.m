@@ -81,7 +81,24 @@ typedef struct { void (*fn)(void); } guest_arg;
 static void *guest_tramp(void *p) {
     static char alt[65536];                       // The signal alternate stack is per thread; crash printing must also work on the guest thread
     stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt}; sigaltstack(&ss, 0);
-    ((guest_arg *)p)->fn(); LOG("客体线程结束"); exit(0);
+    ((guest_arg *)p)->fn(); dm_host_shutdown("客体线程结束"); return NULL;
+}
+// Every way out (close button, ⌘Q / menu / Dock quit; SIGTERM / SIGINT in hle_lifecycle.c) ends in dm_host_shutdown on an ordinary thread: the main thread keeps running, so presents waiting on it can finish
+static void quit_async(const char *why) { dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ dm_host_shutdown(why); }); }
+@interface DmAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate> @end
+@implementation DmAppDelegate
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app { (void)app; quit_async("退出（⌘Q / 菜单 / 程序坞）"); return NSTerminateLater; }   // never replied: dm_host_shutdown ends the process
+- (BOOL)windowShouldClose:(NSWindow *)w { (void)w; quit_async("关闭窗口"); return NO; }   // the window and its layer stay until the process exits
+@end
+static void main_menu(void) {
+    NSMenu *bar = [NSMenu new], *app = [NSMenu new], *wm = [[NSMenu alloc] initWithTitle:@"窗口"];
+    NSMenuItem *ai = [NSMenuItem new], *wi = [NSMenuItem new]; ai.submenu = app; wi.submenu = wm; [bar addItem:ai]; [bar addItem:wi];
+    [app addItemWithTitle:@"隐藏 " DM_GAME_NAME action:@selector(hide:) keyEquivalent:@"h"];
+    [app addItem:NSMenuItem.separatorItem];
+    [app addItemWithTitle:@"退出 " DM_GAME_NAME action:@selector(terminate:) keyEquivalent:@"q"];
+    NSMenuItem *fs = [wm addItemWithTitle:@"全屏幕" action:@selector(toggleFullScreen:) keyEquivalent:@"f"]; fs.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+    [wm addItemWithTitle:@"最小化" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+    NSApp.mainMenu = bar;
 }
 // CAMetalLayer keeps its first drawable size unless set: full screen on a 4K screen still drew 2560x1440
 static void fit_drawable(NSWindow *win) {
@@ -98,11 +115,14 @@ void front_run(void (*guest)(void)) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        static DmAppDelegate *dg; dg = [DmAppDelegate new]; NSApp.delegate = dg;
+        main_menu();
         NSRect r = NSMakeRect(0, 0, 1280, 720);
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
         win.title = @DM_GAME_NAME;   // the game profile's name (game name label)
+        win.delegate = dg;
         win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;   // green button = full screen, Option-click = zoom
         NSView *v = win.contentView;
         v.wantsLayer = YES;
@@ -120,20 +140,23 @@ void front_run(void (*guest)(void)) {
                                                                         usingBlock:^(NSNotification *n) { (void)n; [win toggleFullScreen:nil]; }];
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
+            if (e.type == NSEventTypeKeyDown && (e.modifierFlags & NSEventModifierFlagCommand)) return e;   // ⌘ shortcuts belong to the menu (quit, hide, full screen)
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
             return nil;   // Swallow it to avoid the system beep
         }];
-        // Mouse as a single-point touchscreen (for testing touch on the local machine, front.h dm_touch_set): left button down / drag = finger 0 at the normalized coordinates, release = lifted
+        // Mouse as a single-point touchscreen (for testing touch on the local machine, front.h dm_touch_set): left button down / drag = finger 0 at the normalized coordinates, release = lifted.
+        // Only presses that start inside the game view: the title bar's close / minimize / full screen buttons used to be swallowed here, so the close button did nothing
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp handler:^NSEvent *(NSEvent *e) {
+            static int touching;
             if (e.window != win) return e;
-            if (e.type == NSEventTypeLeftMouseUp) { dm_touch_set(NULL, 0); return nil; }
             NSPoint p = [v convertPoint:e.locationInWindow fromView:nil]; NSSize sz = v.bounds.size;
+            if (e.type == NSEventTypeLeftMouseDown) touching = NSPointInRect(p, v.bounds);
+            if (!touching) return e;
+            if (e.type == NSEventTypeLeftMouseUp) { touching = 0; dm_touch_set(NULL, 0); return nil; }
             if (sz.width <= 0 || sz.height <= 0) return e;
             dm_touch t = {0, (float)(p.x / sz.width), (float)(1.0 - p.y / sz.height)};   // The AppKit view origin is at bottom left, the touchscreen origin is at top left
             dm_touch_set(&t, 1); return nil;
         }];
-        [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification object:win queue:nil
-                                                      usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1)
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
         [nc addObserverForName:NSWindowDidResizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; fit_drawable(win); }];

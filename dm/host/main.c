@@ -77,7 +77,7 @@ static void host_preload(int argc, char **argv) {
         if (pthread_create(&th, NULL, keyrace_thread, NULL)) die("DM_TEST_KEYRACE 起线程失败");
         pthread_detach(th);
     }
-    { void dm_term_install(void); dm_term_install(); }   // SIGTERM graceful exit (hle_lifecycle.c)
+    { void dm_term_install(void); dm_term_install(); }   // SIGTERM / SIGINT graceful exit (hle_lifecycle.c)
     { void crash_set_dump_hook(void (*)(void)); void svc_thread_dump(void); crash_set_dump_hook(svc_thread_dump); }   // Dump guest thread state on a crash
     const char *names[MAX_MOD]; int n = 0;
     int i = 2;
