@@ -83,6 +83,15 @@ static void *guest_tramp(void *p) {
     stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt}; sigaltstack(&ss, 0);
     ((guest_arg *)p)->fn(); LOG("客体线程结束"); exit(0);
 }
+// CAMetalLayer keeps its first drawable size unless set: full screen on a 4K screen still drew 2560x1440
+static void fit_drawable(NSWindow *win) {
+    CGFloat s = win.backingScaleFactor; NSSize b = win.contentView.bounds.size;
+    CGSize d = CGSizeMake(round(b.width * s), round(b.height * s));
+    g_layer.contentsScale = s;
+    if (d.width < 1 || d.height < 1 || CGSizeEqualToSize(g_layer.drawableSize, d)) return;
+    g_layer.drawableSize = d;
+    LOG("窗口画布 %.0fx%.0f（%s）", d.width, d.height, (win.styleMask & NSWindowStyleMaskFullScreen) ? "全屏" : "窗口");
+}
 
 void front_run(void (*guest)(void)) {
     if (!getenv("DM_WINDOW")) { guest(); return; }
@@ -91,9 +100,10 @@ void front_run(void (*guest)(void)) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         NSRect r = NSMakeRect(0, 0, 1280, 720);
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
-                                                    styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+                                                    styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
         win.title = @DM_GAME_NAME;   // the game profile's name (game name label)
+        win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;   // green button = full screen, Option-click = zoom
         NSView *v = win.contentView;
         v.wantsLayer = YES;
         g_layer = [CAMetalLayer layer];
@@ -102,8 +112,11 @@ void front_run(void (*guest)(void)) {
         g_layer.contentsScale = win.backingScaleFactor;
         v.layer = g_layer;
         [win center];
+        fit_drawable(win);
         [win makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
+        const char *fs = getenv("DM_FULLSCREEN");
+        if (fs && atoi(fs)) dispatch_async(dispatch_get_main_queue(), ^{ [win toggleFullScreen:nil]; });   // DM_FULLSCREEN=1: start in full screen
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
@@ -122,6 +135,8 @@ void front_run(void (*guest)(void)) {
                                                       usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1)
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+        [nc addObserverForName:NSWindowDidResizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; fit_drawable(win); }];
+        [nc addObserverForName:NSWindowDidChangeBackingPropertiesNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; fit_drawable(win); }];
         [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; pad_release(); if (!win.miniaturized) dm_focus_set(2); }];
         [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; pads_bind(0); dm_focus_set(1); }];
         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
