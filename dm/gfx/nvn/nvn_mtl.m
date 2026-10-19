@@ -209,6 +209,7 @@ void bf_want_note(const char *key) {
 typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; } pool_ent;   // res: already in the residency set (on demand, see pool_res)
 static pool_ent *g_pools; static int g_npool, g_cap;
 static int g_pidx_ok, g_plast = -1;   // whether the address→pool index is valid, the last hit (pool_find)
+static _Atomic uint64_t g_pool_gen = 1;   // bumped under g_mu after every pool add / remove: invalidates the per-thread lookup caches (pool_lookup)
 static NSMutableArray *g_keep;                  // Holds the buffer references (pool_ent has non-owning pointers)
 static uint64_t g_pool_adds;
 static int g_pool_res_n;   // registered pools already in the residency set (for the memory readout; under g_mu)
@@ -356,6 +357,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc(g_pools, g_cap * sizeof *g_pools); }
     g_pidx_ok = 0; g_plast = -1;   // the address index is invalid (pool_find)
     g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buf.gpuAddress, mem, 0};   // not in the residency set yet: put in the first time it is addressed (pool_res)
+    atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release);
     g_pool_adds++;
     [g_keep addObject:buf];
     pthread_mutex_unlock(&g_mu);
@@ -369,7 +371,7 @@ void mtl_pool_del(const void *mem) {
     for (int i = 0; i < g_npool; i++)
         if (g_pools[i].key == mem) { id<MTLBuffer> b = g_pools[i].buf; [g_keep removeObject:b]; defer_obj_release(b); if (g_pools[i].res) g_pool_res_n--;
             if (!g_dead_pools) g_dead_pools = [NSHashTable weakObjectsHashTable];
-            [g_dead_pools addObject:b]; g_pools[i] = g_pools[--g_npool]; g_pidx_ok = 0; g_plast = -1; break; }
+            [g_dead_pools addObject:b]; g_pools[i] = g_pools[--g_npool]; g_pidx_ok = 0; g_plast = -1; atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release); break; }
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -390,21 +392,31 @@ static int pool_find(uint64_t addr, uint64_t len) {
     for (int i = 0; i < g_npool; i++) if (addr >= g_pools[i].lo && addr + len <= g_pools[i].hi) return g_plast = i;
     return -1;
 }
-int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
-    int ok = 0;
+// Lock-free fast path in front of pool_find: in a TotK shrine the submit thread resolves about 70k addresses per frame, and the g_mu lock pair plus the search
+// took about 1.2 ms of its 8.5 ms per frame. Each thread keeps a direct-mapped cache of pools it has resolved (copied under g_mu, only after pool_res, so a hit
+// needs no residency work); adding or removing a pool bumps g_pool_gen under g_mu, which invalidates every cached entry. A hit read just before a change is the
+// same as a locked lookup made just before it: the game does not remove a pool while it is still recording commands that use it
+typedef struct { uintptr_t lo, hi, base; void *buf; uint64_t gpu, gen; } pool_hit;
+#define PHIT_N 256
+static __thread pool_hit t_phit[PHIT_N];
+static const pool_hit *pool_lookup(uint64_t addr, uint64_t len) {
+    pool_hit *h = &t_phit[(addr >> 16) % PHIT_N];
+    if (h->gen == atomic_load_explicit(&g_pool_gen, memory_order_acquire) && addr >= h->lo && addr + len <= h->hi) return h;
     pthread_mutex_lock(&g_mu);
     int i = pool_find(addr, len);
-    if (i >= 0) { pool_res(i); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; ok = 1; }
+    if (i >= 0) { pool_res(i); const pool_ent *p = &g_pools[i]; *h = (pool_hit){p->lo, p->hi, p->base, (__bridge void *)p->buf, p->gpu, atomic_load_explicit(&g_pool_gen, memory_order_relaxed)}; }
     pthread_mutex_unlock(&g_mu);
-    return ok;
+    return i >= 0 ? h : NULL;
+}
+int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+    const pool_hit *h = pool_lookup(addr, len);
+    if (!h) return 0;
+    *buf = h->buf; *off = addr - h->base; return 1;
 }
 int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu) {
-    int ok = 0;
-    pthread_mutex_lock(&g_mu);
-    int i = pool_find(addr, len);
-    if (i >= 0) { pool_res(i); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; *gpu = g_pools[i].gpu + *off; ok = 1; }
-    pthread_mutex_unlock(&g_mu);
-    return ok;
+    const pool_hit *h = pool_lookup(addr, len);
+    if (!h) return 0;
+    *buf = h->buf; *off = addr - h->base; *gpu = h->gpu + *off; return 1;
 }
 
 // ---------- Submission ----------

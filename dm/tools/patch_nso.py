@@ -171,6 +171,11 @@ CUTS = {
     (0x2b2a7a0, '0a0040b9', '2a008052', '退出固定间隔时的下限：ldr w10,[x0] → mov w10,#1', '仅宿主'),
     (0xd28f44, '0a0042b9', '2a008052', '退出固定间隔（内联）的下限：ldr w10,[x0,#0x200] → mov w10,#1', '仅宿主'),
     (0x1fefd38, '0a0142b9', '2a008052', '退出固定间隔（内联）的下限：ldr w10,[x8,#0x200] → mov w10,#1', '仅宿主'),
+    # Shrines force the fixed interval: main+0xd28e2c sets flag bit 0 of the global at main+0x3ac9aa0 (+0x4f8) and +0x508 = 2, and the apply step forces that interval when bit 0 is
+    # set and +0x50a is 0 (the inlined copy clears bit 0 first, so it only applies a racing set). At 30 fps this only stopped the drop to 20; at 60 it locks shrines to 30. The apply
+    # step now always takes the "not forced" branch, so shrines use the dynamic controller like the overworld (measured in a shrine: it chose 60, game GPU p90 13.6 ms)
+    (0xd28f2c, '69000036', '03000014', '神庙强制固定间隔：tbz w9,#0,#0xd28f38 → b #0xd28f38（不进固定间隔，由动态控制器决定）', '仅宿主'),
+    (0x1fefd04, '6a000036', '03000014', '强制固定间隔（内联）：tbz w10,#0,#0x1fefd10 → b #0x1fefd10', '仅宿主'),
   ],
   '56ec24747ec9e7f19b3efb062483a19d': [
     (0x346430, '08fca752', '087ca052', 'AddressRegionManager 构造：节点区上限 mov w8,#0x3fe00000 → mov w8,#0x3e00000', '仅宿主'),
