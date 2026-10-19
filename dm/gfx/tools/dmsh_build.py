@@ -480,6 +480,15 @@ def vs_pad(key, src):
     k = src.find('main0_out out = {};') + len('main0_out out = {};')
     return src[:k] + ''.join(f'\n    out.dm_pad{l} = float4(0.0, 0.0, 0.0, 1.0);' for l in miss) + src[k:], miss
 
+def vs_out_init(src):
+    """用户输出先置 (0,0,0,1)：未写的分量按 Maxwell / Ryujinx 读到 xyz 0、w 1（王国之泪落点圈只写 locn2.xyz，像素却用 .w 乘 alpha）。
+    User outputs start as (0,0,0,1) so unwritten components read as on Maxwell / Ryujinx (TotK's drop marker writes only locn2.xyz, its pixel shader multiplies alpha by .w)."""
+    i = src.find('struct main0_out\n{\n'); j = src.find('\n};', i); k = src.find('main0_out out = {};')
+    if i < 0 or j < 0 or k < 0: return src
+    names = re.findall(r'\n\s*float4 (\w+) \[\[user\(locn\d+\)[^\]]*\]\];', src[i:j])
+    k += len('main0_out out = {};')
+    return src[:k] + ''.join(f'\n    out.{n} = float4(0.0, 0.0, 0.0, 1.0);' for n in names) + src[k:]
+
 def finish(key, w, j, c1):
     name, k = loc[key]
     msl = os.path.join(w, key + '.metal'); air = msl[:-6] + '.air'; lib = os.path.join(out, key + '_b.metallib')
@@ -496,9 +505,10 @@ def finish(key, w, j, c1):
             if r.returncode: return 'MSL 失败', r.stderr.strip()[:160], None
             src = open(msl).read()
     pad = []
-    if j['stage'] == 'vs' and PAIRS.get(key):   # 像素着色器读而顶点没写的输出补成 (0,0,0,1)（见 vs_pad） | outputs the pixel shader reads but the vertex shader does not write get (0,0,0,1) (see vs_pad)
-        src, pad = vs_pad(key, src)
-        if pad: open(msl, 'w').write(src)
+    if j['stage'] == 'vs':
+        src = vs_out_init(src)
+        if PAIRS.get(key): src, pad = vs_pad(key, src)   # 像素着色器读而顶点没写的输出补成 (0,0,0,1)（见 vs_pad） | outputs the pixel shader reads but the vertex shader does not write get (0,0,0,1) (see vs_pad)
+        open(msl, 'w').write(src)
     res = json.load(open(os.path.join(w, key + '.res.json')))
     try:
         subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)
