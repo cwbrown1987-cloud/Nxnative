@@ -182,6 +182,11 @@ CUTS = {
     (0x3464cc, '09fca752', '097ca052', 'AddressRegionManager 构造：节点区登记为已占区域的长度 mov w9,#0x3fe00000 → mov w9,#0x3e00000', '仅宿主'),
   ],
 }
+# Tears of the Kingdom 1.4.3 (v720896) main: the same 11 cuts. Each of the five functions matches its 1.4.2 instruction words exactly once (PC-relative and adrp-based
+# immediates masked) and every original word is unchanged; only their offsets moved
+_TOTK_143 = {0x2d4ee0: 0x2db204, 0x2d4ee4: 0x2db208, 0x2d501c: 0x2db340, 0x2d503c: 0x2db360, 0x2d5048: 0x2db36c, 0xbb9d98: 0xbdbfe8,
+             0x2b2a7a0: 0x2b3d268, 0xd28f44: 0xb00f64, 0x1fefd38: 0x1ff6138, 0xd28f2c: 0xb00f4c, 0x1fefd04: 0x1ff6104}
+CUTS['277178b7dba1b6d4949a84778d4abc58'] = [(_TOTK_143[c[0]], *c[1:]) for c in CUTS['5cb42b1cf25469fb0635fd046453d843']]
 # ---- Registered observation gates: {NSO build ID: [(offset, number, original instruction word, reason)]}. Numbers match OBS_* in the host's hle.h;
 # the original instruction must be position independent (no PC-relative / branch / anything involving x18 or tpidr), asserted offline; when the host has no callback attached the gate block goes in and out once and returns ----
 OBS = {
@@ -771,9 +776,19 @@ def adr_anchor_table(insl, j):
             k -= 1
         return vals
     v = base_vals(li, set())
-    if len(v) != 1 or None in v: return None
-    tb = v.pop()
-    return [anchor + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)]
+    def targets(tb): return [anchor + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)] if 0 <= tb and tb + 4 * n <= len(IMG) else None
+    if len(v) == 1 and None not in v: return targets(v.pop())
+    # Block entered only through another jump table (TotK 1.4.3 main+0x393bb0), so the walk finds no writer: as upstream's jump_adr_offsets, take the one
+    # adrp + add pair in the function that builds the base and makes every target an instruction of this function
+    fa, fb = insl[0].address, insl[-1].address + 4
+    cands = set()
+    for q, p in enumerate(insl):
+        if p.mnemonic != 'adrp' or not p.op_str.startswith(rb + ','): continue
+        x = next((y for y in insl[q + 1:q + 9] if any(y.reg_name(r) == rb for r in y.regs_access()[1])), None)
+        mm = re.fullmatch(rf'{rb}, {rb}, #(0x[0-9a-f]+|\d+)', x.op_str) if x is not None and x.mnemonic == 'add' else None
+        if mm: cands.add(p.operands[1].imm + int(mm.group(1), 0))
+    ok = [tb for tb in sorted(cands) if (t := targets(tb)) and all(fa <= y < fb and y % 4 == 0 for y in t)]
+    return targets(ok[0]) if len(ok) == 1 else None
 retry_wins = []
 funcs = sorted({func_of(a) for a, (k, _) in kinds.items() if k == 'x18'})
 for fa, fb in funcs:
