@@ -52,8 +52,10 @@ static void read_pad(GCExtendedGamepad *g) {
     push();
 }
 static void pad_release(void) { g_pad_btn = 0; g_pad_lx = g_pad_ly = g_pad_rx = g_pad_ry = 0; push(); }
-// Rumble (front.h front_rumble): the game's left / right motor drives the left / right handle of the first controller with haptics, one looping continuous CoreHaptics event per handle whose
+// Rumble (front.h front_rumble): the game's left / right motor drives the left / right handle of the first controller with haptics, one continuous CoreHaptics event per handle whose
 // intensity = the stronger of the motor's two bands × gain; a controller with a single haptics locality gets the stronger motor. Silent while the window is not key (the app gets no controller input then either).
+// Plain pattern players only: gamecontrollerd (macOS 26) cannot decode an advanced player's sequence and drops the connection (NSCocoaErrorDomain 4097), so instead of looping
+// the 30 s event is started again before it runs out.
 // Game threads only store the newest value; one apply 4 ms later on a serial queue reads the newest values, so a 200 Hz vibration graph costs at most one CoreHaptics call per handle per apply
 static dispatch_queue_t g_rq;                     // NULL = rumble off (windowless or DM_RUMBLE=0)
 static float g_rgain = 1;
@@ -62,20 +64,31 @@ static atomic_flag g_rpend = ATOMIC_FLAG_INIT;
 static _Atomic int g_rfocus = 1, g_rdead;
 static GCController *g_rpad;                      // controller the engines were last requested for (main thread)
 static CHHapticEngine *g_reng[2];                 // this and below: only on g_rq
-static id<CHHapticAdvancedPatternPlayer> g_rpl[2];
+static id<CHHapticPatternPlayer> g_rpl[2];
 static float g_rsent[2];
-static int g_rmono, g_rgen;
+static double g_rt0[2];                           // when each player's 30 s event was last started
+static int g_rmono, g_rgen, g_rtick;
 static NSArray *rumble_level(float a) { return @[[[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:a relativeTime:0]]; }
 static void rumble_apply(void) {
     atomic_flag_clear(&g_rpend);                  // before reading: a value stored after this schedules another apply
     float v[2] = {atomic_load(&g_rval[0]) / 1000.f, atomic_load(&g_rval[1]) / 1000.f};
     if (g_rmono) v[0] = fmaxf(v[0], v[1]);
+    double now = CACurrentMediaTime(); int live = 0;
     for (int i = 0; i < 2; i++) {
         float a = atomic_load(&g_rfocus) ? v[i] : 0; NSError *err = nil;
-        if (!g_rpl[i] || fabsf(a - g_rsent[i]) < .004f) continue;
+        if (!g_rpl[i]) continue;
+        if (now - g_rt0[i] > 25 && a >= .004f) {   // the event ends at 30 s: start it again (the intensity is sent before and after, as the restart may begin at full strength)
+            [g_rpl[i] stopAtTime:CHHapticTimeImmediate error:nil];
+            [g_rpl[i] sendParameters:rumble_level(a) atTime:CHHapticTimeImmediate error:nil];
+            if (![g_rpl[i] startAtTime:CHHapticTimeImmediate error:&err]) { LOG("手柄震动：重新开始失败（%s %ld）", err.domain.UTF8String ?: "?", (long)err.code); continue; }
+            g_rt0[i] = now; g_rsent[i] = -1;
+        }
+        if (a >= .004f) live = 1;
+        if (fabsf(a - g_rsent[i]) < .004f) continue;
         g_rsent[i] = a;
-        if (![g_rpl[i] sendParameters:rumble_level(a) atTime:CHHapticTimeImmediate error:&err]) LOG("手柄震动：发强度失败（%s）", err.localizedDescription.UTF8String ?: "?");
+        if (![g_rpl[i] sendParameters:rumble_level(a) atTime:CHHapticTimeImmediate error:&err]) LOG("手柄震动：发强度失败（%s %ld）", err.domain.UTF8String ?: "?", (long)err.code);
     }
+    if (live && !g_rtick) { g_rtick = 1; dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), g_rq, ^{ g_rtick = 0; rumble_apply(); }); }   // a held rumble with no new values still reaches the restart
 }
 static void rumble_kick(void) { if (g_rq && !atomic_flag_test_and_set(&g_rpend)) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_MSEC), g_rq, ^{ rumble_apply(); }); }
 void front_rumble(int motor, float amp_low, float freq_low, float amp_high, float freq_high) {
@@ -95,20 +108,20 @@ static void rumble_bind(GCController *c) {
     GCHapticsLocality loc[2] = {two ? GCHapticsLocalityLeftHandle : GCHapticsLocalityDefault, two ? GCHapticsLocalityRightHandle : nil};
     for (int i = 0; i < 2 && loc[i]; i++) {
         NSError *err = nil; CHHapticEngine *e = [h createEngineWithLocality:loc[i]];
-        if (!e || ![e startAndReturnError:&err]) { LOG("手柄震动：%s 引擎起不来（%s）", loc[i].UTF8String, e ? err.localizedDescription.UTF8String ?: "?" : "建不了"); continue; }
+        if (!e || ![e startAndReturnError:&err]) { LOG("手柄震动：%s 引擎起不来（%s %ld）", loc[i].UTF8String, e ? err.domain.UTF8String ?: "?" : "建不了", (long)err.code); atomic_store(&g_rdead, 1); continue; }
         CHHapticEvent *ev = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous parameters:@[
             [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1],
-            [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness value:.5f]] relativeTime:0 duration:30];   // 30 s is the longest continuous event; the player loops it
+            [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness value:.5f]] relativeTime:0 duration:30];   // 30 s is the longest continuous event
         CHHapticPattern *p = [[CHHapticPattern alloc] initWithEvents:@[ev] parameters:@[] error:&err];
-        id<CHHapticAdvancedPatternPlayer> pl = p ? [e createAdvancedPlayerWithPattern:p error:&err] : nil;
-        pl.loopEnabled = YES;
+        id<CHHapticPatternPlayer> pl = p ? [e createPlayerWithPattern:p error:&err] : nil;
         if (!pl || ![pl sendParameters:rumble_level(0) atTime:CHHapticTimeImmediate error:&err] || ![pl startAtTime:CHHapticTimeImmediate error:&err]) {
-            LOG("手柄震动：%s 播放器起不来（%s）", loc[i].UTF8String, err.localizedDescription.UTF8String ?: "?"); [e stopWithCompletionHandler:nil]; continue;
+            LOG("手柄震动：%s 播放器起不来（%s %ld），下次获得焦点重建", loc[i].UTF8String, err.domain.UTF8String ?: "?", (long)err.code);
+            [e stopWithCompletionHandler:nil]; atomic_store(&g_rdead, 1); continue;
         }
         // The haptics server restarted: rebuild right away (Apple's recommended handling). The engine stopped on its own (controller asleep, system error): rebuild at the next focus / connect
         e.resetHandler = ^{ dispatch_async(g_rq, ^{ if (gen == g_rgen) rumble_bind(c); }); };
         e.stoppedHandler = ^(CHHapticEngineStoppedReason why) { if (gen == g_rgen) { atomic_store(&g_rdead, 1); LOG("手柄震动：引擎停了（原因 %ld），下次获得焦点重建", (long)why); } };
-        g_reng[i] = e; g_rpl[i] = pl; g_rsent[i] = 0;
+        g_reng[i] = e; g_rpl[i] = pl; g_rsent[i] = 0; g_rt0[i] = CACurrentMediaTime();
     }
     g_rmono = !two;
     if (g_reng[0] || g_reng[1]) LOG("手柄震动：%s，%s，增益 %.2f", c.vendorName.UTF8String ?: "?", two ? "左右手柄各一路" : "整只手柄一路（取两马达较强者）", g_rgain);
