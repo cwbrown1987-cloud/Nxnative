@@ -9,3 +9,6 @@ int dm_custom_lang_explicit(void) { return g_t_lang; }
 #include "../dm.h"
 module_t g_mod[MAX_MOD];
 int g_nmod;
+// Tests already run on the host stack. Preserve arguments/LR and tail-call the
+// implementation selected by the real HLE_FORCE_BIG registration trampoline.
+__asm__(".text\n.p2align 2\n.globl _dm_bigstack_enter\n_dm_bigstack_enter:\nbr x16\n");

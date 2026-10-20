@@ -518,10 +518,9 @@ void (*g_dm_pre_commit_hook[4])(const char *workdir);   // called before commit 
 void (*g_dm_save_commit_hook)(const char *commit_dir);   // called after a save commit succeeds (committed directory); the iOS iCloud sync sets it, NULL on the host
 static _Atomic uint64_t g_save_commits;   // number of successful commits (used by the front end when going to background to wait for "the game's current save has been committed")
 uint64_t dm_fs_commit_count(void) { return atomic_load(&g_save_commits); }
-HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv; transactional save: the whole work directory tree is cloned, then swapped atomically with the committed directory (renamex_np RENAME_SWAP)", Result, h_fs_Commit, const char *name) {
-    PATH_LOCK(); pthread_mutex_lock(&g_lock);
-    int i = 0; while (i < g_nmnt && strcmp(g_mnt[i].name, name)) i++;
-    if (i == g_nmnt || !g_mnt[i].commit[0]) { pthread_mutex_unlock(&g_lock); return RES_OK; }   // non-transactional mount: nothing to commit
+// Both Commit overloads share this transaction engine. Caller holds the path
+// and mount locks; front-end failure notification is delivered after unlocking.
+static Result commit_mount_locked(int i, int *notify_error) {
     uint64_t tc0 = clock_gettime_nsec_np(CLOCK_MONOTONIC), tw0 = atomic_exchange(&g_txn_first_ns, 0);
     for (int k = 0; k < 4; k++) if (g_dm_pre_commit_hook[k]) g_dm_pre_commit_hook[k](g_mnt[i].dir);
     uint64_t tc1 = clock_gettime_nsec_np(CLOCK_MONOTONIC);   // side files written into the working directory are swapped in atomically together with this commit
@@ -546,9 +545,8 @@ HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv; transactional save: the whole work d
         else if (renamex_np(re, g_mnt[i].dir, RENAME_SWAP)) { rerr = errno ? errno : EIO; rm_tree(re); }
         else rm_tree(re);                                               // the swapped-out tainted work directory
         if (rerr) { save_poison(perr); LOG("[RED] save transaction: recloning the work directory failed errno=%d -- the work directory is left as it is and stays tainted (the next commit is refused again and retries), the committed version is unchanged", rerr); }
-        pthread_mutex_unlock(&g_lock);
         LOG("[RED] save commit refused: a save write failed in this transaction errno=%d (0-byte files in the work directory: %s); the committed version is unchanged, the work directory %s%s", perr, tl ? torn + 1 : "none", rerr ? "could not be recloned (see the previous line)" : "was recloned from the committed version", nopen ? "; [RED] save files are still open" : "");
-        front_save_failed(perr);
+        *notify_error = perr;
         return RES_FAIL;
     }
     char neu[1100]; snprintf(neu, sizeof neu, "%s.new", g_mnt[i].commit);
@@ -562,7 +560,39 @@ HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv; transactional save: the whole work d
         LOG("save commit #%d: %s swapped atomically into %s (%d save writes so far) (hook %llu us, clone + swap %llu us, since this transaction's first write %llu us)", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
             (unsigned long long)((tc1 - tc0) / 1000), (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0)); atomic_fetch_add(&g_save_commits, 1);
         if (g_dm_save_commit_hook) g_dm_save_commit_hook(g_mnt[i].commit); }   // iCloud sync (cloud_ios.m): called with the lock held, that side only takes a clonefile snapshot
+    return r;
+}
+HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv; transactional save: the whole work directory tree is cloned, then swapped atomically with the committed directory (renamex_np RENAME_SWAP)", Result, h_fs_Commit, const char *name) {
+    PATH_LOCK(); pthread_mutex_lock(&g_lock);
+    int i = 0; while (i < g_nmnt && strcmp(g_mnt[i].name, name)) i++;
+    if (i == g_nmnt || !g_mnt[i].commit[0]) { pthread_mutex_unlock(&g_lock); return RES_OK; }   // retain single-name non-transactional semantics
+    int notify_error = 0; Result r = commit_mount_locked(i, &notify_error);
     pthread_mutex_unlock(&g_lock);
+    if (notify_error) front_save_failed(notify_error);
+    return r;
+}
+// A mount list is atomic only when every name addresses the same host backing
+// transaction. Validate the whole list first. Independent save trees cannot be
+// swapped atomically together, so refuse them without publishing either tree.
+HLE_FORCE("_ZN2nn2fs6CommitEPKPKci", "fsp-srv; commit a validated mount list sharing one host save transaction; independent multi-save commits are unsupported", Result, h_fs_CommitList, const char *const *names, int count) {
+    if (count < 0 || count > MAX_MOUNT || (count && !names)) return RES_FAIL;
+    if (!count) return RES_OK;
+    PATH_LOCK(); pthread_mutex_lock(&g_lock);
+    int target = -1, notify_error = 0; Result r = RES_FAIL;
+    for (int k = 0; k < count; k++) {
+        if (!names[k] || strnlen(names[k], sizeof g_mnt[0].name) == sizeof g_mnt[0].name) goto out;
+        int i = 0; while (i < g_nmnt && strcmp(g_mnt[i].name, names[k])) i++;
+        if (i == g_nmnt || g_mnt[i].ro || !g_mnt[i].commit[0]) goto out;
+        if (target >= 0 && (strcmp(g_mnt[target].commit, g_mnt[i].commit) || strcmp(g_mnt[target].dir, g_mnt[i].dir))) {
+            LOG("[RED] Commit mount list spans independent host saves; refused without a partial commit");
+            goto out;
+        }
+        if (target < 0) target = i;
+    }
+    r = commit_mount_locked(target, &notify_error);
+out:
+    pthread_mutex_unlock(&g_lock);
+    if (notify_error) front_save_failed(notify_error);
     return r;
 }
 // SDK 11's old name: CommitSaveData(mount name) is the later Commit (Metroid Dread)
