@@ -13,8 +13,7 @@
 module_t g_mod[MAX_MOD];
 int g_nmod;
 pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
-pthread_key_t g_keyres[2], g_keyaspect, g_keyaspectui;   // g_keyaspect: aspect ratio upper-limit parameter slot (KASPECT)          // resolution parameter slots (rewriter PARAMS, KRES0 handheld / KRES1 docked); 0 and not allocated if the build output lacks them
-enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_KRES0, KEY_KRES1, KEY_KASPECT, KEY_KASPECTUI, KEY_N };
+enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_N };
 
 uint64_t resolve_import(module_t *m, const char *name);
 int hle_implements(const char *name);
@@ -23,18 +22,13 @@ void gate_register(uint64_t ret_addr, const char *kind, int arg, uint64_t orig);
 static pthread_key_t key_value(unsigned i) {
     switch (i) {
     case KEY_K18: return g_key18; case KEY_KTLS: return g_keytls; case KEY_KTLR: return g_keytlr;
-    case KEY_KGATE: return g_keygate; case KEY_KRES0: return g_keyres[0]; case KEY_KRES1: return g_keyres[1];
-    case KEY_KASPECT: return g_keyaspect; default: return g_keyaspectui;
+    default: return g_keygate;
     }
 }
 static void create_keys(void) {
     if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) ||
         pthread_key_create(&g_keytlr, NULL) || pthread_key_create(&g_keygate, NULL)) die("cannot create the host key");
-    // Parameter slot keys are always created (not decided by whether the build output uses them: an iOS app has no params.tsv, so deciding by file would miss creating them and the key page would be written as 0 → the game reads TSD slot 0)
-    if (pthread_key_create(&g_keyres[0], NULL) || pthread_key_create(&g_keyres[1], NULL) ||
-        pthread_key_create(&g_keyaspect, NULL) || pthread_key_create(&g_keyaspectui, NULL)) die("cannot create the parameter-bit key");
-    LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu KRES0=%lu KRES1=%lu KASPECT=%lu KASPECTUI=%lu",
-        g_key18, g_keytls, g_keytlr, g_keygate, g_keyres[0], g_keyres[1], g_keyaspect, g_keyaspectui);
+    LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", g_key18, g_keytls, g_keytlr, g_keygate);
 }
 
 // K slot check: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key
@@ -150,10 +144,10 @@ static void read_layout(module_t *m, const char *dir) {
     char path[1024]; snprintf(path, sizeof path, "%s/%s.fixups.tsv", dir, m->name);
     FILE *f = fopen(path, "r");
     if (!f) die("open %s", path);
-    static const char *kn[8] = {"K18", "KTLS", "KTLR", "KGATE", "KRES0", "KRES1", "KASPECT", "KASPECTUI"};
+    static const char *kn[KEY_N] = {"K18", "KTLS", "KTLR", "KGATE"};
     char line[256], key[32]; unsigned long v; unsigned seen = 0;
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, "# %31s %lx", key, &v) != 2) die("%s: the output comes from an old rewriter; replace it with output of the current product name (dm/PRODUCT)", path);
+        if (sscanf(line, "# %31s %lx", key, &v) != 2) die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
         if (!strcmp(key, "PATCH_OFF")) m->patch_off = strtoll(line + 2 + strlen(key), NULL, 16);   // may be negative (patch area before the base)
         else if (!strcmp(key, "IMAGE_SIZE")) m->image_size = v;
         else if (!strcmp(key, "FILE_IMAGE_LEN")) m->file_image_len = v;
@@ -163,9 +157,8 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "RO_OFF")) m->ro_off = v;
         else if (!strcmp(key, "DATA_OFF")) m->data_off = v;
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
-        else if (!strcmp(key, "FPS_LEGACY_ELAPSED")) m->fps_legacy_elapsed = (int)v;
         else if (!strcmp(key, "BUILD_ID")) sscanf(line, "# %*s %32s", m->build_id);
-        else for (int k = 0; k < 8; k++) {
+        else for (int k = 0; k < KEY_N; k++) {
             size_t n = strlen(kn[k]);
             if (!strncmp(key, "KEY_", 4) && !strncmp(key + 4, kn[k], n) && !strcmp(key + 4 + n, "_IDX")) {
                 m->key_idx[k] = (unsigned)strtoul(strrchr(line, '\t') + 1, 0, 10); seen |= 1u << k;
@@ -173,44 +166,35 @@ static void read_layout(module_t *m, const char *dir) {
         }
     }
     fclose(f);
-    if (!m->patch_off || m->key_page_off % 0x4000 || m->key_page_size != 0x4000 || seen != 0xff)
-        die("%s: the output comes from an old rewriter; replace it with output of the current product name (dm/PRODUCT)", path);
+    if (!m->patch_off || m->key_page_off % 0x4000 || m->key_page_size != 0x4000 || seen != (1u << KEY_N) - 1)
+        die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
     if (m->patch_off < 0 && (!m->image_size || !m->file_image_len || m->file_image_len % 0x4000 || m->patch_off % 0x4000 || m->key_page_off + m->key_page_size > m->image_size))
         die("%s: patch area before the base, but IMAGE_SIZE / FILE_IMAGE_LEN missing or wrong", path);
 }
 
 // Frame step state (the page after the key page, read-write; layout in patch_nso.py FRAME_STEP): the rewriter's stubs step the game by the host's whole vsyncs capped at this
 // target, 0 = the game's own interval logic. The profile's fps_target, overridden by DM_FPS_TARGET (0, 30 or 60); the graphics layer decides the steps and paces presents
-// (hle_nvn.c fstep_tick). Mode +0x28: the profile's frame_step, overridden by DM_FRAME_STEP (ticks / legacy); legacy is each game's earlier method: Tears of the Kingdom's
-// elapsed-time step, or for a build whose legacy is not one (FPS_LEGACY_ELAPSED 0, Breath of the Wild) target 0, so its own interval controller runs
+// (hle_nvn.c fstep_tick)
 uint8_t *dm_fps_state;
 static void install_fps_state(module_t *m) {
     if (m->fps_state_off + 0x40 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
     const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
     if (t != 0 && t != 30 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30 or 60; using the game's own frame step", e); t = 0; }
-    const char *fe = getenv("DM_FRAME_STEP"); int legacy = DM_GAME_FRAME_STEP_LEGACY;
-    if (fe) { if (!strcmp(fe, "legacy")) legacy = 1; else if (!strcmp(fe, "ticks")) legacy = 0; else LOG("[RED] DM_FRAME_STEP=%s: must be ticks or legacy; keeping the profile's frame_step", fe); }
-    if (legacy && !m->fps_legacy_elapsed) t = 0;
     float f = (float)t; dm_fps_state = m->base + m->fps_state_off; memcpy(dm_fps_state, &f, sizeof f);
-    uint32_t mode = (uint32_t)legacy; memcpy(dm_fps_state + 0x28, &mode, sizeof mode);
     // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880): 1.0 keeps the game's own size and dynamic resolution;
-    // another factor fixes the size at that fraction (DM_RENDER_SCALE, 0.5 to 1.0). Independent of the frame step: written in legacy mode and at target 0 too
+    // another factor fixes the size at that fraction (DM_RENDER_SCALE, 0.5 to 1.0). Independent of the frame step: written at target 0 too
     const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f;
     if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= 1.0f)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to 1.0; keeping the game's size", rs); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", m->name, sc); }
     memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
-    if (legacy && !m->fps_legacy_elapsed) LOG("%s: frame step as the game sets it (legacy: %s)", m->name, fe ? "DM_FRAME_STEP" : "game profile frame_step");
-    else LOG("%s: frame step %s%s (%s; %s)", m->name, !t ? "as the game sets it" : legacy ? "by elapsed time (legacy)" : "in whole vsyncs decided by the host", t ? cap : "",
-             e ? "DM_FPS_TARGET" : "game profile fps_target", fe ? "DM_FRAME_STEP" : "game profile frame_step");
+    LOG("%s: frame step %s%s (%s)", m->name, !t ? "as the game sets it" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
 }
 static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);
     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
     memset(page, 0, m->key_page_size);
-    for (unsigned i = 0; i < 4; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
-    page[m->key_idx[KEY_KRES0]] = (uint64_t)g_keyres[0] * 8; page[m->key_idx[KEY_KRES1]] = (uint64_t)g_keyres[1] * 8;
-    page[m->key_idx[KEY_KASPECT]] = (uint64_t)g_keyaspect * 8; page[m->key_idx[KEY_KASPECTUI]] = (uint64_t)g_keyaspectui * 8;
-    for (int k = 0; k < 8; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
+    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
+    for (int k = 0; k < KEY_N; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s key page mprotect", m->name);
     if (m->fps_state_off) install_fps_state(m);
 }
@@ -346,24 +330,7 @@ static void remap_at(module_t *m, vm_address_t to, const void *from, unsigned lo
     if (kr != KERN_SUCCESS || a != to) die("%s vm_remap %p → %#lx (%#lx bytes) failed: %d", m->name, from, (unsigned long)to, size, kr);
     if ((cur & need) != need) die("%s permissions after vm_remap %#x, missing %#x", m->name, cur, need);
 }
-#ifdef DM_SHELL
-// Shell (the App built by ios/tools/shell_build.sh, containing no game content at all): the module images are not in the main executable but in the
-// Frameworks/Guest.framework/Guest that users build themselves from their game files -- a dynamic library that holds only segments (written by dm/tools/guest_dylib.py), with the same section names as the embedded approach; below only the image header to fetch from is swapped.
-#include <dlfcn.h>
-#include <mach-o/dyld.h>
-static const struct mach_header_64 *image_mh(void) {
-    static const struct mach_header_64 *mh; if (mh) return mh;
-    char exe[4096]; uint32_t n = sizeof exe; if (_NSGetExecutablePath(exe, &n)) die("cannot get the executable path");
-    char *sl = strrchr(exe, '/'); if (!sl || (size_t)(sl - exe) + 40 > sizeof exe) die("unexpected executable path: %s", exe); strcpy(sl, "/Frameworks/Guest.framework/Guest");
-    if (!dlopen(exe, RTLD_NOW)) die("this install package has no game program yet (%s): first put your own game files into the package with dm/tools/d2rm_pack.py, then install it. The system says: %s", exe, dlerror());
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) if (strstr(_dyld_get_image_name(i), "/Guest.framework/Guest")) mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
-    if (!mh) die("Guest dynamic library is loaded but its image header cannot be found");
-    fprintf(stderr, "boot: module image taken from Guest dynamic library %s\n", exe); return mh;
-}
-#define IMAGE_MH image_mh()
-#else
 #define IMAGE_MH (&_mh_execute_header)
-#endif
 static void map_image(module_t *m, const char *dir) {
     (void)dir;
     char sx0[17], sx1[17], dm[17]; snprintf(sx0, sizeof sx0, "__dm%sx0", m->name); snprintf(sx1, sizeof sx1, "__dm%sx1", m->name); snprintf(dm, sizeof dm, "__DM%sW", m->name);

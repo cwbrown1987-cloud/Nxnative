@@ -1,4 +1,4 @@
-// System service interfaces used by games on newer SDKs (16.x) that the d2r-mobile title did not use: oe / time / pl (shared font) / vi vsync / diag.
+// System service interfaces used by games on newer SDKs (16.x): oe / time / pl (shared font) / vi vsync / diag.
 // On the real device all of these go through Horizon system services (IPC); the host gives values directly or makes them "unavailable".
 #include "hle.h"
 #include <fcntl.h>

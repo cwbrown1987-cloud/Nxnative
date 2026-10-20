@@ -3,7 +3,7 @@
 ## The loop
 
 ```bash
-DM_RULESET=native python3 dm/tools/patch_nso.py $W/data/v0/ExeFS/main $W/build/patched_v0 main   # and sdk
+python3 dm/tools/patch_nso.py $W/data/v0/ExeFS/main $W/build/patched_v0 main   # and sdk
 make -C dm/host GAME=<title ID> dmhost
 $W/run/boot.sh <log name> [seconds] [VAR=value ...]
 ```

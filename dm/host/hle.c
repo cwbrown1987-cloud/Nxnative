@@ -61,8 +61,6 @@ enum { G_SVC, G_CNTPCT, G_CNTVCT, G_OBS };
 static void (*g_obs_fn[OBS_MAX])(const uint64_t *regs); static int g_obs_have[OBS_MAX];
 void gate_obs_set(int id, void (*fn)(const uint64_t *regs)) { if (id <= 0 || id >= OBS_MAX) die("observation gate number out of range %d", id); g_obs_fn[id] = fn; }
 int gate_obs_present(int id) { return id > 0 && id < OBS_MAX && g_obs_have[id]; }
-static uint8_t g_svc_have[256];   // svc numbers registered in the build output (used to tell whether the host call numbers from 0x80 up, introduced by cuts, are present)
-int gate_svc_present(int num) { return num >= 0 && num < 256 && g_svc_have[num]; }
 typedef struct { uint64_t ret; int kind, arg; uint64_t orig; } gate_t;
 #define GATE_BITS 12                     // 4096 slots, gate count ≤ 1024, load factor ≤ 1/4
 static gate_t g_gate[1u << GATE_BITS];
@@ -73,7 +71,6 @@ void gate_register(uint64_t ret_abs, const char *kind, int arg, uint64_t orig) {
     int k = !strcmp(kind, "svc") ? G_SVC : !strcmp(kind, "cntpct") ? G_CNTPCT : !strcmp(kind, "cntvct") ? G_CNTVCT : !strcmp(kind, "obs") ? G_OBS : -1;
     if (k < 0) die("unknown gate kind %s", kind);
     if (k == G_OBS) { if (arg <= 0 || arg >= OBS_MAX) die("observation gate number out of range %d", arg); g_obs_have[arg] = 1; }
-    if (k == G_SVC && arg >= 0 && arg < 256) g_svc_have[arg] = 1;
     if (++g_ngate > (1 << GATE_BITS) / 4) die("gate overflow");
     unsigned i = gate_h(ret_abs);
     while (g_gate[i].ret) { if (g_gate[i].ret == ret_abs) die("gate registered twice %#llx", ret_abs); i = (i + 1) & ((1u << GATE_BITS) - 1); }

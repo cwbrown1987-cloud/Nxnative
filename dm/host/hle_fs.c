@@ -1,5 +1,5 @@
 // nn::fs: on the real device it goes through the fsp-srv service; the host connects directly to the Mac file system. Mount name → host directory:
-//   rom   → $DM_ROMFS (default $DM_ROOT/data/switch/3.3.94012/Update/RomFS, read-only; the game parses the storage blocks in it itself)
+//   rom   → $DM_ROMFS (default $DM_ROOT/romfs, read-only; the game parses the storage blocks in it itself)
 //   save  → $DM_SAVE (must be set, pointing to this run's copy of the standard save save_ref; if unset, report a failure and abort)
 //   temp  → $DM_TEMP (default $DM_ROOT/run/platform/temp)
 // Paths look like "rom:/data/x". FileHandle / DirectoryHandle are 8 bytes passed by value, here they store the host fd / DIR*.
@@ -46,12 +46,11 @@ static uint8_t g_fsave[65536];              // fd → whether it is on a transac
 static _Atomic int g_save_writes;           // number of writes on the save mount (shared by the injection point and the commit log)
 static _Atomic uint64_t g_txn_first_ns;     // time of this transaction's first save write (used by the commit log to report timing; cleared to 0 at commit)
 // Write failures are refused per transaction: on the real device save space is reserved when the save is created, overwrites cannot fail, and the game does not check the return values of WriteFile / SetFileSize either, it Commits as usual after a failure
-// (after injecting a failure on the 1st write, the committed joe.d2s is 0 bytes = character lost). When a host write fails (disk full etc., really possible on iOS):
+// (after injecting a failure on the 1st write, the committed save file was 0 bytes). When a host write fails (disk full etc., really possible on iOS):
 // if any save write / set-size failed between the last Commit and this Commit, this Commit is refused -- the committed version is unchanged, the working directory is discarded and re-cloned from the committed version,
 // and the front end is notified (front_save_failed); the next transaction (the game's next full save rewrite) is attempted as usual and committed if it succeeds. g_save_poison = errno of the first failure in this transaction (0 = none).
 static _Atomic int g_save_poison;
 static void save_poison(int e) { int z = 0; atomic_compare_exchange_strong(&g_save_poison, &z, e ? e : EIO); }
-void dm_fs_save_poison(int e) { save_poison(e); }   // for the pre-commit hook: a side file (Chronicle / pouch) that failed to write also counts as a write failure of this transaction -- if the commit went ahead as usual, the items would no longer be in the character save and would not be in the side file either
 // The default weak implementation only logs (Mac); the iOS front end provides a strong implementation of the same name that shows a native alert. Called on the game thread, the front end switches to the main thread itself
 __attribute__((weak)) void front_save_failed(int err) { LOG("front_save_failed(errno=%d): no front end attached (default weak implementation)", err); }
 // DM_FSLOG=<file>: each ReadFile logs one TSV line "seconds since boot\tguest path\toffset\tlength\tguest buffer address" (which bytes boot read, for offline reverse lookup against the manifest)
@@ -64,7 +63,7 @@ static const char *envdir(const char *var, const char *rel, char *buf, size_t n)
     snprintf(buf, n, "%s%s/%s", getenv("DM_ROOT") ?: getenv("HOME"), getenv("DM_ROOT") ? "" : "/dm-work", rel); return buf;
 }
 
-// Steps that end in a failed write (from d2r-mobile b94670c79): test injection DM_TEST_FS_FAILAT=<point>[:<count>][,...] -- in a save transaction, mountclone (clone the work directory at mount),
+// Steps that end in a failed write: test injection DM_TEST_FS_FAILAT=<point>[:<count>][,...] -- in a save transaction, mountclone (clone the work directory at mount),
 // reclone (reclone after a refused commit), guestname (write the guest name after a rename), renameback (rename rollback) fail with ENOSPC for the first <count> times (default 1),
 // to check "no exit, committed version unchanged, next commit works" (tests/t_fs.c 6). Without the variable it costs one getenv
 static int dm_fs_test_fail(const char *pt) {
@@ -116,7 +115,7 @@ static Result mount(const char *name, const char *dir, int ro) { return mount_ex
 // APFS is case-insensitive by default, Horizon paths are case-sensitive: every component is looked up exactly by guest name.
 // Ordinary host names are unchanged; only when a name collides on the host is a separate physical name chosen, with the guest name stored in an xattr.
 // clonefile preserves xattr, so save Commit/remount needs no separate mapping table; enumeration must not leak physical aliases.
-#define FS_GUEST_NAME "org.d2rmobile.guest-name"
+#define FS_GUEST_NAME "org.d2rmobile.guest-name"   // the name this host has always used: existing saves carry it, so it is kept
 static int guest_name(const char *parent, const char *physical, char *out, size_t n) {
     // Only the physical names chosen on a case collision (.dm-case-N) carry the xattr (set_guest_name writes it only when the physical name differs from the guest name); any other physical name is the guest name,
     // so no per-entry getxattr is needed -- that was one system call per entry when listing, seconds for the 216,000 entries Engage walks in RomFS at boot
@@ -214,20 +213,6 @@ static int root_path(const char *root, const char *rest, char *out, size_t n) {
     }
     return 1;
 }
-// Files in the overlay that the host itself reads (marker files, sidecar tables, data archives) are all looked up here. DM_ROMFS_OVERLAY may have
-// several layers, colon-separated, earlier ones taking priority; old devices have two layers,
-// "in-bundle romfs_overlay_astc:Legacy Device Pack directory"; treating the whole string as one directory when building file names finds nothing at all
-// on old devices.
-int dm_overlay_file(const char *rel, char *out, size_t n) {
-    const char *ov = getenv("DM_ROMFS_OVERLAY");
-    for (const char *p = ov ? ov : ""; *p;) {
-        size_t l = strcspn(p, ":");
-        if (l && snprintf(out, n, "%.*s/%s", (int)l, p, rel) < (int)n && !access(out, R_OK)) return 1;
-        p += l; if (*p == ':') p++;
-    }
-    if (n) out[0] = 0;
-    return 0;
-}
 static int rom_overlay_path(const mount_t *m, const char *rest, char *out, size_t n) {
     char *roots = strdup(m->overlay);
     if (!roots) die("rom overlay path allocation failed");
@@ -321,7 +306,7 @@ static Result err_res(const char *op, const char *path) {
 HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", "fsp-srv; rom reads the host directory directly, the cache gets only the minimum size", Result, h_fs_QueryRomCache, size_t *out) { *out = 0x1000; return RES_OK; }
 HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory", Result, h_fs_MountRom, const char *name, void *cache, size_t sz) {
     (void)cache; (void)sz; char b[1024];
-    Result r = mount(name, envdir("DM_ROMFS", "data/switch/3.3.94012/Update/RomFS", b, sizeof b), 1);
+    Result r = mount(name, envdir("DM_ROMFS", "romfs", b, sizeof b), 1);
     if (r == RES_OK && getenv("DM_ROMFS_OVERLAY")) {
         PATH_LOCK();
         for (int i = 0; i < g_nmnt; i++) if (!strcmp(g_mnt[i].name, name)) {
@@ -410,100 +395,6 @@ HLE_FORCE("_ZN2nn2fs14ExtendSaveDataERKNS_7account3UidEll", "fsp-srv; extend sav
     (void)uid; LOG("fs extend save data to %lld bytes (journal %lld): nothing to do", (long long)size, (long long)journal); return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", "fsp-srv; the save directory is created at mount time", Result, h_fs_EnsureSave, const void *uid) { (void)uid; return RES_OK; }
-// Settings defaults for the touch product (dropped item names shown permanently by default, can be turned off in settings): Settings/Settings.json in the save only records keys the player has changed, unrecorded ones use the game default.
-// Before mounting the save, fill in the touch product defaults for the two keys "the player has not touched yet"; existing keys are never changed (if the player changed it in the options page, the player wins):
-//   "Item Name Display": 1 -- options page "Show Items" = toggle style (game default 0 = hold; touch has no key that can be held). Companion: the front end taps the "Show Items" key once for the player the first time this process reaches the normal in-run state (front_ios.m),
-//       in toggle style one tap keeps it shown, and it persists into the next run after exit and re-entry; a player who wants it off changes this item back to "Hold".
-//   "Item Tooltip Hotkey Appender": 0 -- item tooltips carry no controller key hints (game default 1).
-//   Minimap (placed top right: mini, semi-transparent):
-//   "AutoMapMode": 2 = mini map on the right (0 full screen / 1 left / 2 right, the game default is also 2, stated here explicitly); opacity (AutoMapFade) is not filled in, the game default 0 = no fade is used -- with "All" (3) the minimap lines fade until almost only the text remains; the map is lines overlaid on the picture anyway, so it shows through without fading;
-//   "AutoMap Open On Load": 1 = open automatically on entering a run (game default 0). Tapping the minimap = the map toggle key, see front_ios.m.
-// Done by default in the iOS app; not done by default on the Mac host (gate checks compare images against Switch ground truth), DM_TOUCH_DEFAULTS=1 on / =0 off.
-// Shared stash seed: when the save directory has no ModernSharedStashSoftCoreV2/ModernSharedStashSoftCoreV2.d2i, write the seed file (stash_seed.h); an existing one is not changed by a single byte.
-// Done before mounting the save and cloning the working directory, so it is what the game reads the first time. On by default on iOS, DM_STASH_SEED=0 turns it off; off by default on the Mac host, DM_STASH_SEED=1 turns it on.
-// Only covers the DLC type (standard + hardcore): SharedStash{Soft,Hard}CoreV2.d2i used by the Lord of Destruction type is not seeded -- the touch character creation page cannot create that kind of character
-// The seed file stash_seed.h holds the bytes of a save the game itself generated, and the public repository does not ship it: without the header nothing is seeded (the game then creates an empty shared stash of its own the first time one is needed, as the original does)
-#if __has_include("stash_seed.h")
-#include "stash_seed.h"
-static void stash_seed_one(const char *save_dir, const char *name) {
-    char dir[1100], path[1200], tmp[1210]; snprintf(dir, sizeof dir, "%s/%s", save_dir, name); snprintf(path, sizeof path, "%s/%s.d2i", dir, name);
-    struct stat st; if (!stat(path, &st)) return;
-    if (mkdir(dir, 0755) && errno != EEXIST) { LOG("shared stash seed: creating directory %s failed (%s), not seeding", dir, strerror(errno)); return; }
-    snprintf(tmp, sizeof tmp, "%s.tmp", path); FILE *f = fopen(tmp, "wb"); if (!f) { LOG("shared stash seed: writing %s failed (%s), not seeding", tmp, strerror(errno)); return; }
-    int ok = fwrite(g_stash_seed, 1, sizeof g_stash_seed, f) == sizeof g_stash_seed; ok = fclose(f) == 0 && ok;
-    if (ok && !rename(tmp, path)) LOG("shared stash seed: %s did not exist, wrote the seed file (%zu bytes: 2.5 million gold + 2 Tokens of Absolution)", path, sizeof g_stash_seed); else { remove(tmp); LOG("shared stash seed: write failed, not seeding"); }
-}
-// One copy each for standard and hardcore, each judged on its own (the game picks the file name by character type, main+0x2ce1e8: DLC type standard = ModernSharedStashSoftCoreV2, hardcore = ModernSharedStashHardCoreV2; same file format)
-static void stash_seed(const char *save_dir) {
-    const char *e = getenv("DM_STASH_SEED"); int on = e ? strcmp(e, "0") != 0 : TARGET_OS_IPHONE; if (!on) return;   // on by default on iOS; off by default on the Mac host (gate checks such as lockstep comparison / save transaction compare the save directory byte by byte, one extra file turns them red), set DM_STASH_SEED=1 to verify
-    stash_seed_one(save_dir, "ModernSharedStashSoftCoreV2"); stash_seed_one(save_dir, "ModernSharedStashHardCoreV2");
-}
-#else
-static void stash_seed(const char *save_dir) { (void)save_dir; }
-#endif
-// Fallback for "Large Font" (settings key "Low Vision Mode"): if it is 1 in the settings file, change it back to 0. It switches the UI to the original game's low-vision layout profile, which our touch UI was never built for; it hangs after being turned on in the settings page.
-// This item in the settings page is separately hidden by the UI overlay; this here guarantees that devices where it was already turned on recover on restart. Same switch as settings_seed (on by default on iOS, on the Mac host only with DM_TOUCH_DEFAULTS=1)
-static void low_vision_off(const char *save_dir) {
-    const char *e = getenv("DM_TOUCH_DEFAULTS"); int on = e ? strcmp(e, "0") != 0 : TARGET_OS_IPHONE; if (!on) return;
-    char path[1200]; snprintf(path, sizeof path, "%s/Settings/Settings.json", save_dir); static char buf[65536]; FILE *f = fopen(path, "rb"); if (!f) return;
-    size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f); if (n == sizeof buf - 1) return; buf[n] = 0;
-    char *k = strstr(buf, "\"Low Vision Mode\""); if (!k) return; char *v = strchr(k + 17, ':'); if (!v) return; v++; while (*v == ' ' || *v == '\t') v++;
-    if (*v != '1' || (v[1] >= '0' && v[1] <= '9')) return; *v = '0';
-    char tmp[1210]; snprintf(tmp, sizeof tmp, "%s.tmp", path); f = fopen(tmp, "wb"); if (!f) return; int ok = fwrite(buf, 1, n, f) == n; ok = fclose(f) == 0 && ok;
-    if (ok && !rename(tmp, path)) LOG("settings fallback: 'Large Font' (Low Vision Mode) was on, turned it back off"); else remove(tmp);
-}
-static void settings_seed(const char *save_dir) {
-    const char *e = getenv("DM_TOUCH_DEFAULTS"); int on = e ? strcmp(e, "0") != 0 : TARGET_OS_IPHONE; if (!on) return;
-    static const char *kv[][2] = {{"\"Item Name Display\"", "1"}, {"\"Item Tooltip Hotkey Appender\"", "0"},
-                                  {"\"AutoMapMode\"", "2"}, {"\"AutoMap Open On Load\"", "1"}};
-    char dir[1100], path[1200]; snprintf(dir, sizeof dir, "%s/Settings", save_dir); snprintf(path, sizeof path, "%s/Settings.json", dir);
-    static char buf[65536], out[66000]; size_t n = 0; FILE *f = fopen(path, "rb");   // static: the game thread that mounts the save has a small stack (two 64 KB blocks on the stack overflow it outright, measured crash); mounting the save is done on one thread only
-    int first = f == NULL;   // no settings file = first install
-    if (f) { n = fread(buf, 1, sizeof buf - 1, f); fclose(f); if (n == sizeof buf - 1) { LOG("settings defaults: %s is over 64 KB, left alone", path); return; } }
-    buf[n] = 0;
-    char *brace = strchr(buf, '{'); int had = brace != NULL; size_t o = 0; int added = 0;
-    o += (size_t)snprintf(out + o, sizeof out - o, "{");
-    for (size_t i = 0; i < sizeof kv / sizeof kv[0]; i++) if (!strstr(buf, kv[i][0])) { o += (size_t)snprintf(out + o, sizeof out - o, "\n    %s: %s,", kv[i][0], kv[i][1]); added++; }
-    // On first install the original game's text and voice languages are set from the system language (dm_sys_lang(), see dm_i18n.c; only when there is no settings file). An existing settings file does not get these two keys added (existing players stay as they are); afterwards they are changed by the language switch on the Custom page (settings_lang_apply)
-    if (first) { int dm_sys_lang(void); o += (size_t)snprintf(out + o, sizeof out - o, "\n    \"Language\": %d,\n    \"VoiceLanguage\": %d,", dm_sys_lang(), dm_sys_lang()); added += 2; }
-    if (!added) return;
-    if (had) { const char *rest = brace + 1; const char *q = rest; while (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
-        if (*q == '}') { out[o - 1] = 0; o--; }   // the original file is an empty object: remove the last comma that was added
-        o += (size_t)snprintf(out + o, sizeof out - o, "%s", rest); }
-    else { out[o - 1] = 0; o--; o += (size_t)snprintf(out + o, sizeof out - o, "\n}\n"); }
-    mkdir(dir, 0755); char tmp[1300]; snprintf(tmp, sizeof tmp, "%s.seed", path);
-    f = fopen(tmp, "wb"); if (!f || fwrite(out, 1, o, f) != o) { if (f) fclose(f); LOG("[RED] settings defaults: writing %s failed", tmp); return; }
-    fclose(f); if (rename(tmp, path)) { LOG("[RED] settings defaults: renaming to %s failed", path); return; }
-    LOG("settings defaults: %s got %d keys added (Show Items = toggle / tooltip hotkeys = off / minimap on the right, opens on entering a run%s; existing keys untouched)", path, added, first ? " / first install: Language written from the system language" : "");
-}
-// Language switch (the cell in the title row of the Custom page, lang_en in dm_custom.c): once the player has tapped "Apply" the settings file holds an explicit value, and on every save mount (before the game reads its settings) the original game's settings file has its
-// Language (text) and VoiceLanguage (voice; the voice switches along with it) changed to 0 English / 8 Simplified Chinese accordingly. It is changed only when it "does not match the switch": switch = English but text is not 0; switch = Chinese but text is 0.
-// So with the switch off, if the player has chosen another language such as Traditional Chinese in the original game, it is not changed back to Simplified Chinese. Whichever of the two keys is missing is added. Apply never tapped (-1) = nothing is touched
-static int json_int_set(char *buf, size_t cap, const char *key, int val) {   // Replace the N of "key": N with val (if the key is absent, insert it after the first {); returns 1 = changed
-    char *k = strstr(buf, key); char num[16]; snprintf(num, sizeof num, "%d", val);
-    if (!k) { char *b = strchr(buf, '{'); char ins[96]; int m = snprintf(ins, sizeof ins, "\n    %s: %s,", key, num); if (!b || strlen(buf) + (size_t)m + 1 >= cap) return 0;
-        memmove(b + 1 + m, b + 1, strlen(b + 1) + 1); memcpy(b + 1, ins, (size_t)m); return 1; }
-    char *v = strchr(k + strlen(key), ':'); if (!v) return 0; v++; while (*v == ' ' || *v == '\t') v++; char *e = v; if (*e == '-') e++; while (*e >= '0' && *e <= '9') e++;
-    if (e == v || atoi(v) == val) return 0; size_t nl = strlen(num); if (strlen(buf) + nl + 1 >= cap) return 0;
-    memmove(v + nl, e, strlen(e) + 1); memcpy(v, num, nl); return 1; }
-static void settings_lang_apply(const char *save_dir) {
-    int dm_custom_lang_explicit(void); int en = dm_custom_lang_explicit(); if (en < 0) return;
-    char path[1200]; snprintf(path, sizeof path, "%s/Settings/Settings.json", save_dir); static char buf[66000]; FILE *f = fopen(path, "rb"); if (!f) return;
-    size_t n = fread(buf, 1, 65535, f); fclose(f); if (n == 65535) return; buf[n] = 0;
-    const char *k = strstr(buf, "\"Language\""), *c = k ? strchr(k + 10, ':') : NULL; int cur = c ? atoi(c + 1) : 0;   // Not written = game default (the host reports en-US)
-    if ((en && cur == 0) || (!en && cur != 0)) { const char *vk = strstr(buf, "\"VoiceLanguage\""), *vc = vk ? strchr(vk + 15, ':') : NULL; int vcur = vc ? atoi(vc + 1) : cur;
-        if ((en && vcur == 0) || (!en && vcur != 0)) return; }   // Text and voice already match the switch
-    int want = en ? 0 : 8, ch = json_int_set(buf, sizeof buf, "\"Language\"", want) | json_int_set(buf, sizeof buf, "\"VoiceLanguage\"", want); if (!ch) return;
-    char tmp[1300]; snprintf(tmp, sizeof tmp, "%s.lang", path); f = fopen(tmp, "wb"); size_t m = strlen(buf);
-    if (!f || fwrite(buf, 1, m, f) != m) { if (f) fclose(f); LOG("[RED] language switch: writing %s failed", tmp); return; }
-    fclose(f); if (rename(tmp, path)) { LOG("[RED] language switch: renaming to %s failed", path); return; }
-    LOG("language switch: set the settings file's Language / VoiceLanguage to %d (%s; previous text language %d)", want, en ? "English" : "Simplified Chinese", cur);
-}
-// The current working directory of the transactional save (the copy the game reads and writes; the host's own side files must be written here to enter the committed version with Commit). Returns NULL when no save is mounted
-const char *dm_save_workdir(void) { for (int i = 0; i < g_nmnt; i++) if (g_mnt[i].commit[0]) return g_mnt[i].dir; return NULL; }
-// The committed directory of the transactional save (the copy on disk, the version from the last Commit). Returns NULL when no save is mounted
-const char *dm_save_commitdir(void) { for (int i = 0; i < g_nmnt; i++) if (g_mnt[i].commit[0]) return g_mnt[i].commit; return NULL; }
-void (*g_dm_mount_seed_hook)(const char *save_dir);   // called before mounting the save (save dir): adds the files the host needs to the save
 // Another application's save data (Tears of the Kingdom asks by application ID and would mount it read-only): the host keeps only this game's own save, which exists once mounted
 HLE_FORCE("_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", "fsp-srv; only this game's own save data exists", int, h_fs_SaveExisting, uint64_t app, const void *uid) {
     (void)uid; LOG("fs asks whether save data exists: program %016llx → %s", (unsigned long long)app, app == DM_GAME_PROGRAM_ID ? "this game, yes" : "another program, no"); return app == DM_GAME_PROGRAM_ID;
@@ -517,25 +408,15 @@ HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv; save data 
     const char *d = getenv("DM_SAVE");
     if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;   // strip trailing slashes (.work / .new are appended at the same level)
-    // The items below all edit D2R's save (Settings/Settings.json, shared stash): only on the D2R build, other games' files of the same name are left alone
-    int d2r = !strcmp(dm_main_build(), DM_D2R_BUILD);
-    if (d2r) { stash_seed(dd); low_vision_off(dd); settings_seed(dd); settings_lang_apply(dd); }
-    // Rule files for the loot filter (the game loads them at startup; dm_lootfilter.c registers this hook from a constructor; it is null in unit tests that link only hle_fs.c). Same switch as settings_seed:
-    // written by default on iOS; not written under the Mac host's parity gate (saves must match the device ground truth file by file)
-    { const char *e = getenv("DM_TOUCH_DEFAULTS"); if (d2r && g_dm_mount_seed_hook && (e ? strcmp(e, "0") != 0 : TARGET_OS_IPHONE)) g_dm_mount_seed_hook(dd); }
     return mount_ex(name, dd, 0, 1);
 }
-void (*g_dm_pre_commit_hook[4])(const char *workdir);   // called before commit (working directory): host side files are checked against the save contents in the working directory before being written ([0] personal stash pages dm_pages.c, [2] pouch dm_pouch.c, [1] chronicle vault dm_vault.c, [3] rift progress dm_rift.c)
-void (*g_dm_save_commit_hook)(const char *commit_dir);   // called after a save commit succeeds (committed directory); the iOS iCloud sync sets it, NULL on the host
 static _Atomic uint64_t g_save_commits;   // number of successful commits (used by the front end when going to background to wait for "the game's current save has been committed")
 uint64_t dm_fs_commit_count(void) { return atomic_load(&g_save_commits); }
 HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv; transactional save: the whole work directory tree is cloned, then swapped atomically with the committed directory (renamex_np RENAME_SWAP)", Result, h_fs_Commit, const char *name) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     int i = 0; while (i < g_nmnt && strcmp(g_mnt[i].name, name)) i++;
     if (i == g_nmnt || !g_mnt[i].commit[0]) { pthread_mutex_unlock(&g_lock); return RES_OK; }   // non-transactional mount: nothing to commit
-    uint64_t tc0 = clock_gettime_nsec_np(CLOCK_MONOTONIC), tw0 = atomic_exchange(&g_txn_first_ns, 0);
-    for (int k = 0; k < 4; k++) if (g_dm_pre_commit_hook[k]) g_dm_pre_commit_hook[k](g_mnt[i].dir);
-    uint64_t tc1 = clock_gettime_nsec_np(CLOCK_MONOTONIC);   // side files written into the working directory are swapped in atomically together with this commit
+    uint64_t tc1 = clock_gettime_nsec_np(CLOCK_MONOTONIC), tw0 = atomic_exchange(&g_txn_first_ns, 0);
     int perr = atomic_exchange(&g_save_poison, 0);
     if (perr) {                                                         // a write failed in this transaction: refuse the commit, discard the working directory
         char torn[512] = ""; size_t tl = 0; DIR *d0 = opendir(g_mnt[i].dir); struct dirent *e0;   // record files truncated to 0 bytes (the damage that would enter the save if committed as usual)
@@ -568,11 +449,11 @@ HLE_FORCE("_ZN2nn2fs6CommitEPKc", "fsp-srv; transactional save: the whole work d
     if (clonefile(g_mnt[i].dir, neu, 0)) { LOG("[RED] save commit: clonefile %s failed errno=%d (committed version unchanged)", neu, errno); r = RES_FAIL; }
     else if (renamex_np(neu, g_mnt[i].commit, RENAME_SWAP)) { LOG("[RED] save commit: atomic swap failed errno=%d (committed version unchanged)", errno); rm_tree(neu); r = RES_FAIL; }
     else rm_tree(neu);                                                  // the old version that was swapped out
-    // Timing readouts (integer microseconds, no floating point): how long the pre-commit hook and the clone + atomic swap each took; how long in total from this transaction's first save write to the end of the commit (the game writing files + the commit; 0 = no save write in this transaction)
+    // Timing readouts (integer microseconds, no floating point): how long the clone + atomic swap took; how long in total from this transaction's first save write to the end of the commit (the game writing files + the commit; 0 = no save write in this transaction)
     static int n; if (r == RES_OK) { uint64_t tc2 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-        LOG("save commit #%d: %s swapped atomically into %s (%d save writes so far) (hook %llu us, clone + swap %llu us, since this transaction's first write %llu us)", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
-            (unsigned long long)((tc1 - tc0) / 1000), (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0)); atomic_fetch_add(&g_save_commits, 1);
-        if (g_dm_save_commit_hook) g_dm_save_commit_hook(g_mnt[i].commit); }   // iCloud sync (cloud_ios.m): called with the lock held, that side only takes a clonefile snapshot
+        LOG("save commit #%d: %s swapped atomically into %s (%d save writes so far) (clone + swap %llu us, since this transaction's first write %llu us)", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
+            (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0)); atomic_fetch_add(&g_save_commits, 1);
+    }
     pthread_mutex_unlock(&g_lock);
     return r;
 }
@@ -581,75 +462,6 @@ HLE_FORCE("_ZN2nn2fs14CommitSaveDataEPKc", "fsp-srv; same as Commit (SDK 11's ol
 HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; the mount table is permanent, unmounting is a no-op", void, h_fs_Unmount, const char *name) { (void)name; }
 
 // ---------- Files ----------
-// Zero-stripped archives: large zero-filled ranges in the resource pack (cutscene videos, old-version music) are not distributed with the package -- these zero-filled ranges are stripped from the archive file, and an extent table is placed beside it,
-// "<archive name>.holes" (text: first line `size <original byte count>`, then one line `<zero-filled range start> <zero-filled range length>` each, ascending by start, non-overlapping).
-// When reading such archives the host translates offsets through the table: bytes falling in a zero-filled range return 0 and the file size is reported as the original value; the game and the startup prefetch still see the original layout, and not a single word of the index needs changing.
-// There are only two read entry points: ReadFile in this file and the startup prefetch in hle_tact.c, both going through dm_data_pread. Files without .holes take the original path with zero extra overhead.
-typedef struct { int64_t size; int n; int64_t *log, *len, *phys; char name[40]; } holemap;   // Kept segment: original start / length / start in the zero-stripped file
-static _Atomic uint64_t g_hole_reads;   // Number of reads that hit a zero-filled range: should normally be 0 (zero-filled ranges are stripped cutscene videos / old-version music the game should not come to read); non-zero = stripped wrongly
-static holemap *g_hm[4096];
-static holemap *hm_load(const char *hostpath) {
-    char hp2[1100]; if (snprintf(hp2, sizeof hp2, "%s.holes", hostpath) >= (int)sizeof hp2) return NULL;
-    FILE *f = fopen(hp2, "r"); if (!f) return NULL;
-    long long size = -1, o, l; if (fscanf(f, "size %lld", &size) != 1 || size < 0) die("bad hole table format: %s", hp2);
-    holemap *m = calloc(1, sizeof *m); int cap = 64; m->size = size; m->log = malloc(cap * sizeof *m->log); m->len = malloc(cap * sizeof *m->len); m->phys = malloc(cap * sizeof *m->phys);
-    int64_t pos = 0, phys = 0;
-    while (fscanf(f, "%lld %lld", &o, &l) == 2) {
-        if (o < pos || l <= 0 || o + l > size) die("hole table zero range out of bounds or out of order: %s (%lld %lld)", hp2, o, l);
-        if (o > pos) { if (m->n == cap) { cap *= 2; m->log = realloc(m->log, cap * sizeof *m->log); m->len = realloc(m->len, cap * sizeof *m->len); m->phys = realloc(m->phys, cap * sizeof *m->phys); }
-            m->log[m->n] = pos; m->len[m->n] = o - pos; m->phys[m->n++] = phys; phys += o - pos; }
-        pos = o + l;
-    }
-    fclose(f);
-    if (pos < size) { if (m->n == cap) { cap++; m->log = realloc(m->log, cap * sizeof *m->log); m->len = realloc(m->len, cap * sizeof *m->len); m->phys = realloc(m->phys, cap * sizeof *m->phys); }
-        m->log[m->n] = pos; m->len[m->n] = size - pos; m->phys[m->n++] = phys; phys += size - pos; }
-    struct stat st; if (stat(hostpath, &st) || st.st_size != phys) die("zero-stripped archive length does not match its hole table: %s is %lld bytes, the table says %lld", hostpath, (long long)st.st_size, (long long)phys);
-    const char *bn = strrchr(hostpath, '/'); strlcpy(m->name, bn ? bn + 1 : hostpath, sizeof m->name);
-    { static _Atomic int said[64]; unsigned h = 0; for (const char *c = m->name; *c; c++) h = h * 31 + (unsigned char)*c;   // Print a line for each archive only on first registration
-      if (!atomic_exchange(&said[h % 64], 1)) LOG("zero-stripped archive %s: original %lld bytes, stored %lld bytes, %d kept segments", m->name, (long long)size, (long long)phys, m->n); }
-    return m;
-}
-void dm_data_note_fd(int fd, const char *hostpath) {   // Called after opening a resource archive: register it if there is an extent table
-    if (fd < 0 || fd >= 4096) return;
-    g_hm[fd] = hm_load(hostpath);
-}
-// Same as dm_data_logical_size, but opened relative to the directory fd: listing does not resolve the long path from the root again for every entry
-static int64_t data_logical_size_at(int dfd, const char *name, int64_t phys_size) {
-    char hn[0x320]; if (snprintf(hn, sizeof hn, "%s.holes", name) >= (int)sizeof hn) return phys_size;
-    int fd = openat(dfd, hn, O_RDONLY); if (fd < 0) return phys_size;
-    FILE *f = fdopen(fd, "r"); if (!f) { close(fd); return phys_size; }
-    long long size = -1; int ok = fscanf(f, "size %lld", &size) == 1; fclose(f); return ok && size >= 0 ? size : phys_size;
-}
-int64_t dm_data_logical_size(const char *hostpath, int64_t phys_size) {   // For directory listing / size queries: report the original size when there is an extent table
-    char hp2[1100]; if (snprintf(hp2, sizeof hp2, "%s.holes", hostpath) >= (int)sizeof hp2) return phys_size;
-    FILE *f = fopen(hp2, "r"); if (!f) return phys_size; long long size = -1; int ok = fscanf(f, "size %lld", &size) == 1; fclose(f); return ok && size >= 0 ? size : phys_size;
-}
-ssize_t dm_data_pread(int fd, void *buf, size_t n, off_t off) {   // Same semantics as pread (may short-read); zero-stripped archives are translated through the extent table
-    holemap *m = fd >= 0 && fd < 4096 ? g_hm[fd] : NULL;
-    if (!m) return pread(fd, buf, n, off);
-    if (off >= m->size) return 0;
-    if ((int64_t)n > m->size - off) n = (size_t)(m->size - off);
-    int lo = 0, hi = m->n;   // The first kept segment whose end point > off
-    while (lo < hi) { int mid = (lo + hi) / 2; if (m->log[mid] + m->len[mid] <= off) lo = mid + 1; else hi = mid; }
-    size_t done = 0;
-    while (done < n) {
-        int64_t cur = off + (int64_t)done;
-        if (lo < m->n && cur >= m->log[lo]) {   // In a kept segment: read directly into the destination buffer
-            int64_t in = cur - m->log[lo]; size_t want = n - done; if ((int64_t)want > m->len[lo] - in) want = (size_t)(m->len[lo] - in);
-            size_t got = 0; while (got < want) { ssize_t r = pread(fd, (uint8_t *)buf + done + got, want - got, m->phys[lo] + in + (int64_t)got); if (r < 0) { if (errno == EINTR) continue; return -1; } if (r == 0) return (ssize_t)(done + got); got += (size_t)r; }
-            done += want; if (in + (int64_t)want == m->len[lo]) lo++;
-        } else {                               // In a zero-filled range: fill 0 up to the start of the next kept segment
-            int64_t end = lo < m->n ? m->log[lo] : m->size; size_t z = n - done; if ((int64_t)z > end - cur) z = (size_t)(end - cur);
-            memset((uint8_t *)buf + done, 0, z); done += z;
-            // The game reads whole blocks aligned to 256 KB: when what it wants is a kept file next to a zero-filled range, the whole block incidentally overlaps the edge of the zero-filled range (harmless, the kept file's bytes are returned as usual).
-            // Only a read that lies entirely inside a zero-filled range is really reading stripped content → report a failure (the first 20 one by one, then one line per 1000); boundary-crossing reads are only noted the first 3 times
-            if (z == n) { uint64_t hr = atomic_fetch_add(&g_hole_reads, 1);
-                if (hr < 20 || hr % 1000 == 0) LOG("[RED] read inside a stripped zero range %s offset %lld length %zu (#%llu; the whole block lies in the stripped cutscene videos / old-version music: the stripping was wrong or there is a new reader)", m->name, (long long)off, n, (unsigned long long)hr + 1);
-            } else { static _Atomic uint64_t edge; if (atomic_fetch_add(&edge, 1) < 3) LOG("block read overlaps the edge of a stripped zero range (harmless): %s read %lld length %zu, %zu bytes of it in the zero range", m->name, (long long)off, n, z); }
-        }
-    }
-    return (ssize_t)done;
-}
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) {
     HP(path);
     if (mode & (MODE_WRITE | MODE_APPEND)) RW();
@@ -659,7 +471,6 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     if (S_ISDIR(st.st_mode)) { close(fd); return RES_PATH_NOT_FOUND; }
     if (fd >= (int)sizeof g_fmode) die("fd beyond the table");
     g_fmode[fd] = (uint8_t)mode; *out = (uint64_t)fd;
-    g_hm[fd] = NULL; if (!(mode & (MODE_WRITE | MODE_APPEND))) dm_data_note_fd(fd, hp);
     { const char *c = strchr(path, ':'); size_t ln = c ? (size_t)(c - path) : 0; g_fsave[fd] = 0;
       for (int i = 0; c && i < g_nmnt; i++) if (strlen(g_mnt[i].name) == ln && !strncmp(g_mnt[i].name, path, ln)) g_fsave[fd] = g_mnt[i].commit[0] != 0; }
     fslog_init();
@@ -669,16 +480,15 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
 }
 HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) {
     if (!h) { *out = 0; return RES_FAIL; }   // a file handle is an fd; 0 is stdin and never a file the game opened: the null handle the game keeps using after a failed open
-    size_t got = 0; uint64_t t0 = g_flag.bootprof ? now_ns() : 0;
+    size_t got = 0;
     dm_guest_write_prepare(buf, sz);   // The destination may be a texture pool page write-protected by the graphics layer: a kernel write to a read-only page returns EFAULT instead of page-faulting, so unprotect and mark dirty first
     while (got < sz) {
-        ssize_t r = dm_data_pread((int)h, (uint8_t *)buf + got, sz - got, off + got);
+        ssize_t r = pread((int)h, (uint8_t *)buf + got, sz - got, off + got);
         if (r < 0) { if (errno == EINTR) continue; return err_res("pread", "fd"); }
         if (r == 0) break;
         got += r;
     }
     *out = got;
-    if (g_flag.bootprof) dm_prof_add(PROF_FS_READ, now_ns() - t0, got);
     if (g_fslog) { pthread_mutex_lock(&g_fslog_lock);
         static int hash_on = -1; if (hash_on < 0) hash_on = getenv("DM_FSLOG_HASH") != NULL;   // DM_FSLOG_HASH=1: append a column with the FNV-1a 64 of the content read (to compare whether the bytes read from two resource packs match)
         uint64_t fh = 0xcbf29ce484222325ull; if (hash_on) for (size_t i = 0; i < got; i++) fh = (fh ^ ((uint8_t *)buf)[i]) * 0x100000001b3ull;
@@ -718,7 +528,7 @@ HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp
 HLE_FORCE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", "fsp-srv → fstat(2)", Result, h_fs_GetFileSize, int64_t *out, uint64_t h) {
     if (!h) return RES_FAIL;
     struct stat st; if (fstat((int)h, &st)) return err_res("fstat", "fd");
-    *out = (int)h < 4096 && g_hm[(int)h] ? g_hm[(int)h]->size : st.st_size; return RES_OK;
+    *out = st.st_size; return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", "fsp-srv → ftruncate(2)", Result, h_fs_SetFileSize, uint64_t h, int64_t sz) {
     if (!h) return RES_FAIL;
@@ -730,7 +540,6 @@ HLE_FORCE("_ZN2nn2fs9FlushFileENS0_10FileHandleE", "fsp-srv; host writes are alr
 HLE_FORCE("_ZN2nn2fs9CloseFileENS0_10FileHandleE", "fsp-srv → close(2)", void, h_fs_CloseFile, uint64_t h) {
     if (!h) return;   // the null handle after a failed open (see ReadFile): do not touch fd 0
     g_fmode[(int)h & 0xffff] = 0; g_fsave[(int)h & 0xffff] = 0;
-    if ((int)h >= 0 && (int)h < 4096 && g_hm[(int)h]) { holemap *m = g_hm[(int)h]; g_hm[(int)h] = NULL; free(m->log); free(m->len); free(m->phys); free(m); }
     close((int)h); }
 HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv; the open mode is recorded by the host", int, h_fs_GetFileOpenMode, uint64_t h) { return g_fmode[(int)h & 0xffff]; }
 
@@ -817,7 +626,6 @@ static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
         struct dirent *e;
         while ((e = readdir(x))) {
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-            { size_t dl = strlen(e->d_name); if (dl > 6 && !strcmp(e->d_name + dl - 6, ".holes")) continue; }   // The extent table is not shown to the game
             if (!guest_name(parent, e->d_name, guest, 0x301)) continue;
             int dup = 0; for (int j = 0; j < nn; j++) if (!strcmp(names[j], guest)) { dup = 1; break; }
             if (!dup && nn < 2048) strlcpy(names[nn++], guest, sizeof names[0]);
@@ -831,7 +639,7 @@ static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
         snprintf(rel, 2048, "%s/%s", rest, names[j]);
         if (!rom_overlay_path(m, rel, resolved, 1024)) continue;
         struct stat st;
-        if (!stat(resolved, &st)) { h->snap[j].type = S_ISDIR(st.st_mode) ? ENT_DIR : ENT_FILE; h->snap[j].size = S_ISDIR(st.st_mode) ? 0 : dm_data_logical_size(resolved, st.st_size); }
+        if (!stat(resolved, &st)) { h->snap[j].type = S_ISDIR(st.st_mode) ? ENT_DIR : ENT_FILE; h->snap[j].size = S_ISDIR(st.st_mode) ? 0 : st.st_size; }
     }
     free(resolved); free(rel); free(guest); free(parent); free(all); free(names); free(roots);
 }
@@ -852,7 +660,6 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
     int dfd = dirfd(h->d);
     while (n < max && (e = readdir(h->d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        { size_t dl = strlen(e->d_name); if (dl > 6 && !strcmp(e->d_name + dl - 6, ".holes")) continue; }   // The extent table is not shown to the game
         // a directory's type comes from d_type without stat; files need a size, taken with fstatat relative to the directory fd (following links, like the old stat)
         struct stat st; int isdir;
         if (e->d_type == DT_DIR) isdir = 1;
@@ -860,7 +667,7 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
         if (!(h->mode & (isdir ? DIRMODE_DIR : DIRMODE_FILE))) continue;
         DirectoryEntry *o = &ents[n++]; memset(o, 0, sizeof *o);
         if (!guest_name(h->path, e->d_name, o->name, sizeof o->name)) { char c[1280]; snprintf(c, sizeof c, "%s/%s", h->path, e->d_name); *count = n - 1; return err_res("directory name", c); }
-        o->type = isdir ? ENT_DIR : ENT_FILE; o->size = isdir ? 0 : data_logical_size_at(dfd, e->d_name, st.st_size);
+        o->type = isdir ? ENT_DIR : ENT_FILE; o->size = isdir ? 0 : st.st_size;
     }
     *count = n; return RES_OK;
 }
@@ -887,7 +694,6 @@ HLE_FORCE("_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", "fsp-srv
     struct dirent *e;
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        { size_t dl = strlen(e->d_name); if (dl > 6 && !strcmp(e->d_name + dl - 6, ".holes")) continue; }
         char c[1280]; snprintf(c, sizeof c, "%s/%s", h->path, e->d_name);
         struct stat st; if (stat(c, &st)) continue;
         if (h->mode & (S_ISDIR(st.st_mode) ? DIRMODE_DIR : DIRMODE_FILE)) n++;

@@ -93,7 +93,6 @@ static void front_ios_power_watch(void) {
 }
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
-uint64_t front_game_res(int docked) { return docked ? 900ull << 32 | 1600 : 720ull << 32 | 1280; }   // Same as Mac: the original 16:9 constants
 void front_run(void (*guest)(void)) { guest(); }   // Already on main.m's big-stack thread
 
 // Software keyboard: show a UIAlertController on the main thread, the calling thread waits for the result
@@ -122,7 +121,7 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     return 1;
 }
 
-// Save write failed (most likely the phone's storage is full): show a notice on the main thread without blocking the game (as d2r-mobile does). hle_fs.c calls this when a save transaction is refused or a mount has to fall back to read-only;
+// Save write failed (most likely the phone's storage is full): show a notice on the main thread without blocking the game. hle_fs.c calls this when a save transaction is refused or a mount has to fall back to read-only;
 // the iOS front end used not to implement it, so there was only a log line and the player never learned that progress was not being saved
 void front_save_failed(int err) {
     LOG("front end: save data write failed errno=%d, telling the player", err);

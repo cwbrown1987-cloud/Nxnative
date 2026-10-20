@@ -1,4 +1,4 @@
-// Probes DM_PROBE (taken from d2r-mobile dm/host/diag.c, keeping only the probe itself): when the debugger needs a system authorization prompt on the Mac, use this to print registers and a backtrace at a guest address.
+// Probes DM_PROBE: when the debugger needs a system authorization prompt on the Mac, use this to print registers and a backtrace at a guest address.
 #include "dm.h"
 #include <TargetConditionals.h>
 #include <signal.h>

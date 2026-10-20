@@ -96,8 +96,6 @@ def header(g):
     if pi not in ('game', 'display'): sys.exit(f'{g.id}: present_interval must be game or display: {pi}')
     ft = g.get('fps_target', '0')   # frame rate cap of the rewriter's frame step (patch_nso.py FRAME_STEP: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0) or of the engine's own frame limit (hle_fpslock.c): 0 = the game's own step, 30 / 60
     if ft not in ('0', '30', '60'): sys.exit(f'{g.id}: fps_target must be 0, 30 or 60: {ft}')
-    fs = g.get('frame_step', 'ticks')   # the frame step's method: ticks = whole vsyncs decided by the host (nvn_fstep.h), legacy = each game's earlier method (for the iPhone A/B test)
-    if fs not in ('ticks', 'legacy'): sys.exit(f'{g.id}: frame_step must be ticks or legacy: {fs}')
     cp = g.get('core_preempt', 'off')   # same-core preemption approximation (hle_thread.c): on / off
     if cp not in ('on', 'off'): sys.exit(f'{g.id}: core_preempt must be on or off: {cp}')
     aba = g.get('alloc_big_align', 'off')   # nn::mem::StandardAllocator::Allocate aligns blocks of 64 KB or more to 64 KB (hle_os.c; Vanillaware's memory pool storage): on / off
@@ -155,7 +153,6 @@ def header(g):
          f'#define DM_GAME_CORE_PREEMPT {int(cp == "on")}',
          f'#define DM_GAME_ALLOC_BIG_ALIGN {int(aba == "on")}',
          f'#define DM_GAME_FPS_TARGET {int(ft)}',
-         f'#define DM_GAME_FRAME_STEP_LEGACY {int(fs == "legacy")}',
          f'#define DM_GAME_SHARED_FONT_TTF {int(sf == "ttf")}',
          f'#define DM_GAME_PAD_FULL {int(pl == "full")}',
          f'#define DM_GAME_OPMODE {int(om == "console")}',

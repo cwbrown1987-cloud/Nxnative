@@ -165,16 +165,7 @@ static void wake(thr_t *t, int64_t res) {
     if (self && self != t && !t->host_owned && t->prio < self->prio && t->mask == 1ull << (self->core & 63)) self->yield_pending = 1;
 }
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
-static int64_t block_inner(thr_t *t, int kind, int64_t ns);
-static int64_t block(thr_t *t, int kind, int64_t ns) {   // Boot timeline: accumulated by wait kind (all threads) + the main thread listed separately
-    if (!g_flag.bootprof) return block_inner(t, kind, ns);
-    uint64_t t0 = now_ns(); int64_t r = block_inner(t, kind, ns); uint64_t d = now_ns() - t0;
-    static const int id[] = {0, PROF_WAIT_LOCK, PROF_WAIT_CV, PROF_WAIT_ADDR, PROF_WAIT_SYNC};
-    dm_prof_add(id[kind & 7], d, 0);
-    if (t->handle == 0x1001) dm_prof_add(PROF_MAIN_WAIT, d, 0);
-    return r;
-}
-static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
+static int64_t block(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     struct timespec dl;
@@ -445,7 +436,7 @@ static void thr_bt(thr_t *t) {
     arm_thread_state64_t st; mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(t->mport, ARM_THREAD_STATE64, (thread_state_t)&st, &n) == KERN_SUCCESS) {
         // Threads not waiting in a system call (running guest code, possibly spinning on a condition): print the callee-saved registers x19–x28, plus 128 bytes of the memory pointed to by each of x19 / x20.
-        // The state seen in the occasional "no frames after entering a run": the main thread spins in the job pool's "help while waiting" (main+0x14f08d8), x19 = wait object, x20 = job pool -- only with these can one tell which batch it is waiting for and what the unfinished count is
+        // A thread spinning on a condition is told apart by its callee-saved registers (often the object it waits on) and the memory they point to
         if (t->wkind == 0) { char rl[400]; int q = snprintf(rl, sizeof rl, "[dm]   %#x registers pc=", t->handle); uint64_t pc = __darwin_arm_thread_state64_get_pc(st); module_t *pm = module_of((void *)pc);
             q += pm ? snprintf(rl + q, sizeof rl - q, "%s+%#llx", pm->name, pc - (uint64_t)pm->base) : snprintf(rl + q, sizeof rl - q, "%#llx", pc);
             for (int i = 19; i <= 28; i++) q += snprintf(rl + q, sizeof rl - q, " x%d=%#llx", i, st.__x[i]);
@@ -461,43 +452,15 @@ static void thr_bt(thr_t *t) {
             if (sp > 0x100000000ull && !vm_read_overwrite(mach_task_self(), sp, sizeof stk, (vm_address_t)stk, &g) && g == sizeof stk)
                 for (int r = 0; r < 128; r += 8) fprintf(stderr, "[dm]   %#x stack sp+%#05x: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", t->handle, r * 8,
                         stk[r], stk[r + 1], stk[r + 2], stk[r + 3], stk[r + 4], stk[r + 5], stk[r + 6], stk[r + 7]); }
-        char line[1024]; int p = snprintf(line, sizeof line, "[dm]   %#x backtrace:", t->handle), nf = 0; uint64_t wait_fp = 0;
+        char line[1024]; int p = snprintf(line, sizeof line, "[dm]   %#x backtrace:", t->handle), nf = 0;
         for (int k = 0; k < 64 && fp && nf < 20 && p < (int)sizeof line - 40; k++) {
             module_t *m = module_of((void *)lr);
             if (m) { p += snprintf(line + p, sizeof line - p, " %s+%#llx", m->name, lr - (uint64_t)m->base); nf++; }
             uint64_t fr[2]; vm_size_t g2 = 0;
             if (vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &g2) || g2 != 16 || fr[0] <= fp) break;
-            if (m && !strcmp(m->name, "main") && lr - (uint64_t)m->base == 0x132db30) wait_fp = fp;   // The return point is inside the resource wait function main+0x132d988 (after it calls the job pool's "help while waiting"): the frame pointer at this moment is its own
             fp = fr[0]; lr = fr[1];
         }
         fprintf(stderr, "%s\n", line);
-        // The resource wait function main+0x132d988 (prologue sub sp,#0x50 … add x29,sp,#0x40) places the wait object {vtable, pointer to the event pointer} at the bottom of its own stack (0x132db14 stp x8,x23,[sp]),
-        // so the wait object = its frame pointer −0x40; what that points to, −0x10 = the resource wait object {+0 in-flight job, +8 mutex pointer, +0x10 event pointer}. It is located by the return point 0x132db30, regardless of which instruction of the wait loop the thread is stopped on right now.
-        // The old code took "the previous frame" based on 0x14f0934 and was off by one level, reading the resource wait object as the wait object; "in-flight job null" and "event / lock unreadable" were both misreads
-        if (wait_fp) { uint64_t wo[2] = {0, 0}, res[3] = {0, 0, 0}, wjob = 0; vm_size_t g = 0;
-            #define RD(addr, buf) ((addr) > 0x100000000ull && !vm_read_overwrite(mach_task_self(), (addr), sizeof(buf), (vm_address_t)(buf), &g) && g == sizeof(buf))
-            #define HEX(tag, addr, nbytes) { uint32_t raw[32]; vm_size_t gg = 0; if ((addr) > 0x100000000ull && !vm_read_overwrite(mach_task_self(), (addr), (nbytes), (vm_address_t)raw, &gg) && gg == (nbytes)) { \
-                char hx[300]; int h = 0; for (unsigned q = 0; q < (nbytes) / 4; q++) h += snprintf(hx + h, sizeof hx - h, "%08x ", raw[q]); fprintf(stderr, "[dm]   %#x job pool wait: %s %#llx: %s\n", t->handle, tag, (unsigned long long)(addr), hx); } \
-                else fprintf(stderr, "[dm]   %#x job pool wait: %s %#llx unreadable\n", t->handle, tag, (unsigned long long)(addr)); }
-            if (RD(wait_fp - 0x40, wo)) { module_t *vm_ = module_of((void *)wo[0]);
-                fprintf(stderr, "[dm]   %#x job pool wait: wait object %#llx vtable %s+%#llx (should be main+0x20f2408), points to %#llx\n", t->handle, (unsigned long long)(wait_fp - 0x40), vm_ ? vm_->name : "?", vm_ ? wo[0] - (uint64_t)vm_->base : wo[0], wo[1]);
-                if (RD(wo[1] - 0x10, res)) {
-                    fprintf(stderr, "[dm]   %#x job pool wait: resource wait object %#llx: in-flight job %#llx (%s), mutex %#llx, event %#llx. Reading: in-flight job null = the signal was consumed by some wait; non-null and event not set = the completion signal never came; event set = a problem in the wait loop\n",
-                            t->handle, (unsigned long long)(wo[1] - 0x10), res[0], res[0] ? "non-null" : "null", res[1], res[2]);
-                    HEX("event body 64 bytes", res[2], 64);
-                    HEX("mutex body 32 bytes (+8 recursion count, +0x10 owner thread object, +0x18 lock word = owner handle)", res[1], 32);
-                    // Job object (filled by the submit function main+0x147f154): +0x10 flags (filtered by a per-thread-class mask when taking a job, 0xeda190 / 0xdf8fac), +0x20 next in the queue, dependency table from +0x30 (low 31 bits = count), +0x60 resource, +0x68 pointer to the event pointer
-                    if (res[0]) { HEX("in-flight job object, 128 bytes from +0", res[0], 128); HEX("in-flight job object, 128 bytes from +0x80", res[0] + 0x80, 128); } wjob = res[0]; } }
-            // Job pool: when the thread is stopped on an instruction of the wait loop main+0x14f08d8 itself, x20 is the pool; when it is stopped in a function called from it, x20 cannot be trusted and is not printed
-            { uint64_t pc = __darwin_arm_thread_state64_get_pc(st); module_t *pm = module_of((void *)pc); uint64_t off = pm && !strcmp(pm->name, "main") ? pc - (uint64_t)pm->base : 0;
-              // Queue (0xeda190): {+0 tail, +8 head, +0x10 count, +0x18 lock}, node +0x10 flags, +0x20 next. Walk from the head for at most 8 nodes to see whether the awaited job is in this pool
-              if (off >= 0x14f0900 && off < 0x14f09b8) { uint64_t qa = st.__x[20] + 0x410, nd = 0; HEX("job queue head (pool = x20, 32 bytes from +0x410)", qa, 32); int in = 0, cnt = 0;
-                  if (RD(qa + 8, &nd)) for (; nd && cnt < 8; cnt++) { uint64_t nb[5] = {0}; if (!RD(nd, nb)) break; fprintf(stderr, "[dm]   %#x job pool wait:   queue entry %d %#llx flags %#x%s\n", t->handle, cnt, (unsigned long long)nd, (uint32_t)nb[2], nd == wjob ? " (the waited-for job)" : ""); in |= nd == wjob; nd = nb[4]; }
-                  fprintf(stderr, "[dm]   %#x job pool wait: the waited-for job %s among the first %d in the queue of pool x20\n", t->handle, in ? "is" : "is not", cnt); }
-              else fprintf(stderr, "[dm]   %#x job pool wait: the thread is not on the wait loop's own instructions, job pool not read\n", t->handle); }
-            #undef RD
-            #undef HEX
-        }
     }
     thread_resume(t->mport);
 }
@@ -530,7 +493,7 @@ void svc_thread_dump(void) {
                         fprintf(stderr, "[dm]   %#x waited-for object, 64 bytes from %#llx: %s\n", t->handle, t->waddr & ~0xfull, hx); }
         thr_bt(t);
     }
-    // Threads created by the host itself (prefetch, Granny background, graphics present, audio, etc.): not in the guest thread table, enumerated as mach threads, the first 12 frames symbolized with dladdr
+    // Threads created by the host itself (graphics present, audio, movie decoding, etc.): not in the guest thread table, enumerated as mach threads, the first 12 frames symbolized with dladdr
     thread_act_array_t ths; mach_msg_type_number_t nth = 0;
     if (task_threads(mach_task_self(), &ths, &nth) == KERN_SUCCESS) {
         for (mach_msg_type_number_t i = 0; i < nth; i++) {
@@ -668,14 +631,13 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x0A: thread_exit(cur()); return 1;
     case 0x0B: {  // SleepThread(x0 ns); 0/-1/-2 = the various kinds of yield
         int64_t ns = (int64_t)regs[0];
-        uint64_t t0 = g_flag.bootprof ? now_ns() : 0;
         if (ns > 0 && dm_detclock_enabled()) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
             while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
         } else if (ns >= 20000) { thr_t *me = pthread_getspecific(g_keythr); if (me) me->sleeping = 1; sleep_precise(now_ns() + (uint64_t)ns); if (me) me->sleeping = 0; }
         // Yield (0 / -1 / -2), and sleeps shorter than 20 µs, which sleep_precise would return from at once: Super Mario Galaxy's Hagi polls with SleepThread(100 ns) (main+0x517c),
         // which kept a core at 100% (1.4 billion calls in 200 s); as yields they get the back-off below.
-        // Count and time of the main thread's yields are recorded: the game's render task graph "wait for everything to finish" is pure polling + yield (main+0x15ee898); measure how much of a frame it takes
+        // Count and time of the main thread's yields are recorded: a render task graph's "wait for everything to finish" is often pure polling + yield; measure how much of a frame it takes
         else {
             thr_t *me = pthread_getspecific(g_keythr);
             uint64_t y0 = me ? now_ns() : 0;
@@ -685,7 +647,6 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             else sched_yield();
             if (me && me->handle == 0x1001) { g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }
         }
-        if (g_flag.bootprof) { uint64_t d = now_ns() - t0; dm_prof_add(PROF_SLEEP, d, 0); thr_t *me = pthread_getspecific(g_keythr); if (me && me->handle == 0x1001) dm_prof_add(PROF_MAIN_WAIT, d, 0); }
         return 1;
     }
     case 0x0C: { thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; return 1; }

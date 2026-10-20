@@ -8,37 +8,13 @@
 typedef struct { int16_t year; int8_t month, day, hour, minute, second; int8_t pad; } CalendarTime;
 typedef struct { uint32_t wday, yday; char tzname[8]; uint32_t dst; int32_t offset; } CalendarAdditionalInfo;
 
-// DM_FIXED_TIME=seconds (for deterministic comparison; the ground-truth side counterpart is dm/verify/ryu/drive.py --fix-time):
-// ① the user clock (source of the save's d2s +0x20 last-played time and .meta last_modified_time) always returns this value;
-// ② the one time() at the game-creation random seed (main 0x3509a0 bl time, return point 0x3509a4, same point as drive.py) returns this value.
-// This SDK's libc time() is uptime (clock_gettime(0) → __nnmusl_ClockGetTime → GetSystemTick), not wall clock;
-// the other 17 time() call sites in main are left alone and forwarded unchanged to the SDK's own time().
+// DM_FIXED_TIME=seconds (for deterministic comparison): the user clock always returns this value (and main.c pins the host time zone to UTC)
 static int64_t fixed_time(void) {
     static int64_t v = -2;
     if (v == -2) { const char *e = getenv("DM_FIXED_TIME"); v = e ? strtoll(e, 0, 0) : -1;
-                   if (v >= 0) LOG("DM_FIXED_TIME=%lld: user clock and the run-setup time() (main 0x3509a4) return a fixed value", (long long)v); }
+                   if (v >= 0) LOG("DM_FIXED_TIME=%lld: the user clock returns a fixed value", (long long)v); }
     return v;
 }
-HLE_FORCE("time", "recognizes the run-setup seed call by its return address (DM_FIXED_TIME); everything else passes straight to the SDK's time()", int64_t, h_time_time, int64_t *t) {
-    uint64_t lr = (uint64_t)__builtin_return_address(0);
-    static int64_t (*sdk_time)(int64_t *); static uint64_t seed_ret;
-    if (!sdk_time) {
-        module_t *ms = NULL, *mm = NULL;
-        for (int i = 0; i < g_nmod; i++) { if (!strcmp(g_mod[i].name, "sdk")) ms = &g_mod[i]; if (!strcmp(g_mod[i].name, "main")) mm = &g_mod[i]; }
-        void *f = ms ? module_sym(ms, "time") : NULL; if (!f) die("time not found in the SDK");
-        uint32_t w = mm && !strcmp(mm->build_id, DM_D2R_BUILD) ? *(uint32_t *)(mm->base + 0x3509a0) : 0;   // read only on the D2R build (elsewhere this is unrelated code, and a main smaller than 3.3 MB would be read past its end)
-        if ((w & 0xfc000000) == 0x94000000) seed_ret = (uint64_t)mm->base + 0x3509a4;               // bl time (build db0507f3…; the rewriter changes the branch target, so only the bl itself is matched)
-        else if (fixed_time() >= 0) LOG("[RED] DM_FIXED_TIME: main 0x3509a0 is not the expected bl time (%#x), run-setup time() not fixed", w);
-        sdk_time = (int64_t (*)(int64_t *))f;
-    }
-    int64_t ft = fixed_time();
-    if (ft >= 0 && lr == seed_ret) {
-        static int once; if (!once++) LOG("DM_FIXED_TIME: run-setup time() returns %lld", (long long)ft);
-        if (t) *t = ft; return ft;
-    }
-    return sdk_time(t);
-}
-
 HLE_FORCE("_ZN2nn4time10InitializeEv", "connect to the time service; clocks come from the host system time instead", Result, h_time_Initialize, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn4time13IsInitializedEv", "the time service is taken over, always initialized", int, h_time_IsInitialized, void) { return 1; }
 // Steady clock (seconds since boot + a clock source ID, a 16-byte UUID): the host's monotonic seconds with a fixed source ID. GetSpanBetween runs as is in sdk: it subtracts only when the source IDs match
@@ -78,23 +54,7 @@ HLE_FORCE("_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18Sy
     pthread_mutex_unlock(&mu);
     return RES_OK;
 }
-// Forced Terror Zone for stages 6–10 of the boss rush (set by dm_bossrush.c): when g_dm_tz_time is non-zero and not expired, only the clock reads at the "Terror Zone" sites get it; save timestamps and all other calls are unchanged.
-// Which sites: the return point falls in the cluster starting at the zone function 0x58f1e0 (0x58f1e0–0x591440), or the zone schedule 0x58f310 is called within 8 instructions after the return (server side 0x636b38 applying the zone, 0x694b48 and so on, 9 sites).
-// Expiry: dm_bossrush renews it by 1 second every tick; once this run stops ticking (exit / crash) it no longer applies, and the next run gets the real clock when the game is created.
-_Atomic int64_t g_dm_tz_time;
-_Atomic uint64_t g_dm_tz_live_ns;
-static int tz_site(uint64_t lr) {   // Checked only while forcing is active, reading the 8 instructions after the return point each time, no caching (several threads read the clock)
-    static _Atomic uint64_t base; uint64_t b = atomic_load(&base);
-    if (!b) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) b = (uint64_t)g_mod[i].base; atomic_store(&base, b); }
-    if (!b || lr < b) return 0;
-    uint64_t off = lr - b; if (off > 0x58f1e0 && off < 0x591440) return 1;
-    for (int k = 0; k < 8; k++) { uint32_t w = *(const uint32_t *)(uintptr_t)(lr + 4 * k);
-        if ((w & 0xfc000000) == 0x94000000) { int64_t imm = w & 0x3ffffff; if (imm & 0x2000000) imm -= 1 << 26; if (off + 4 * k + imm * 4 == 0x58f310) return 1; } }
-    return 0;
-}
-HLE_FORCE("_ZN2nn4time23StandardUserSystemClock3nowEv", "user clock → host time(); while the boss rush forces a zone, the Terror Zone call sites get a different value", int64_t, h_time_now, void) {
-    int64_t tz = atomic_load(&g_dm_tz_time);
-    if (tz && (uint64_t)clock_gettime_nsec_np(CLOCK_MONOTONIC) < atomic_load(&g_dm_tz_live_ns) && tz_site((uint64_t)__builtin_return_address(0))) return tz;
+HLE_FORCE("_ZN2nn4time23StandardUserSystemClock3nowEv", "user clock → host time()", int64_t, h_time_now, void) {
     int64_t ft = fixed_time(); return ft >= 0 ? ft : time(NULL); }
 HLE_FORCE("_ZN2nn4time23StandardUserSystemClock9to_time_tERKNSt3__16chrono10time_pointINS0_17SystemClockTraitsENS3_8durationIlNS2_5ratioILl1ELl1EEEEEEE",
           "the SDK implementation pairs with now(), taken over with it", int64_t, h_time_to_time_t, const int64_t *tp) { return *tp; }
@@ -142,8 +102,8 @@ HLE_FORCE("_ZN2nn4time18ToPosixTimeFromUtcERKNS0_12CalendarTimeE", "UTC calendar
     struct tm tm = {.tm_year = ct->year - 1900, .tm_mon = ct->month - 1, .tm_mday = ct->day, .tm_hour = ct->hour, .tm_min = ct->minute, .tm_sec = ct->second};
     return (int64_t)timegm(&tm);
 }
-// Local time conversion is forced onto the host libc: the SDK's own localtime / localtime_r / mktime have no time zone data and always use UTC (measured on the host: the chronicle's "First Discovered" is produced by
-// main+0xb04d34 calling localtime and then strftime, and was off by 8 hours). The SDK on a real Switch converts by the system time zone, so only following the host system time zone here is consistent;
+// Local time conversion is forced onto the host libc: the SDK's own localtime / localtime_r / mktime have no time zone data and always use UTC
+// (a game's local timestamps were off by the time zone's offset). The SDK on a real Switch converts by the system time zone, so only following the host system time zone here is consistent;
 // the host TZ normally = the system time zone, and is pinned to UTC only for deterministic comparison with DM_FIXED_TIME (main.c). The struct tm layout is the same on both sides (9 ints, long offset, time zone name pointer).
 // gmtime / gmtime_r / timegm are UTC anyway and are not taken over. The same-named pass-through entries in hle_table.c only take effect when the symbol has no definition (the SDK defines them), hence HLE_FORCE
 HLE_FORCE("localtime", "local time → host localtime (follows the system time zone)", struct tm *, h_localtime, const int64_t *t) { time_t v = (time_t)*t; return localtime(&v); }

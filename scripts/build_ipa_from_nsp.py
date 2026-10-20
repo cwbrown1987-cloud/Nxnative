@@ -387,7 +387,7 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
     R += [f'| {n} | {m["kind"]} | `{m["bid"]}` | ' + ' / '.join(f'{z / 2**20:.1f}' for z in m['sizes']) + f' | {m["bss"] / 2**20:.1f} |' for n, m in mods.items()]
     if F['program'] is not None: R.append(f'\n- main.npdm program ID: `{F["program"]:016X}`')
     if (ex / 'ExeFS/main.npdm').exists(): R.append(f'- system resource: {F["sysres"] / 2**20:.0f} MB')
-    R.append(f'- SDK: {", ".join(sorted(F["sdkver"])) or "?"} (Mario: 16_2_0 / 16_2_12; D2R ≈ 12)')
+    R.append(f'- SDK: {", ".join(sorted(F["sdkver"])) or "?"} (Mario: 16_2_0 / 16_2_12)')
     R.append('- SDK components: ' + (', '.join(sorted(F['comps'])) or '—'))
     if F['unity']: R.append('- Unity: ' + ', '.join(sorted(F['unity'])))
     R.append('- engine and API markers: ' + ('; '.join(f'{k} ({", ".join(v)})' for k, v in F['markers'].items()) or '—'))
@@ -619,14 +619,13 @@ def check_build(d, name, g):   # every module's build ID must be the one registe
 
 
 def rewrite(py, repo, exe_dir, out, env, logs, g):
-    """patch_nso.py on every code module at once (each writes its own <module>.* files, main also the boot list, all the same build_src.sha256 line), each with its log.
-    Reused when the modules, patch_nso.py, the boot lists, its switches and capstone are as at the last successful rewrite (Monster Hunter Rise's main alone takes 5.5 min)"""
+    """patch_nso.py on every code module at once (each writes its own <module>.* files, all the same build_src.sha256 line), each with its log.
+    Reused when the modules, patch_nso.py, its switch and capstone are as at the last successful rewrite (Monster Hunter Rise's main alone takes 5.5 min)"""
     import capstone
     mods = g.words('modules')
     PROG.stage('rewrite', step='checking the inputs')
     kf = out.with_name(out.name + '.key')
-    key = fingerprint(('files', [repo / 'dm/tools/patch_nso.py'] + [exe_dir / m for m in mods] + sorted((repo / 'dm/data').glob('bootlist_*.tsv'))), mods, capstone.__version__,
-                      {k: env.get(k) for k in ('DM_PATCH_FRONT', 'DM_PRIVATE_GATES')})
+    key = fingerprint(('files', [repo / 'dm/tools/patch_nso.py'] + [exe_dir / m for m in mods]), mods, capstone.__version__, {k: env.get(k) for k in ('DM_PATCH_FRONT',)})
     if all((out / f'{m}.patched.bin').is_file() for m in mods) and reused(kf, key) is not None:
         PROG.end(f'{", ".join(mods)}, reused (inputs unchanged)'); return
     tmp = out.with_name(out.name + '.partial'); rmtree(tmp); tmp.mkdir(parents=True); logs.mkdir(parents=True, exist_ok=True)
@@ -635,7 +634,7 @@ def rewrite(py, repo, exe_dir, out, env, logs, g):
     try:
         for m in mods:
             logf[m] = open(logs / f'rewrite_{m}.log', 'w')
-            procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(exe_dir / m), str(tmp), m], env=dict(env, DM_RULESET='native'), stdout=logf[m], stderr=subprocess.STDOUT)
+            procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(exe_dir / m), str(tmp), m], env=env, stdout=logf[m], stderr=subprocess.STDOUT)
         left = list(mods)
         while left:
             for m in [m for m in left if procs[m].poll() is not None]:

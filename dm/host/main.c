@@ -6,18 +6,15 @@
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <unistd.h>
-void probe_install(void); void ticks_install(void); void hid_keys_init(void); void tact_prefetch_start(const char *outdir); void tact_chk_init(void); void stubs_report(void); void crash_install(void); void guest_thread_init(void); uint32_t svc_thread_main_init(void);
+void probe_install(void); void hid_keys_init(void); void stubs_report(void); void crash_install(void); void guest_thread_init(void); uint32_t svc_thread_main_init(void);
 typedef void (*fn0)(void); typedef void (*fn2)(uint64_t, uint64_t); typedef void (*fnp)(void *);
 static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("missing symbol %s", n); return p; }
 
 // Game arguments: argv[0] is fixed to "game", and whatever follows "--" is appended as is (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
 static char *g_argv[64] = {"game"}; static int g_argc = 1;
 
-void crash_sample_self(void);
 static void guest_main(void) {
     guest_thread_init();
-    { void inflate_bench_maybe(void); inflate_bench_maybe(); }   // DM_INFLATE_BENCH test mode (for diagnostics, exits when done)
-    crash_sample_self();   // DM_SAMPLE sampling (for diagnostics)
     uint32_t hmain = svc_thread_main_init();   // Main thread handle: x0 of nnosInitialize (stored in an sdk global, used by ThreadManagerImplByHorizon); x1 = pointer to the argument area
     // Copy Start step by step: _init_libc1 = __nnmusl_init_locks (initializes the stdio etc. locks as recursive locks; skipping it self-deadlocks on nested locking in putc) + __init_ssp.
     // The three callbacks passed in by rtld: A only sets an rtld flag (skipped), B = each module's DT_INIT (before nnMain), C = destructors (not done)
@@ -31,11 +28,8 @@ static void guest_main(void) {
     ((fnp)req("_ZN2nn2os11SetHostArgvEPPc"))(g_argv);
     LOG(">>> nninitStartup"); ((fn0)req("nninitStartup"))();
     ((fn0)req("_init_libc2"))();
-    dm_prof_mark("② SDK init (nnosInitialize → nninitStartup)");
     run_module_inits();   // rtld callback B: each module's DT_INIT (global constructors)
-    dm_prof_mark("③ module init_arrays");
     { void dm_guest_spawn_selftest(void); dm_guest_spawn_selftest(); }   // DM_GUEST_SPAWN_TEST self-test of host-created guest threads (hle_guestthread.c)
-    { void dm_padmode_boot(void); dm_padmode_boot(); }   // Touch overlay present: repoint the layout prefixes to the touch version (dm_padmode.c); must happen before the game builds its panels
     { void dm_oodle_job_maybe(void); dm_oodle_job_maybe(); }   // DM_OODLE_JOB: decode a job file with the game's own Oodle and exit (hle_oodle.c, for the offline shader tools)
     LOG(">>> nnMain"); ((fn0)req("nnMain"))();
     LOG("nnMain returned");
@@ -66,7 +60,6 @@ static void *keyrace_thread(void *unused);
 static void host_preload(int argc, char **argv) {
     g_t0_ns = proc_start_mono_ns();
     flags_init();
-    dm_prof_mark("⓪ process creation → host main (dyld)");
     if (argc < 2) die("usage: dmhost <dir> [mod...] [-- game arguments...]");
     // Time zone: the game converts absolute time to local time along two paths, both ending in the host libc -- nn::time::ToCalendarTime (hle_time.c, localtime_r) and the guest libc's
     // localtime_r / mktime (hle_table.c wires them straight to the host). So only when the host follows the system time zone do the original game's screens (chronicle discovery time etc.) show this machine's time.
@@ -101,16 +94,10 @@ static void host_preload(int argc, char **argv) {
     load_modules(argv[1], names, n);
     uint64_t ta = now_ns();
     probe_install();   // DM_PROBE probes (for diagnostics)
-    ticks_install();   // DM_TICKS per-tick state hash (tick-entry observation gate)
-    { void target_rank_install(void); target_rank_install(); }   // Touch version auto-targeting Boss > elite > normal (hle_target.c)
-    hid_keys_init();   // DM_KEYS scripted input (steps driven by UI messages must subscribe before the message appears)
+    hid_keys_init();   // DM_KEYS scripted input
     uint64_t tb = now_ns();
-    tact_chk_init();                // DM_TACTCHK per-block log (logging stops at character select)
-    tact_prefetch_start(argv[1]);   // Background pre-decode of boot blocks (on by default: bootlist.tsv in the build output directory; DM_TACT_PREFETCH=0 turns it off)
-    uint64_t tc = now_ns();
     stubs_report();
-    if (g_flag.bootprof) LOG("① breakdown (after loading): probes / tick gates / keys %.1f ms, prefetch start (reading the list) %.1f ms, stub report %.1f ms", (tb - ta) / 1e6, (tc - tb) / 1e6, (now_ns() - tc) / 1e6);
-    dm_prof_mark("① host loading (read NSO / relocate / forced takeover)");
+    if (g_flag.bootprof) LOG("① breakdown (after loading): probes / keys %.1f ms, stub report %.1f ms", (tb - ta) / 1e6, (now_ns() - tb) / 1e6);
     { void loader_hash_log(void); loader_hash_log(); }   // DM_LOADHASH=1: address-independent hash of the load result (loader.c)
     { void dm_ue_malloc_install(void); dm_ue_malloc_install(); }   // Unreal's allocator on a host malloc zone, for the builds whose constructor call is cut (hle_uemalloc.c)
 }

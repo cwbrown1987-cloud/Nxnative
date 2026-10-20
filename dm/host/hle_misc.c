@@ -3,23 +3,18 @@
 #include "hle.h"
 #include <dirent.h>
 
-// ---------- aoc add-on content (D2R's Reign of the Warlock; other games by the DLC NSPs in the player's folder) / ec shop (excluded) ----------
-// Reign of the Warlock is the only add-on content in the Switch package: AOC 0100726014353001 = add-on content index 1 of the base 0100726014352000.
-// This DLC is only an unlock ticket of about 100 KB, the content itself is already in the main RomFS; main does not import MountAddOnContent and only judges by "is index 1 present".
-// The reimplementation scope requires keeping Reign of the Warlock, so index 1 is reported as owned; what is excluded is the shop (ec), not the DLC itself.
-enum { AOC_WARLOCK = 1 };
+// ---------- aoc add-on content (the DLC NSPs in the player's folder) / ec shop (excluded) ----------
 // Owned add-on content indices (ascending), fixed at the first query:
 //   numeric subdirectories of DM_AOC_DIR: each is one DLC's RomFS, which the packing script extracts only from DLC NSPs really in the player's folder (title ID = base + 0x1000 + index).
 //     Engage: F001 → 1 (E0), F002 → 2 (H0); the content itself is in the 2.0.0 update's RomFS and each DLC package holds one empty marker file; the game calls MountAddOnContent for each index ListAddOnContent returns (hle_fs.c).
-//   No DM_AOC_DIR: D2R (main build db0507f3…) reports {1} (the Warlock expansion, content in the main RomFS, main does not import MountAddOnContent); other builds none --
-//     on a Switch 2 Mario 1.2.1 uses it to tell whether the upgrade pack is owned, and the user has no Mario add-on content files.
-//   DM_AOC_OWNED=0: always none (test switch, for lockstep comparison against ground truth recorded without the DLC installed); DM_AOC_OWNED=1 without DM_AOC_DIR: reports {1}.
+//   No DM_AOC_DIR: none (on a Switch 2 Mario 1.2.1 uses it to tell whether the upgrade pack is owned, and the user has no Mario add-on content files).
+//   DM_AOC_OWNED=0: always none (test switch, for runs without the DLC).
 static int g_aoc[64], g_naoc = -1;
 static int aoc_int_cmp(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
 static void aoc_load(void) {
     if (g_naoc >= 0) return;
     g_naoc = 0;
-    const char *e = getenv("DM_AOC_OWNED"), *dir = getenv("DM_AOC_DIR"); const char *why = "by main build ID";
+    const char *e = getenv("DM_AOC_OWNED"), *dir = getenv("DM_AOC_DIR"); const char *why = "no DM_AOC_DIR";
     if (e && !strcmp(e, "0")) why = "DM_AOC_OWNED=0";
     else if (dir && *dir) {
         why = dir; DIR *d = opendir(dir); struct dirent *ent;
@@ -29,16 +24,11 @@ static void aoc_load(void) {
         }
         if (d) closedir(d);
         qsort(g_aoc, g_naoc, sizeof *g_aoc, aoc_int_cmp);
-    } else {
-        int d2r = 0;
-        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) d2r = !strcmp(g_mod[i].build_id, "db0507f36b84200ac05f75d76ed5026f");
-        if (e) why = "DM_AOC_OWNED";
-        if (d2r || e) g_aoc[g_naoc++] = AOC_WARLOCK;
     }
     char list[256] = ""; for (int i = 0; i < g_naoc; i++) snprintf(list + strlen(list), sizeof list - strlen(list), "%s%d", i ? "," : "", g_aoc[i]);
     LOG("aoc: reporting %d add-on contents {%s} (%s)", g_naoc, list, why);
 }
-HLE_FORCE("_ZN2nn3aoc17CountAddOnContentEv", "add-on content count: length of the owned index list (D2R Reign of the Warlock / DM_AOC_DIR)", int, h_aoc_Count, void) { aoc_load(); return g_naoc; }
+HLE_FORCE("_ZN2nn3aoc17CountAddOnContentEv", "add-on content count: length of the owned index list (DM_AOC_DIR)", int, h_aoc_Count, void) { aoc_load(); return g_naoc; }
 // ListAddOnContent(out, start index, max count): writes out from the owned index list starting at the start index, returns the number written
 HLE_FORCE("_ZN2nn3aoc16ListAddOnContentEPiii", "add-on content list: the owned index list", int, h_aoc_List, int *out, int off, int n) {
     int w = 0; aoc_load();
