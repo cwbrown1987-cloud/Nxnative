@@ -29,7 +29,6 @@ romfs_marker	re_chunk_000.pak.patch_001.pak
 zip_store	.pak:.metallib
 
 # ---- Graphics ----
-graphics	nvn
 # RE Engine fills small textures from the CPU in place (the menu cursor's 8 × 8 BC1 texture: 32 bytes written into a CPU-visible pool, no packaged layout, no WriteTexels), so they must be uploaded
 # from guest memory (without these keys the cursor highlight composited black on black and the menus looked frozen)
 tex_flush_upload	on

@@ -93,12 +93,23 @@ static font_t font_get(int type) {
     pthread_mutex_unlock(&mu);
     return f;
 }
-// The profile's shared_font ttf (Super Mario 3D World + Bowser's Fury, SDK 10): the address points straight at the TTF (past the 8-byte header) and the size excludes the header. That game records shared fonts as type 0 (main+0x975658),
-//   calls no Decode and hands the address as is to ScalableFontEngine::LoadFont; with the header LoadFont fails with error 403 and SetFont with 301, every lookup of the "?" glyph then misses, and main+0x6c73c0 crashes on a null pointer
-static const size_t k_font_skip = DM_GAME_SHARED_FONT_TTF ? 8 : 0;
+// SDK 10 and older (dm_sdk_major; the profile's shared_font overrides): the address points straight at the TTF (past the 8-byte header) and the size excludes the header. Super Mario 3D World + Bowser's Fury
+//   (SDK 10) records shared fonts as type 0 (main+0x975658), calls no Decode and hands the address as is to ScalableFontEngine::LoadFont; with the header LoadFont fails with error 403 and SetFont with 301, every lookup
+//   of the "?" glyph then misses, and main+0x6c73c0 crashes on a null pointer. Odyssey (7), Link's Awakening (8), Age of Calamity (9) and Three Houses (6) take it the same way; SDK 11 and later pass the header to Decode
+static size_t font_skip(void) {
+    static int skip = -1;
+    if (skip < 0) {
+#ifdef DM_GAME_SHARED_FONT_TTF
+        skip = DM_GAME_SHARED_FONT_TTF ? 8 : 0; LOG("shared font: %s (game profile shared_font)", skip ? "the TTF itself" : "BFTTF header + TTF");
+#else
+        int m = dm_sdk_major(); skip = DM_SDK_OLD(m) ? 8 : 0; LOG("shared font: %s (SDK %d)", skip ? "the TTF itself" : "BFTTF header + TTF", m);
+#endif
+    }
+    return (size_t)skip;
+}
 HLE_FORCE("_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE", "shared font load state: loaded (1)", int, h_pl_LoadState, int type) { return font_get(type).p ? 1 : 0; }
-HLE_FORCE("_ZN2nn2pl20GetSharedFontAddressENS0_14SharedFontTypeE", "shared font address → BFTTF header (archive shared_font ttf: the TTF itself)", const void *, h_pl_Addr, int type) { const uint8_t *p = font_get(type).p; return p ? p + k_font_skip : NULL; }
-HLE_FORCE("_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE", "shared font size → 8-byte header + stand-in font file size (archive shared_font ttf: without the header)", size_t, h_pl_Size, int type) { font_t f = font_get(type); return f.p ? f.n - k_font_skip : 0; }
+HLE_FORCE("_ZN2nn2pl20GetSharedFontAddressENS0_14SharedFontTypeE", "shared font address → BFTTF header (archive shared_font ttf: the TTF itself)", const void *, h_pl_Addr, int type) { const uint8_t *p = font_get(type).p; return p ? p + font_skip() : NULL; }
+HLE_FORCE("_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE", "shared font size → 8-byte header + stand-in font file size (archive shared_font ttf: without the header)", size_t, h_pl_Size, int type) { font_t f = font_get(type); return f.p ? f.n - font_skip() : 0; }
 // Every shared font at once (Rhythm Heaven Groove, SDK 21): the SDK asks the pl service for GetSharedFontInOrderOfPriority and, when the fonts are loaded, fills min(count, max) SharedFontData {u32 type; const void *address; size_t size}
 //   (0x18 bytes) with the shared memory base + each font's offset (sdk+0x40f270), then returns whether they are loaded; the game retries every 10 ms until they are (main+0x501f04). The service's offsets point past each font's 8-byte
 //   BFTTF header, and the game hands each address straight to ScalableFontEngine::LoadFont (main+0x501ff0), so this always gives the TTF itself, whatever the profile's shared_font. Unhooked, the SDK opens the pl service and aborts

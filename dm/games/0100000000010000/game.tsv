@@ -21,10 +21,6 @@ modules	main subsdk0 sdk
 romfs_marker	SoundData/SeResourceStd2nd.aras
 zip_store	.aras:.bfsar:.bfstm:.mp4:.szs:.metallib
 
-# SDK 8 / 10: the shared-font address points at the TTF itself, and the game wants NVN API 53
-shared_font	ttf
-device_api	53.313
-
 # ---- Memory ----
 mem_reserve	0x100000000
 mem_alias	0x10000000

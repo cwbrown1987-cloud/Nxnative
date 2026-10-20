@@ -52,6 +52,8 @@ extern pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
 void load_modules(const char *dir, const char **names, int n);
 void run_module_inits(void);
 void *module_sym(module_t *m, const char *name);
+int dm_sdk_major(void);   // SDK major version from the sdk module's version string (loader.c); 0 = unknown
+#define DM_SDK_OLD(major) ((major) > 0 && (major) <= 10)   // SDK 10 and older: NVN API 53, the shared-font address points at the TTF itself
 void *guest_sym(const char *name);
 module_t *module_of(const void *p);
 // Gate dispatch: rewritten svc / timer reads come in through the common entry, ret_addr = the return point of that gate block, regs points to the saved x0..x30

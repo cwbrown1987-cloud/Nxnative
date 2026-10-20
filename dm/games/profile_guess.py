@@ -161,9 +161,6 @@ def guess(F, hooks=None):
                if heap_api else 'main never sets a heap (its memory is its own bss): a 256 MB heap region')
     G['mem_reserve'] = (f'{mem[0]:#x}', mem[3]); G['mem_alias'] = (f'{mem[1]:#x}', ''); G['mem_stack'] = ('0x10000000', ''); G['app_pool'] = (f'{mem[2]:#X}'.replace('0X', '0x'), '')
 
-    if 0 < F['sdk'] <= 10 and 'nvnBootstrapLoader' in imp:   # SDK 8 / 10 NVN games (Link's Awakening, Super Mario 3D World, Odyssey, the KTGL games); Hades (SDK 9, Vulkan) keeps the defaults
-        G['shared_font'] = ('ttf', f'SDK {F["sdk"]}: the shared-font address points at the TTF itself')
-        G['device_api'] = ('53.313', f'SDK {F["sdk"]}: the game wants NVN API 53')
     if 'Unity IL2CPP' in F.get('main_markers', ()):
         G['nvn_tex_base'] = ('0x168', 'Unity: separate texture bindings (Engage)'); G['nvn_tex_slots'] = ('128', '')
     if F.get('main_markers', set()) & {'Unreal', 'Unreal 4'} and R['exts'].get('.pak') and 'nvnBootstrapLoader' in imp:
@@ -229,8 +226,8 @@ def heap_signals(log, g):
 
 
 # ---- Checking the rules against the hand-made profiles ----
-DEFAULTS = {'graphics': 'nvn', 'shader_vk_capture': 'off', 'shader_main_glslc': 'off', 'shader_separable': 'off', 'shader_glslc_capture': 'off', 'shader_ue_decode': 'off', 'shared_font': 'bfttf',
-            'device_api': '55.15', 'op_mode': 'console', 'pad_layout': 'simple', 'nvn_tex_base': '0x20', 'nvn_tex_slots': '32'}
+DEFAULTS = {'graphics': 'nvn', 'shader_vk_capture': 'off', 'shader_main_glslc': 'off', 'shader_separable': 'off', 'shader_glslc_capture': 'off', 'shader_ue_decode': 'off',
+            'op_mode': 'console', 'pad_layout': 'simple', 'nvn_tex_base': '0x20', 'nvn_tex_slots': '32'}
 NO_SIGNAL = {'pad_layout', 'op_mode'}   # no static signal outside the engine presets; the player switches the pad layout in game, DM_OPMODE in env.txt sets the mode
 
 

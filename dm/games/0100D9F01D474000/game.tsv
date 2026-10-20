@@ -13,7 +13,6 @@ program_id	0100D9F01D474000
 name	Rhythm Heaven Groove
 ipa	RhythmHeavenGroove.ipa
 app_category	public.app-category.games
-pad_layout	simple
 # Handheld with Boost: docked means a TV to the game, which then runs a latency calibration (press A on every fourth beat) until one passes; a phone is its own screen.
 #   Boost keeps the 1920x1080 draw size (handheld Normal draws 1280x720); the game takes it from the performance mode alone (hle_oe.c)
 op_mode	handheld
@@ -38,7 +37,6 @@ mem_stack	0x10000000
 app_pool	0xCD500000
 
 # ---- Graphics ----
-graphics	nvn
 
 # ---- NVN driver constant segments (Mario's values, the translator's built-in layout; every shader binding decodes with them) ----
 nvn_tex_base	0x20

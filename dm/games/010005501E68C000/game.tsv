@@ -12,7 +12,6 @@ program_id	010005501E68C000
 name	Ace Attorney Investigations Collection
 ipa	AceAttorneyInvestigations.ipa
 app_category	public.app-category.adventure-games
-pad_layout	simple
 
 # ---- Versions ----
 # only the merged 1.0.0.2 copy is extracted
