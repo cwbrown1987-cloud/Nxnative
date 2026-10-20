@@ -114,9 +114,9 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
         if (!vc) { dispatch_semaphore_signal(done); return; }
         [vc presentViewController:ac animated:YES completion:nil];
     });
-    guest_clock_freeze_for(2, 1);
+    // The guest clock keeps running meanwhile, as on the Switch (hle_swkbd.c): a freeze here as well stopped Octopath Traveler 0's frame loop for as long as the box was up and made its sound stutter
+    // (4,977 ms and 2,577 ms frames, 5,181 wakeups a second). The inline keyboard freezes around its own call (hle_swkbd.c)
     dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
-    guest_clock_freeze_for(2, 0);
     if (!r) return 0;
     snprintf(out, out_cap, "%s", text.UTF8String ? text.UTF8String : "");
     return 1;

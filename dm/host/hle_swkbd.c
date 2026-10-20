@@ -72,8 +72,8 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
     const char *script = getenv("DM_KBD");
     // The guest clock keeps running while the keyboard is up, as on the Switch: the applet blocks the calling thread and the game's other threads go on in real time. d2r-mobile froze it here
     // (monsters should not attack while the player typed), which left the threads that wait on the clock spinning: Octopath Traveler 0's sound stuttered and the input box lagged on an iPhone
-    // (5,035 wakeups a second while the box was up, about 1,800 otherwise; 7,936 on the Mac with the box held 8 s). The inline keyboard below still freezes it: there the host's input box
-    // blocks a game that on hardware keeps running and steps by real time (Monster Hunter Rise)
+    // (5,035 wakeups a second while the box was up, about 1,800 otherwise; 7,936 on the Mac with the box held 8 s). The iOS input box froze it a second time around its own wait (front_ios.m),
+    // which kept the stutter until that went too. The inline keyboard below still freezes it: there the host's input box blocks a game that on hardware keeps running and steps by real time (Monster Hunter Rise)
     // Test switch DM_TEST_SWKBD_HOLD_MS=<ms> (with DM_KBD): the keyboard stays up that long before DM_KBD's text is returned, the way a player types into the input box (for reproducing on the Mac what the game's other threads do meanwhile)
     static int hold = -1; if (hold < 0) { const char *h = getenv("DM_TEST_SWKBD_HOLD_MS"); hold = h ? atoi(h) : 0; }
     if (script && hold > 0) usleep((useconds_t)hold * 1000);
