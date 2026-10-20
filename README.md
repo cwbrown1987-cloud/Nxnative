@@ -41,6 +41,7 @@ All of these are tested on an iPhone and playable:
 | Ace&nbsp;Attorney&nbsp;Investigations&nbsp;Collection | ~7&nbsp;GB | |
 | Hades&nbsp;II | ~4&nbsp;GB | |
 | Unicorn&nbsp;Overlord | ~4&nbsp;GB | |
+| Rhythm&nbsp;Heaven&nbsp;Groove | ~3&nbsp;GB | |
 
 | | |
 |:---:|:---:|
@@ -52,9 +53,9 @@ All of these are tested on an iPhone and playable:
 | ![Fire Emblem: Three Houses](docs/images/fire-emblem-three-houses.jpg)<br>Fire Emblem: Three Houses | ![Super Mario Galaxy](docs/images/super-mario-galaxy.jpg)<br>Super Mario Galaxy |
 | ![The Legend of Zelda: Tears of the Kingdom](docs/images/zelda-tears-of-the-kingdom.jpg)<br>The Legend of Zelda: Tears of the Kingdom | ![Monster Hunter Rise](docs/images/monster-hunter-rise.jpg)<br>Monster Hunter Rise |
 | ![Ace Attorney Investigations Collection](docs/images/ace-attorney-investigations.jpg)<br>Ace Attorney Investigations Collection | ![Hades II](docs/images/hades-ii.jpg)<br>Hades II |
-| ![Unicorn Overlord](docs/images/unicorn-overlord.jpg)<br>Unicorn Overlord | |
+| ![Unicorn Overlord](docs/images/unicorn-overlord.jpg)<br>Unicorn Overlord | ![Rhythm Heaven Groove](docs/images/rhythm-heaven-groove.jpg)<br>Rhythm Heaven Groove |
 
-**On the Mac, not yet tested on an iPhone:** OCTOPATH TRAVELER 0 (update 1.0.5, ~4&nbsp;GB IPA). On the Mac it plays from a new game through character creation and the story opening into free play, and its saves load. Its IPA is packed the same way; whether it runs on a phone is not known yet. Rhythm Heaven Groove (base game 1.0.0, ~3.2&nbsp;GB IPA). On the Mac it plays from a first boot through the setup and the main menu into its first rhythm game, with sound; it runs in handheld mode, which skips the game's TV latency calibration. Its IPA is packed the same way and not yet run on a phone either.
+**On the Mac, not yet tested on an iPhone:** OCTOPATH TRAVELER 0 (update 1.0.5, ~4&nbsp;GB IPA). On the Mac it plays from a new game through character creation and the story opening into free play, and its saves load. Its IPA is packed the same way; whether it runs on a phone is not known yet.
 
 Needs iOS / iPadOS 26 or later on an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later: the games' textures are BC-compressed, and older iPhones can't read that format. Other games aren't supported yet. For them the script writes a survey and still tries its best to pack an IPA, guessing the game's settings; such an IPA may not start.
 
