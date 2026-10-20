@@ -43,6 +43,7 @@ All of these are tested on an iPhone and playable:
 | Unicorn&nbsp;Overlord | ~4&nbsp;GB | |
 | Rhythm&nbsp;Heaven&nbsp;Groove | ~3&nbsp;GB | |
 | Octopath&nbsp;Traveler&nbsp;0 | ~4&nbsp;GB | Upgraded to 60 fps (30 fps on Switch); the upgrade needs update 1.0.5, it does not work with other versions |
+| Pokémon&nbsp;Legends:&nbsp;Z-A | ~6&nbsp;GB | |
 
 | | |
 |:---:|:---:|
@@ -55,7 +56,7 @@ All of these are tested on an iPhone and playable:
 | ![The Legend of Zelda: Tears of the Kingdom](docs/images/zelda-tears-of-the-kingdom.jpg)<br>The Legend of Zelda: Tears of the Kingdom | ![Monster Hunter Rise](docs/images/monster-hunter-rise.jpg)<br>Monster Hunter Rise |
 | ![Ace Attorney Investigations Collection](docs/images/ace-attorney-investigations.jpg)<br>Ace Attorney Investigations Collection | ![Hades II](docs/images/hades-ii.jpg)<br>Hades II |
 | ![Unicorn Overlord](docs/images/unicorn-overlord.jpg)<br>Unicorn Overlord | ![Rhythm Heaven Groove](docs/images/rhythm-heaven-groove.jpg)<br>Rhythm Heaven Groove |
-| ![Octopath Traveler 0](docs/images/octopath-traveler-0.jpg)<br>Octopath Traveler 0 | |
+| ![Octopath Traveler 0](docs/images/octopath-traveler-0.jpg)<br>Octopath Traveler 0 | ![Pokémon Legends: Z-A](docs/images/pokemon-legends-z-a.jpg)<br>Pokémon Legends: Z-A |
 
 Needs iOS / iPadOS 26 or later on an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later: the games' textures are BC-compressed, and older iPhones can't read that format. Other games aren't supported yet. For them the script writes a survey and still tries its best to pack an IPA, guessing the game's settings; such an IPA may not start.
 
