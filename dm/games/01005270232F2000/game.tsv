@@ -1,4 +1,4 @@
-# OCTOPATH TRAVELER 0: Square Enix, Unreal Engine 4.26 / 4.27 (mobile renderer, SF_GLSL_SWITCH_MOBILE shaders), SDK 19.3.13, NVN, CRIWARE sound and movies; update 1.0.5.
+# OCTOPATH TRAVELER 0: Square Enix, Unreal Engine 5 (the paged global distance field shaders and the LowLevelTasks task system; mobile renderer, SF_GLSL_SWITCH_MOBILE shaders), SDK 19.3.13, NVN, CRIWARE sound and movies; update 1.0.5.
 # Started from the NSP script's provisional profile (dm/games/profile_guess.py) and brought up on the Mac (docs/agents)
 
 # ---- Identity ----
@@ -43,6 +43,8 @@ nvn_samp_base	0x568
 nvn_img_base	0x120
 nvn_img_slots	8
 nvn_ssbo_bases	vs=0x110 ps=0x510 cs=0x310
+# 61 vertex shaders pick one of several c2 table slots at run time (texture slots 0-10, samplers 0-4), which the translator cannot trace to one slot: slot indices in c2, the bound slots in its arrays
+tex_dyn_slots	on
 
 # ---- Shader split ----
 # The decoded shader code archives: the engine's global shaders and the game's material shaders

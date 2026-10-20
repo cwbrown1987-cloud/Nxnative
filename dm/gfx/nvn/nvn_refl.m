@@ -30,6 +30,25 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             NSString *k = b[@"kind"]; nvn_rbind *r = &o->b[o->nb];
             id rg = b[@"reg"]; int reg = [rg isKindOfClass:[NSNumber class]] ? [rg intValue] : -1, aid = [b[@"arg_id"] intValue];
             r->aid = (uint16_t)aid; r->reg = reg < 0 ? 0 : (uint16_t)reg;
+            NSString *nm = b[@"msl_name"], *ty = b[@"msl_type"];
+            // Ryujinx's fallback for a handle it cannot trace to one slot (handle type 4: <stage>_<t|tb|s>_cb0_40000000, declared array<element, n>); the build leaves it without a slot
+            // ('tbuf' / 'tex' with no reg, '?' for the samplers). Octopath Traveler 0's vertex shaders pick one of several c2 table slots at run time (61 shaders, slots 0-10)
+            if ([nm isKindOfClass:[NSString class]] && [nm hasSuffix:@"_cb0_40000000"] && [ty isKindOfClass:[NSString class]] && [ty hasPrefix:@"array<"] && [ty hasSuffix:@">"]) {
+                NSRange c = [ty rangeOfString:@", " options:NSBackwardsSearch];
+                int n = c.location == NSNotFound ? 0 : [[ty substringWithRange:NSMakeRange(NSMaxRange(c), ty.length - 1 - NSMaxRange(c))] intValue];
+                NSString *el = c.location == NSNotFound ? @"" : [ty substringWithRange:NSMakeRange(6, c.location - 6)];
+                if (n < 1 || n > 32) FAIL("B binding %s: array of %d", nm.UTF8String, n);
+                if ([el hasPrefix:@"sampler"]) r->kind = NVN_RB_SAMPD;
+                else if ([el hasPrefix:@"texture_buffer"]) { r->kind = NVN_RB_TEXD; r->dtt = (uint8_t)MTLTextureTypeTextureBuffer; uint8_t tt; dummy_kind(el, &tt, &r->dpf); }
+                else if ([el hasPrefix:@"texture"] || [el hasPrefix:@"depth"]) { r->kind = NVN_RB_TEXD; dummy_kind(el, &r->dtt, &r->dpf); }
+                else FAIL("B binding %s: dynamic handle array of %s", nm.UTF8String, el.UTF8String);
+                r->n = (uint8_t)n; o->dyn = 1; o->nb++; continue;
+            }
+            // SPIRV-Cross's MSL 2.3 image atomics: the image (texture_buffer / texture2d… <uint> or <int>) and, for the atomics, a device pointer to the same memory, <image name>_atomic, which the build
+            // reads as a second image of the same slot. Octopath Traveler 0: 2,084 shaders (Unreal's buffer images: cp_i_cb2_4C_r32ui_atomic)
+            if ([k isEqualToString:@"img"] && reg >= 0 && [nm isKindOfClass:[NSString class]] && [nm hasSuffix:@"_atomic"] && [ty isKindOfClass:[NSString class]] && [ty hasPrefix:@"device atomic_"]) {
+                r->kind = NVN_RB_IMGA; o->nb++; continue;
+            }
             if ([k isEqualToString:@"cbuf"]) r->kind = NVN_RB_CBUF;
             else if ([k isEqualToString:@"samp"]) r->kind = NVN_RB_SAMP;
             else if ([k isEqualToString:@"samp_tex"]) r->kind = NVN_RB_SAMPT;
