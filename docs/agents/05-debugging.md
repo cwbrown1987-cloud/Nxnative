@@ -96,6 +96,8 @@ To see the order of events, put temporary observation gates (`OBS` in `patch_nso
 4. GPU allocated climbing while the residency set, `shared textures` and the upload counts stay flat: retired objects kept alive by an autorelease pool that never drains. Any objc call on the guest submit thread outside `g_sub_pool` leaks what it autoreleases (Metroid Dread; Breath of the Wild, GitHub issue #9). Build the host with the suspect wrapped in `@autoreleasepool` and compare.
 5. `serial objects` climbing by the same amount every frame with GPU memory flat: entries the serial table never deletes. A census of `g_by_serial` by class and size in `mtl_mem_stat` shows which (BotW: finalized textures replay resolved again; they now go to the small table counted as `finalized textures still referenced`).
 
+6. Address space rather than memory (an iPhone has about 5 GB of it without the extended virtual addressing entitlement): `DM_ALIAS_WINDOWS=<MB>` logs every 30 s how much of each window of that size in the alias region is mapped (windows aligned to their size in absolute addresses). For an allocator that reserves fixed windows and commits each from its start, the windows are its pools: Unreal's FMallocBinned3 in Octopath Traveler 0 showed 74 pools of 512 MB holding 732 MB together, the largest 68 MB, so no smaller uniform window fitted ([03](03-bringup.md)). Unreal's own heap on the host malloc zone (`hle_uemalloc.c`) logs its peak as `[mem] Unreal heap … in use`.
+
 Instruments' Metal Resource Events didn't record this process from the command line (`xctrace record --launch`, with `--env` for the variables); the in-host probes were faster.
 
 ## Save failures

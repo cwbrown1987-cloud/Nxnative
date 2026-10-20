@@ -489,12 +489,12 @@ def write_profile(pdir, app, f):
          '# ---- Memory ----', *key('mem_reserve'), *key('mem_alias'), *key('mem_stack'), *key('app_pool'), '',
          '# ---- NVN driver constant segments (Mario\'s values, the translator\'s built-in layout, unless the engine says otherwise) ----',
          *key('nvn_tex_base', '0x20'), *key('nvn_tex_slots', '32'), f'nvn_samp_base{T}0x568', f'nvn_img_base{T}0x120', f'nvn_img_slots{T}8', f'nvn_ssbo_bases{T}vs=0x110 ps=0x510 cs=0x310', '',
-         '# ---- Shader split ----', f'shader_groups{T}{" ".join(groups) or "/=romfs"}', f'shader_note{T}{name} shaders (provisional profile)',
-         *key('shader_main_glslc'), *key('shader_separable'), *key('shader_glslc_capture')]
+         '# ---- Shader split ----', *key('shader_groups', " ".join(groups) or "/=romfs"), f'shader_note{T}{name} shaders (provisional profile)',
+         *key('shader_main_glslc'), *key('shader_separable'), *key('shader_glslc_capture'), *key('shader_ue_decode')]
     (pdir / 'game.tsv').write_text('\n'.join(L) + '\n', encoding='utf-8')
     for n, text in EMPTY_TABLES.items(): (pdir / n).write_text(text)
     say(f'wrote a provisional game profile: {pdir / "game.tsv"}')
-    for k in ('graphics', 'modules', 'shader_vk_capture', 'shader_main_glslc', 'shader_glslc_capture', 'mem_reserve', 'op_mode'):
+    for k in ('graphics', 'modules', 'shader_vk_capture', 'shader_main_glslc', 'shader_glslc_capture', 'shader_ue_decode', 'mem_reserve', 'op_mode'):
         if k in G and G[k][1]: say(f'  {k} {G[k][0]}: {G[k][1]}')
 
 
@@ -744,6 +744,48 @@ def capture_glslc(repo, dirs, pkg_ver, patched, work, env, logs, g):
     PROG.end(f'{len(got)} shaders in {hms(time.time() - t0)}')
 
 
+UE_DECODE_SECS = 300   # the longest Oodle decode run: Octopath Traveler 0's 10,596 shaders take about 10 s, the boot up to nnMain included
+
+
+def ue_stamp(d):   # what an extraction's decoded shader archives were made from: its paks (paths and sizes)
+    return ''.join(f'{p.relative_to(d / "RomFS")}\t{p.stat().st_size}\n' for p in sorted((d / 'RomFS').rglob('*.pak')))
+
+
+def decode_ue_shaders(repo, dirs, pkg_ver, patched, work, env, logs, g):
+    """Profiles with shader_ue_decode on (Octopath Traveler 0): Unreal Engine keeps its shaders in the shader code archives of its paks, each shader Oodle-compressed, and only the game's own Oodle
+    decodes them. dm/gfx/tools/uepak.py takes the archives out of the paks (the pak index is AES-encrypted with a key from main) and writes one Oodle job; the game's code decodes it in the Mac host
+    (DM_OODLE_JOB, dm/host/hle_oodle.c: right before nnMain, then the host exits), and the decoded archives go to <version dir>/ue_shaders, where shader_split.py reads them.
+    The job runs the packed version's code (Oodle's format does not change between builds). A folder whose stamp matches its paks is reused"""
+    sys.path.insert(0, str(repo / 'dm/gfx/tools')); import uepak
+    todo = {v: d for v, d in dirs.items() if not ((d / 'ue_shaders/stamp').exists() and (d / 'ue_shaders/stamp').read_text() == ue_stamp(d))}
+    PROG.stage('UE shader decode')
+    if not todo:
+        say(f'reusing the decoded shader archives: {", ".join(str(d / "ue_shaders") for d in dirs.values())}')
+        PROG.end('reused'); return
+    PROG.set(step='building the Mac host')
+    host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
+    t0, total = time.time(), 0
+    for v, d in todo.items():
+        jd, rd, log = work / f'tmp/ue_job_{v}', work / 'tmp/ue_run', logs / f'ue_decode_{v}.log'
+        rmtree(jd); rmtree(rd)
+        for s in ('save', 'temp'): (rd / s).mkdir(parents=True)
+        PROG.set(step=f'{v}: shader archives out of the paks')
+        listing, n = uepak.job(str(d / 'RomFS'), str(d / 'ExeFS/main'), str(jd))
+        if not listing: raise BuildError(f'the profile has shader_ue_decode on, but no pak under {d / "RomFS"} holds a shader code archive')
+        say(f'{v}: ' + '; '.join(f'{x["name"]} {x["shaders"]:,} shaders' for x in listing) + f'; decoding {n:,} with the game\'s Oodle in the Mac host')
+        PROG.set(step=f'{v}: decoding {n:,} shaders in the Mac host')
+        henv = dict(env, DM_ROMFS=str(dirs[pkg_ver] / 'RomFS'), DM_SAVE=str(rd / 'save'), DM_TEMP=str(rd / 'temp'), DM_MSL_DIR=str(rd / 'msl'), DM_OODLE_JOB=str(jd / 'oodle.job'))
+        rc = boot_mac(host, patched, henv, rd, log, UE_DECODE_SECS)
+        if rc != 0 or not (jd / 'oodle.job.out').exists():
+            PROG.end(ok=False)
+            PROG.say(f'---- last lines of {log} ----\n' + ''.join(collections.deque(open(log, errors='replace'), maxlen=20)).rstrip('\n'))
+            raise BuildError(f'the Oodle decode run stopped with exit {rc} (host output: {log})')
+        out = d / 'ue_shaders.partial'; rmtree(out)
+        uepak.finish(str(jd), str(out)); (out / 'stamp').write_text(ue_stamp(d))
+        swap_in(out, d / 'ue_shaders'); rmtree(jd); rmtree(rd); total += n
+    PROG.end(f'{total:,} shaders in {hms(time.time() - t0)}')
+
+
 VK_CAPTURE_SECS = 120   # the longest Vulkan capture run: Super Mario Galaxy creates its 3,089 modules within 6 s of its first one (about 15 s after boot on an M4 Pro)
 
 
@@ -878,7 +920,8 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False):
     PROG.stage('shader split', step='checking the inputs')   # then a spinner: shader_split.py writes the package and the tables only at the end
     kf = pkg.with_name(pkg.name + '.key')
     key = None if provisional or ALLOW_DAMAGED else fingerprint(('files', tool_files(repo)), ('files', profile_files(g)),
-        *[x for r, m in zip(roms, mains) for x in (('files', [m]), ('tree', r), ('files', sorted((r.parent / 'glslc_capture').glob('*.glslc'))))])
+        *[x for r, m in zip(roms, mains) for x in (('files', [m]), ('tree', r), ('files', sorted((r.parent / 'glslc_capture').glob('*.glslc'))),
+                                                   ('files', sorted((r.parent / 'ue_shaders').glob('*.ushaderbytecode'))))])
     if key and pkg.is_dir() and (note := reused(kf, key)) is not None:
         PROG.end(f'{note}, reused (inputs unchanged)'); return key
     PROG.set(step='splitting')
@@ -1151,8 +1194,9 @@ def main(args=None):
     if free_gb(work) < gb and not all((ex / v).exists() for v in versions): raise BuildError(f'less than {gb:.0f} GB free on the volume of {work}')
     glslc = gfx == 'nvn' and g.get('shader_glslc_capture', 'off') == 'on'   # shaders the game compiles at run time, captured in the Mac host (capture_glslc)
     vkcap = gfx == 'vulkan' and g.get('shader_vk_capture', 'off') == 'on'   # SPIR-V shaders the game generates at run time, captured in the Mac host (capture_vk)
+    uedec = gfx == 'nvn' and g.get('shader_ue_decode', 'off') == 'on'   # Unreal Engine shaders, Oodle-compressed in the paks' shader code archives, decoded in the Mac host (decode_ue_shaders)
     heapck = provisional and HEAP_CHECK and not args.no_heap_check and not heap_checked(g)   # the heap check, when the game needs one (once per provisional profile: it stamps the profile)
-    PROG.plan(1 + len(versions) + bool(fam['dlc']) + glslc + vkcap + (5 if gfx == 'nvn' else 4))   # nx_extract, each version's extraction, the DLC, rewrite, the GLSLC / Vulkan capture, shader split + iOS shaders (or the Vulkan shaders), app build, IPA pack
+    PROG.plan(1 + len(versions) + bool(fam['dlc']) + glslc + vkcap + uedec + (5 if gfx == 'nvn' else 4))   # nx_extract, each version's extraction, the DLC, rewrite, the GLSLC / Vulkan capture or the UE shader decode, shader split + iOS shaders (or the Vulkan shaders), app build, IPA pack
     PROG.stage('build nx_extract')
     nx = build_nx_extract(repo, work, logs, env)
     PROG.end()
@@ -1180,6 +1224,7 @@ def main(args=None):
         if heapck and pg.heap_check_needed(game / 'ExeFS'):
             PROG.add(1); g = heap_check(repo, game, patched, work, env, logs, g)
     if glslc: capture_glslc(repo, {v: dirs[v] for v in need}, pkg_ver, patched, work, env, logs, g)
+    if uedec: decode_ue_shaders(repo, {v: dirs[v] for v in need}, pkg_ver, patched, work, env, logs, g)
     sh = work / 'shader'
     if gfx == 'vulkan':   # the packed version's merged RomFS holds the SPIR-V files the game loads; a capture holds those it generates
         cap = capture_vk(repo, game, patched, work, env, logs, g) if vkcap else None

@@ -166,6 +166,14 @@ def guess(F, hooks=None):
         G['device_api'] = ('53.313', f'SDK {F["sdk"]}: the game wants NVN API 53')
     if 'Unity IL2CPP' in F.get('main_markers', ()):
         G['nvn_tex_base'] = ('0x168', 'Unity: separate texture bindings (Engage)'); G['nvn_tex_slots'] = ('128', '')
+    if F.get('main_markers', set()) & {'Unreal', 'Unreal 4'} and R['exts'].get('.pak') and 'nvnBootstrapLoader' in imp:
+        G['shader_ue_decode'] = ('on', 'Unreal Engine with paks: the shaders are Oodle-compressed in the paks\' shader code archives (Octopath Traveler 0), decoded by booting the game on the Mac')
+        G['shader_separable'] = ('on', 'Unreal combines vertex and pixel shaders per draw from its pipeline state')
+        G['shader_groups'] = ('ShaderArchive-Global-=global ShaderArchive-=game', 'the decoded archives: the engine\'s global shaders and the game\'s material shaders')
+        G['nvn_tex_base'] = ('0x168', 'Unreal: separate texture bindings (Octopath Traveler 0, measured over all its shaders)'); G['nvn_tex_slots'] = ('128', '')
+        G['mem_reserve'] = ('0x1028000000', 'Unreal: nninitStartup reserves a 62 GB address region and its FMallocBinned3 takes 37 GB of it, so a 64 GB alias region for the bring-up on the Mac. '
+                            'An iPhone needs the allocator cut for the build and a capped region (game_args), as Octopath Traveler 0\'s profile (docs/agents/03)')
+        G['mem_alias'] = ('0x1008000000', '')
     G.update(preset)
     return G
 
@@ -221,7 +229,7 @@ def heap_signals(log, g):
 
 
 # ---- Checking the rules against the hand-made profiles ----
-DEFAULTS = {'graphics': 'nvn', 'shader_vk_capture': 'off', 'shader_main_glslc': 'off', 'shader_separable': 'off', 'shader_glslc_capture': 'off', 'shared_font': 'bfttf',
+DEFAULTS = {'graphics': 'nvn', 'shader_vk_capture': 'off', 'shader_main_glslc': 'off', 'shader_separable': 'off', 'shader_glslc_capture': 'off', 'shader_ue_decode': 'off', 'shared_font': 'bfttf',
             'device_api': '55.15', 'op_mode': 'console', 'pad_layout': 'simple', 'nvn_tex_base': '0x20', 'nvn_tex_slots': '32'}
 NO_SIGNAL = {'pad_layout', 'op_mode'}   # no static signal outside the engine presets; the player switches the pad layout in game, DM_OPMODE in env.txt sets the mode
 

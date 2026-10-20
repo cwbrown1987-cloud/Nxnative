@@ -17,6 +17,7 @@ pthread_key_t g_keyres[2], g_keyaspect, g_keyaspectui;   // g_keyaspect: aspect 
 enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_KRES0, KEY_KRES1, KEY_KASPECT, KEY_KASPECTUI, KEY_N };
 
 uint64_t resolve_import(module_t *m, const char *name);
+int hle_implements(const char *name);
 void gate_register(uint64_t ret_addr, const char *kind, int arg, uint64_t orig);
 
 static pthread_key_t key_value(unsigned i) {
@@ -252,7 +253,7 @@ static void relocate(module_t *m) {
         case DT_RELR: relr = d->d_un.d_ptr; break;
         case DT_RELRSZ: relrsz = d->d_un.d_val; break;
     }
-    int cnt[3] = {0}, nint = 0;
+    int cnt[3] = {0}, nint = 0, nweak0 = 0;
     unsigned nrelr = relr ? relr_apply(m, relr, relrsz, (uint64_t)m->base) : 0;
     const Elf64_Rela *tabs[2] = {(const Elf64_Rela *)(m->base + rela), (const Elf64_Rela *)(m->base + jmprel)};
     uint64_t sizes[2] = {relasz, pltsz};
@@ -273,7 +274,12 @@ static void relocate(module_t *m) {
                 if (!v) v = self;
                 if (v != self && nint++ < 8) LOG("%s: %s bound to an earlier module's definition (%s)", m->name, m->strtab + s->st_name, module_of((void *)v) ? module_of((void *)v)->name : "?");
             }
-            if (!v) v = resolve_sym(m, m->strtab + s->st_name);
+            // An undefined weak symbol that no module defines and the host does not implement is 0, as Horizon's rtld binds it: the code tests its address before calling it.
+            // Octopath Traveler 0's main imports the thread_local init function _ZTHN13LowLevelTasks5FTask10ActiveTaskE weakly; a named stub made it look defined and the game called it
+            const char *nm = m->strtab + s->st_name;
+            int weak0 = !v && !s->st_shndx && ELF64_ST_BIND(s->st_info) == STB_WEAK && !guest_sym(nm) && !hle_implements(nm);
+            if (weak0 && nweak0++ < 8) LOG("%s: undefined weak %s bound to 0", m->name, nm);
+            if (!v && !weak0) v = resolve_sym(m, nm);
             if (type == R_AARCH64_JUMP_SLOT) { *where = v; cnt[2]++; }
             else { *where = v + r->r_addend; cnt[1]++; }       // ABS64 / GLOB_DAT
         }

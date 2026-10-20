@@ -25,15 +25,18 @@ static void guest_main(void) {
     LOG(">>> nnosInitialize"); ((fn2)req("nnosInitialize"))(hmain, 0);
     ((fn0)req("_init_libc1"))();
     LOG(">>> nninitInitializeSdkModule"); ((fn0)req("nninitInitializeSdkModule"))();
+    // The game arguments are in place before nninitStartup, as on hardware (nn::os takes them from the process argument area in nnosInitialize): Unreal Engine's nninitStartup
+    // (Octopath Traveler 0, main+0x12afc) reads -SwitchVirtualAddressSpaceSize= and its other memory options there
+    ((fnp)req("_ZN2nn2os11SetHostArgcEi"))((void *)(uint64_t)g_argc);
+    ((fnp)req("_ZN2nn2os11SetHostArgvEPPc"))(g_argv);
     LOG(">>> nninitStartup"); ((fn0)req("nninitStartup"))();
     ((fn0)req("_init_libc2"))();
     dm_prof_mark("② SDK init (nnosInitialize → nninitStartup)");
     run_module_inits();   // rtld callback B: each module's DT_INIT (global constructors)
     dm_prof_mark("③ module init_arrays");
-    ((fnp)req("_ZN2nn2os11SetHostArgcEi"))((void *)(uint64_t)g_argc);
-    ((fnp)req("_ZN2nn2os11SetHostArgvEPPc"))(g_argv);
     { void dm_guest_spawn_selftest(void); dm_guest_spawn_selftest(); }   // DM_GUEST_SPAWN_TEST self-test of host-created guest threads (hle_guestthread.c)
     { void dm_padmode_boot(void); dm_padmode_boot(); }   // Touch overlay present: repoint the layout prefixes to the touch version (dm_padmode.c); must happen before the game builds its panels
+    { void dm_oodle_job_maybe(void); dm_oodle_job_maybe(); }   // DM_OODLE_JOB: decode a job file with the game's own Oodle and exit (hle_oodle.c, for the offline shader tools)
     LOG(">>> nnMain"); ((fn0)req("nnMain"))();
     LOG("nnMain returned");
 }
@@ -89,6 +92,11 @@ static void host_preload(int argc, char **argv) {
     int i = 2;
     for (; i < argc && strcmp(argv[i], "--") && n < MAX_MOD; i++) names[n++] = argv[i];
     if (i < argc && !strcmp(argv[i], "--")) for (i++; i < argc && g_argc < 63; i++) g_argv[g_argc++] = argv[i];
+    else if (*DM_GAME_ARGS) {   // no "--" on the command line (the iOS app, the NSP script's Mac runs): the game profile's game_args, split at spaces
+        char *s = strdup(DM_GAME_ARGS);
+        for (char *t = strtok(s, " "); t && g_argc < 63; t = strtok(NULL, " ")) g_argv[g_argc++] = t;
+        LOG("game arguments from the game profile: %s", DM_GAME_ARGS);
+    }
     if (!n) { static const char *def[] = DM_GAME_MODULES; for (int k = 0; k < DM_GAME_NMOD && n < MAX_MOD; k++) names[n++] = def[k]; }   // default module list from the game profile's modules (Mario: main sdk)
     load_modules(argv[1], names, n);
     uint64_t ta = now_ns();
@@ -104,6 +112,7 @@ static void host_preload(int argc, char **argv) {
     if (g_flag.bootprof) LOG("① breakdown (after loading): probes / tick gates / keys %.1f ms, prefetch start (reading the list) %.1f ms, stub report %.1f ms", (tb - ta) / 1e6, (tc - tb) / 1e6, (now_ns() - tc) / 1e6);
     dm_prof_mark("① host loading (read NSO / relocate / forced takeover)");
     { void loader_hash_log(void); loader_hash_log(); }   // DM_LOADHASH=1: address-independent hash of the load result (loader.c)
+    { void dm_ue_malloc_install(void); dm_ue_malloc_install(); }   // Unreal's allocator on a host malloc zone, for the builds whose constructor call is cut (hle_uemalloc.c)
 }
 static struct { int argc; char **argv; pthread_t th; _Atomic int started; } g_pre;
 static void *preload_thread(void *a) { (void)a; host_preload(g_pre.argc, g_pre.argv); return NULL; }

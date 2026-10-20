@@ -44,6 +44,13 @@ uint64_t resolve_import(module_t *m, const char *name) {
     return (uint64_t)hlecount_wrap("STUB", name, (void *)&unimpl_stubs[k]);
 }
 
+// The host implements this import (the swhle table), without allocating a stub for it
+int hle_implements(const char *name) {
+    unsigned long secsz; const hle_ent *sec = (const hle_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swhle", &secsz);
+    for (unsigned i = 0; sec && i < secsz / sizeof(hle_ent); i++) if (!strcmp(sec[i].name, name)) return 1;
+    return 0;
+}
+
 void stubs_report(void) { LOG("stubs=%u", g_nstub); }
 
 // ---------- Host gate dispatch ----------

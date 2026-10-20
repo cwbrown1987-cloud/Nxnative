@@ -288,6 +288,15 @@ The game's own work and its frame rate stay as they are; the host avoids work of
 - **Frame rate:** 60 fps. The game sets present interval 1; on the iPhone the frame time is 16.7 ms at the median.
 - **Mac input:** `DM_KEYS=f2400:A*20/300` goes from the title screen (about frame 2,500) through a new game into the opening story scene (about frame 4,900).
 
+**Octopath Traveler 0 (`01005270232F2000`)**
+- **Engine:** Unreal Engine 4.26 / 4.27 on its mobile renderer, SDK 19.3.13, update 1.0.5 (v327680); the base game is an XCI. Everything is in one pak, `pakchunk0-Switch.pak` (AES-encrypted index; the key is found in `main` and never printed), with CRIWARE sound banks and a USM movie beside it.
+- **Shaders:** 10,324, in the pak's two shader code archives, each one Oodle-compressed. The NSP script decodes them on the Mac with the game's own `OodleLZ_Decompress` (`shader_ue_decode`, `dm/gfx/tools/uepak.py`, `DM_OODLE_JOB`), about 10 s for all of them. 16 compute shaders with 3D image atomics do not build, and 61 vertex shaders read a texture buffer through a fully dynamic handle the host does not support (7 of them failed to load in the first 15 minutes).
+- **Memory:** Unreal reserves one address region (62 GB on the Switch) and its allocator, FMallocBinned3, 37 GB of it. A cut skips the allocator's constructor and the host runs Unreal's heap on a malloc zone (`hle_uemalloc.c`); the region is capped at 2 GB (`game_args`) and the SDK's node area cut to 62 MB, so the guest block is 3.75 GB. 15 minutes into the story on the Mac: region mapped up to 1.26 GB of the alias region, Unreal heap 0.75 GB, 2.8 GB resident, 1.84 GB of GPU allocations.
+- **Frame rate:** 30 fps, as on the Switch (the game asks for present interval 2).
+- **Keyboard:** the character's name and favourite dish come from the system keyboard (`DM_KBD` on the Mac, the input box on the iPhone).
+- **Mac input:** a fresh save reaches the story with `DM_KBD=Lyra DM_KEYS="20:Plus,24:A*27/4,150:Plus,154:A*62/3,340:Right*12/3,341.5:A*12/3,380:Plus*5/3,396:A*20/3,470:A,474:Up,476:A,480:A*140/3"` (initial settings, the prologue, character creation with three belongings, "Begin Lyra's journey?").
+- **Status:** brought up on the Mac through character creation into the story; not yet run on an iPhone.
+
 ## Tools (`dm/tools`)
 
 | Tool | What it does |

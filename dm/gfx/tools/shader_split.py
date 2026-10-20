@@ -36,6 +36,7 @@ GROUPS, NOTE = GAME.pairs('shader_groups'), GAME.get('shader_note')
 GLSLC = GAME.get('shader_main_glslc', 'off') == 'on'   # GLSLC compiler outputs in main (glslc_shaders)
 SEPARABLE = GAME.get('shader_separable', 'off') == 'on'   # single-stage programs combined per stage at draw time (separable_pairs)
 CAPTURE = GAME.get('shader_glslc_capture', 'off') == 'on'   # GLSLC outputs the game compiles at run time, captured on the Mac (DM_GLSLC_CAPTURE, hle_glslc.c)
+UE = GAME.get('shader_ue_decode', 'off') == 'on'   # Unreal Engine shader code archives, decoded on the Mac with the game's own Oodle (uepak.py, DM_OODLE_JOB, hle_oodle.c)
 
 CTL_MAGIC, GFX_MAGIC, CS_MAGIC = bytes.fromhex('34127698'), bytes.fromhex('78563412'), bytes.fromhex('79563412')
 STAGES = ['vs', 'hs', 'ds', 'gs', 'ps', 'cs']
@@ -433,6 +434,24 @@ def separable_pairs(keys):
         k = min(ins, key=lambda k: (-len(ins[k] & left), k)); cover.append(k); left -= ins[k]
     return {(v, p) for v in keys if keys[v][1] == 'vs' for p in cover}, cover
 
+UE_TAG = {'SV': 'vs', 'SH': 'hs', 'SD': 'ds', 'SG': 'gs', 'SP': 'ps', 'SC': 'cs'}
+def ue_shaders(d, label):
+    """An Unreal Engine shader code archive with every shader decoded (Octopath Traveler 0: the two .ushaderbytecode files of its pak, whose shaders are Oodle-compressed; the NSP script decodes them
+    on the Mac with the game's own Oodle, uepak.py): each shader is an LSLG record holding one stage's code area and control section (uepak.lslg); the stage is the record's tag (SV vertex,
+    SP pixel, SC compute), checked against the archive entry's frequency. The engine combines vertex and pixel shaders per draw, so the profile pairs them with shader_separable"""
+    import uepak
+    a, out = uepak.archive(d), []
+    for i, (off, size, raw, fr) in enumerate(a['shaders']):
+        if size != raw: red(f'{label}: shader {i} is still compressed (an archive the NSP script has not decoded)')
+        rec = uepak.lslg(d[a['code'] + off:a['code'] + off + size])
+        if not rec: red(f'{label}: shader {i} is not an LSLG record')
+        tag, ctl, code = rec; st = UE_TAG.get(tag)
+        if not st or uepak.FREQ.get(fr) != st: red(f'{label}: shader {i} has tag {tag} but frequency {fr}')
+        why = check(label, st, ctl, code)
+        if why: red(f'{label}: shader {i} ({st}): {why}')
+        out.append((f'{label}#UE{i}', st, ctl, code))
+    return out
+
 def var_pairs(found):
     """(vertex key, pixel key) within the same BNSH variation"""
     var = collections.defaultdict(dict)
@@ -508,6 +527,11 @@ def main():
             names = sorted(f for f in os.listdir(cap) if f.endswith('.glslc')) if os.path.isdir(cap) else []
             if not names: print(f'[RED] the profile has shader_glslc_capture on, but there are no captured GLSLC outputs in {cap}: the shaders the game compiles at run time will have no translation', flush=True)
             for nm in names: found += glslc_shaders(open(os.path.join(cap, nm), 'rb').read(), f'/glslc_capture/{nm}')
+        if UE:   # Unreal Engine shader code archives decoded on the Mac (uepak.py): <version dir>/ue_shaders, or DM_UE_SHADERS
+            ued = os.environ.get('DM_UE_SHADERS') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'ue_shaders')
+            names = sorted(f for f in os.listdir(ued) if f.endswith('.ushaderbytecode')) if os.path.isdir(ued) else []
+            if not names: red(f'the profile has shader_ue_decode on, but there are no decoded shader code archives in {ued} (the NSP script writes them)')
+            for nm in names: found += ue_shaders(open(os.path.join(ued, nm), 'rb').read(), f'/ue_shaders/{nm}')
         results.append(('main', {skey(c, k): (w, s, c, k) for w, s, c, k in found}, var_pairs(found), {}))
     zdicts = {k: v for r in romfs_v for k, v in zs_dicts(r).items()}   # Tears of the Kingdom's zstd dictionaries (zs_dicts)
     keys = {}
@@ -559,7 +583,8 @@ def main():
         with open(os.path.join(pkg, name), 'wb') as f: f.write(b''.join(rr))
     with open(mapout, 'w') as f:
         kinds = ' / '.join(k for k, hit in (('BNSH / BAHS', any('#BNSH@' in r[4] or '#BAHS@' in r[4] for r in rows)), ('Unity Shader', any('#var' in r[4] and '#BNSH@' not in r[4] and '#MSHD#' not in r[4] and '#SDF#' not in r[4] for r in rows)),
-                                            ('MSHD', any('#MSHD#' in r[4] for r in rows)), ('GLSLC', any('#GLSLC@' in r[4] for r in rows)), ('RE Engine SDF', any('#SDF#' in r[4] for r in rows))) if hit)
+                                            ('MSHD', any('#MSHD#' in r[4] for r in rows)), ('GLSLC', any('#GLSLC@' in r[4] for r in rows)), ('RE Engine SDF', any('#SDF#' in r[4] for r in rows)),
+                                            ('Unreal Engine shader code archives', any('#UE' in r[4] for r in rows))) if hit)
         f.write(f'# kind: evidence  {NOTE} ({kinds} in RomFS + main) → control section + code area keys (dm/gfx/tools/shader_split.py)\n')
         f.write('# column 5 records where each key first appears; this game has no PC version to pair with\n')
         f.write('package\tindex\tstage\tdm_ctl_sha16\tsource\n')

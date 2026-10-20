@@ -235,6 +235,21 @@ CUTS = {
     # SleepThread and a poll), then steps the game by the time that really passed (+0x24, seconds). fps (+0x30) is 30, from engine data (main+0x166daa4)
     (0x166db80, '14159f1a', '94078052', 'KIDS frame task wait: csinc w20,w8,wzr,ne (fps, at least 1) → mov w20,#60 (wait 1/60 s; the step stays the measured time)', 'host-only'),
   ],
+  # Octopath Traveler 0 1.0.5 (v327680) main: Unreal's nninitStartup (main+0x12d74) constructs the engine allocator, an FMallocBinned3, in place at main+0x68022c8 (main+0x12e40 → constructor
+  # main+0x9f480). Its constructor reserves 37 GB of address space (main+0x9f748: 74 pools of 512 MB, pool index = offset >> 29), which only the Mac can give: an iPhone has about 5 GB without the
+  # extended virtual addressing entitlement, and the pools are too uneven to shrink (at character creation the largest holds 68 MB, the 74 together 732 MB). The constructor is not called;
+  # the host puts its own allocator's vtable in the object instead (dm/host/hle_uemalloc.c: Malloc, Realloc, Free and the size queries on a host malloc zone), and every allocation goes through it
+  # (FMemory reaches the object through FPlatformMemory::BaseAllocator, main+0x132b4, and the thread-local storage allocator nninitStartup registers, main+0x12e80 / main+0x12ec0, through its vtable)
+  '9fe60a212cff9b9a3656ab63d4f882e5': [
+    (0x12e40, '90310294', '1f2003d5', 'nninitStartup: bl 0x9f480 (FMallocBinned3 constructor, 37 GB of address space) → nop; the host allocator is in the object already (hle_uemalloc.c)', 'host-only'),
+  ],
+  # Octopath Traveler 0 1.0.5 (v327680) sdk (SDK 19.3.13): the AddressRegionManager node area 0x3fe00000 → 0x3e00000 (62 MB), as Engage's SDK 12 (above). The same constructor (sdk+0x1423ec): +0x1423fc
+  # sets the node area limit, +0x142468 registers it as an occupied region. Unreal's region (-SwitchVirtualAddressSpaceSize, the profile's game_args) then starts 62 MB into the alias region, and the guest
+  # block stays small enough for an iPhone next to the Unreal heap (hle_uemalloc.c), which lives outside it
+  '7bba185a35ee9b4d0af66a4df910a823': [
+    (0x1423fc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000', 'host-only'),
+    (0x142468, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000', 'host-only'),
+  ],
 }
 # ---- Registered observation gates: {NSO build ID: [(offset, number, original instruction word, reason)]}. Numbers match OBS_* in the host's hle.h;
 # the original instruction must be position independent (no PC-relative / branch / anything involving x18 or tpidr), asserted offline; when the host has no callback attached the gate block goes in and out once and returns ----
@@ -816,6 +831,20 @@ def tail_call(insl, j):
         if 'x18' not in [p.reg_name(r) for r in p.regs_access()[1]]: continue
         return p.mnemonic == 'ldr' and bool(re.fullmatch(r'x18, \[(x\d+|sp)(, #(0x[0-9a-f]+|\d+))?\]', p.op_str))
     return False
+def jump_bytes_far(insl, j):
+    """The byte / halfword table form with its add further back (Octopath Traveler 0 main+0x37f9bc8: adr x18,#L; ldrb w0,[x17,x15]; add x18,x18,x0,lsl #2, then 17 register moves before br x18).
+    Up to 32 instructions back, and x18 must not change between the add and the br. Tried only where the 16-instruction search and the offset forms find nothing. Returns (base, width) or None"""
+    ctx = insl[max(0, j - 32):j]
+    for k in range(len(ctx) - 1, -1, -1):
+        p = ctx[k]
+        if p.mnemonic == 'add' and p.op_str.startswith('x18, x18,') and 'lsl #2' in p.op_str: break
+        if any(p.reg_name(r) == 'x18' for r in p.regs_access()[1]): return None
+    else: return None
+    rn = p.reg_name(p.operands[2].reg); idx = {'lr': 30, 'fp': 29}.get(rn, num(rn))
+    base = next((q.operands[1].imm for q in reversed(ctx[:k]) if q.mnemonic == 'adr' and q.op_str.startswith('x18,')), None)
+    ld = next((q for q in reversed(ctx[:k]) if q.mnemonic in ('ldrb', 'ldrsb', 'ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx), None)
+    if base is None or ld is None: return None
+    return base, 256 if ld.mnemonic in ('ldrb', 'ldrsb') else 65536
 def disasm_fn(fa, fb):
     """A function's instructions. Capstone stops at the first word it cannot decode, so go on after it: Monster Hunter Rise main+0x6b34540 is a trap word (0xe7ffdefe)
     in the middle of a function, and the br x18 jump table after it (main+0x6b346d0) was never seen"""
@@ -849,6 +878,7 @@ for fa, fb in funcs:
             if not (base and width):
                 tgt = jump_offsets(insl, j) or jump_adr_offsets(insl, j)
                 if not tgt and tail_call(insl, j): tailcalls.add(ins.address); continue
+                if not tgt and (far := jump_bytes_far(insl, j)): jumps[ins.address] = far; continue
                 assert tgt, f'jump table {ins.address:x}'
                 tabjumps[ins.address] = tgt; continue
             jumps[ins.address] = (base, width)
