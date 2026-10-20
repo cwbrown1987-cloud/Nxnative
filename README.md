@@ -54,7 +54,7 @@ All of these are tested on an iPhone and playable:
 | ![Ace Attorney Investigations Collection](docs/images/ace-attorney-investigations.jpg)<br>Ace Attorney Investigations Collection | ![Hades II](docs/images/hades-ii.jpg)<br>Hades II |
 | ![Unicorn Overlord](docs/images/unicorn-overlord.jpg)<br>Unicorn Overlord | |
 
-**On the Mac, not yet tested on an iPhone:** OCTOPATH TRAVELER 0 (update 1.0.5, ~4&nbsp;GB IPA). On the Mac it plays from a new game through character creation and the story opening into free play, and its saves load. Its IPA is packed the same way; whether it runs on a phone is not known yet.
+**On the Mac, not yet tested on an iPhone:** OCTOPATH TRAVELER 0 (update 1.0.5, ~4&nbsp;GB IPA). On the Mac it plays from a new game through character creation and the story opening into free play, and its saves load. Its IPA is packed the same way; whether it runs on a phone is not known yet. Rhythm Heaven Groove (base game 1.0.0, ~3.2&nbsp;GB IPA). On the Mac it plays from a first boot through the setup and the main menu into its first rhythm game, with sound; it runs in handheld mode, which skips the game's TV latency calibration. Its IPA is packed the same way and not yet run on a phone either.
 
 Needs iOS / iPadOS 26 or later on an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later: the games' textures are BC-compressed, and older iPhones can't read that format. Other games aren't supported yet. For them the script writes a survey and still tries its best to pack an IPA, guessing the game's settings; such an IPA may not start.
 
