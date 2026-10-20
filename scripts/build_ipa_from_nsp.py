@@ -2,6 +2,7 @@
 # Unsigned IPA straight from the NSPs: identify the game (title ID → game profile dm/games/<id>/) → extract (nx_extract) → rewrite the code modules (patch_nso.py)
 #   → (profiles with shader_glslc_capture: capture the shaders the game compiles at run time, by booting it in the Mac host for a few seconds) → split out the shaders and check them against the profile's tables (shader_split.py)
 #   (a Vulkan game with shader_vk_capture, Super Mario Galaxy, boots the same way to capture the SPIR-V shaders it generates)
+#   (a game with shader_oodle, Pokémon Legends: Z-A, has its Oodle-compressed archives decoded for the split by its own decoder, run in the Mac host's tool mode)
 #   → iOS shader libraries (dmsh_build.py) → build_ipa.sh. A Vulkan game (profile key graphics vulkan: Hades) skips the NVN shader steps: vk_shaders.py translates its SPIR-V shaders instead. A game with no matching profile is surveyed (<NSP folder>/<title ID>_survey/survey.md), then gets a provisional profile guessed from
 #   the survey (<NSP folder>/<title ID>_build/profile/<title ID>/, outside the repository, found through DM_GAMES_DIR) and a best-effort IPA that may not boot; SURVEY_ONLY / --survey-only stops after the survey.
 # Two ways to run it: open this file in Spyder and press F5 (it uses the values under "Settings" below; an empty NSP folder or prod.keys is asked for at run time);
@@ -17,8 +18,8 @@ import collections, ctypes, getpass, hashlib, os, re, shlex, shutil, struct, sub
 from pathlib import Path
 
 # ---- Settings ----
-NSP_DIR = '/Volumes/T7/nsp/The Legend of Zelda Tears of the Kingdom/'                            # folder holding the NSPs (empty = ask at run time)
-PROD_KEYS = '/Users/f2pgod/My Drive/Python_Scripts/nsp_check/prod.keys'                          # path of prod.keys (empty = ask at run time)
+NSP_DIR = '/Volumes/S790/nsp/The Legend of Zelda Tears of the Kingdom/'                            # folder holding the NSPs (empty = ask at run time)
+PROD_KEYS = '/Users/seedds/My Drive/Python_Scripts/nsp_check/prod.keys'                          # path of prod.keys (empty = ask at run time)
 PACKAGE = ''                            # version packed into the IPA (empty = the profile's package; Mario 'v327680' i.e. 1.2.1, or 'v0')
 OUT_IPA = ''                            # output IPA (empty = <the profile's ipa> in the NSP folder)
 APP_NAME = ''                           # app name on the home screen (empty = the game name in the base NSP)
@@ -421,7 +422,8 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
     if extra: notes.append(f'modules besides main / sdk: {", ".join(f"{n} ({mods[n]["kind"]})" for n in extra)}; the provisional profile loads {G["modules"][0]} (load order main, subsdk*, sdk)')
     if rom['mags']['UnityFS'] or 'Unity IL2CPP' in F['markers']: notes.append('Unity: the shaders are Shader objects in UnityFS bundles and data.unity3d, which shader_split.py reads through unityfs.py (written for Unity 2020.3\'s Switch format, also read for 2017.4 and 2022.3; check other Unity versions first)')
     if F['glslc']: notes.append(f'main has {F["glslc"]} GLSLC compiler output magics (0x19866891): ' + ('the shaders are compiled into main (13 Sentinels, the KTGL games): shader_main_glslc on' if 'shader_main_glslc' in G else 'not its shaders, the RomFS has shader containers (Engage)'))
-    if not (rom['mags']['BNSH'] or rom['mags']['BAHS']) and not rom['mags']['UnityFS'] and not vulkan and 'shader_main_glslc' not in G:
+    if rom['mags']['Trinity pack']: notes.append('Trinity packs (Game Freak, arc/data.trpfs with its index data.trpfd): the shaders are BNSH inside Oodle Mermaid streams; shader_split.py decodes them with the game\'s own OodleLZ_Decompress in the Mac host, whose address dm/host/hle_oodle.c lists per main build (find it by its error strings, as for Pokémon Legends: Z-A)')
+    elif not (rom['mags']['BNSH'] or rom['mags']['BAHS']) and not rom['mags']['UnityFS'] and not vulkan and 'shader_main_glslc' not in G:
         notes.append('no BNSH / BAHS at the top level: the shaders are inside compressed or other containers or in main, and must be located first')
     major = {v.split('_')[0] for v in F['sdkver']}
     if not major: notes.append('no SDK version string found')
@@ -492,11 +494,11 @@ def write_profile(pdir, app, f):
          '# ---- NVN driver constant segments (Mario\'s values, the translator\'s built-in layout, unless the engine says otherwise) ----',
          *key('nvn_tex_base', '0x20'), *key('nvn_tex_slots', '32'), f'nvn_samp_base{T}0x568', f'nvn_img_base{T}0x120', f'nvn_img_slots{T}8', f'nvn_ssbo_bases{T}vs=0x110 ps=0x510 cs=0x310', '',
          '# ---- Shader split ----', *key('shader_groups', " ".join(groups) or "/=romfs"), f'shader_note{T}{name} shaders (provisional profile)',
-         *key('shader_main_glslc'), *key('shader_separable'), *key('shader_glslc_capture'), *key('shader_ue_decode')]
+         *key('shader_main_glslc'), *key('shader_separable'), *key('shader_glslc_capture'), *key('shader_ue_decode'), *key('shader_oodle')]
     (pdir / 'game.tsv').write_text('\n'.join(L) + '\n', encoding='utf-8')
     for n, text in EMPTY_TABLES.items(): (pdir / n).write_text(text)
     say(f'wrote a provisional game profile: {pdir / "game.tsv"}')
-    for k in ('graphics', 'modules', 'shader_vk_capture', 'shader_main_glslc', 'shader_glslc_capture', 'shader_ue_decode', 'mem_reserve', 'op_mode'):
+    for k in ('graphics', 'modules', 'shader_vk_capture', 'shader_main_glslc', 'shader_glslc_capture', 'shader_ue_decode', 'shader_oodle', 'mem_reserve', 'op_mode'):
         if k in G and G[k][1]: say(f'  {k} {G[k][0]}: {G[k][1]}')
 
 
@@ -914,9 +916,10 @@ def data_rows(b):   # a table's data rows (without # comment lines: the header c
     return [l for l in b.splitlines() if not l.startswith(b'#')]
 
 
-def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False):
+def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, oodle=None):
     """The shader split into pkg, checked against the profile's tables. Returns its key (None for a provisional profile or damaged files, which never reuse it): the package is reused
-    when the tools, the profile and each version's main, RomFS (paths and sizes) and run-time capture are as at the last successful split"""
+    when the tools, the profile and each version's main, RomFS (paths and sizes) and run-time capture are as at the last successful split.
+    oodle: for profiles with shader_oodle on (Pokémon Legends: Z-A's Trinity packs), a function that builds the Mac host and returns the split's DM_OODLE_HOST / DM_OODLE_MODULES; called only when the split runs"""
     names = ('shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv')
     PROG.stage('shader split', step='checking the inputs')   # then a spinner: shader_split.py writes the package and the tables only at the end
     kf = pkg.with_name(pkg.name + '.key')
@@ -925,6 +928,8 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False):
                                                    ('files', sorted((r.parent / 'ue_shaders').glob('*.ushaderbytecode'))))])
     if key and pkg.is_dir() and (note := reused(kf, key)) is not None:
         PROG.end(f'{note}, reused (inputs unchanged)'); return key
+    if oodle:   # the packs are decoded by the game's own Oodle in the Mac host (dm/host/hle_oodle.c)
+        PROG.set(step='building the Mac host for the game\'s Oodle decoder'); env = dict(env, **oodle())
     PROG.set(step='splitting')
     tmp = pkg.with_name(pkg.name + '.partial'); rmtree(tmp); (tmp / 'tables').mkdir(parents=True)
     run([py, repo / 'dm/gfx/tools/shader_split.py', ','.join(map(str, roms)), ','.join(map(str, mains)), tmp / 'pkg'] + [tmp / 'tables' / n for n in names], logs / 'shader_split.log', env=env)
@@ -1231,7 +1236,9 @@ def main(args=None):
         cap = capture_vk(repo, game, patched, work, env, logs, g) if vkcap else None
         ios = build_vk_shaders(py, repo, [game / 'RomFS'] + ([cap] if cap else []), sh, env, logs, g, reuse=not (provisional or ALLOW_DAMAGED))
     else:
-        skey = split_shaders(py, repo, [dirs[v] / 'RomFS' for v in need], [dirs[v] / 'ExeFS/main' for v in need], sh / 'pkg', env, logs, g, provisional)
+        # Trinity packs (shader_oodle): the split decodes them with the packed version's own Oodle decoder, in the Mac host built for the profile
+        oodle = (lambda: {'DM_OODLE_HOST': str(build_mac_host(repo, work / 'tools/dmhost', env, logs, g)), 'DM_OODLE_MODULES': str(patched)}) if g.get('shader_oodle', 'off') == 'on' else None
+        skey = split_shaders(py, repo, [dirs[v] / 'RomFS' for v in need], [dirs[v] / 'ExeFS/main' for v in need], sh / 'pkg', env, logs, g, provisional, oodle)
         ios = build_shaders(py, repo, sh, xlate, env, logs, g, provisional, skey)
 
     if free_gb(out_ipa.parent) < 5: raise BuildError(f'less than 5 GB free on the volume of {out_ipa.parent}')

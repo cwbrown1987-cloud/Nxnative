@@ -1,6 +1,10 @@
 // The game's own Oodle decoder, for the offline shader tools. Unreal Engine games compress each shader in their shader code archives with Oodle (Octopath Traveler 0: every entry of the
-// two .ushaderbytecode files in pakchunk0-Switch.pak, block header 8C 0A = Mermaid). Shaders are translated offline only and Oodle's decoder is not open source, so the NSP script decodes
-// them once on the Mac with the copy statically linked into main: DM_OODLE_JOB=<job file> runs OodleLZ_Decompress on every record right before nnMain, writes <job file>.out and exits.
+// two .ushaderbytecode files in pakchunk0-Switch.pak, block header 8C 0A = Mermaid), and Game Freak's Trinity engine every file of its packs (Pokémon Legends: Z-A: arc/data.trpfs, compression
+// type 3). Shaders are translated offline only and Oodle's decoder is not open source, so they are decoded on the Mac with the copy statically linked into main, in one of two modes:
+// DM_OODLE_JOB=<job file> runs OodleLZ_Decompress on every record right before nnMain, writes <job file>.out and exits (the NSP script, Unreal);
+// DM_OODLE_SERVE=1 answers requests on stdin / stdout from the guest main thread before the SDK starts, until stdin ends (shader_split.py's workers, Trinity: the packs are decoded file by file
+// while they are scanned, about 4.7 GB, so they are never written out). Request: u64 compressed length, u64 decompressed length, the compressed bytes; answer: u64 bytes decoded (0 on failure),
+// then those bytes.
 // Job file: "DMOJ", u32 count, then per record u32 compressed length, u32 raw length and the compressed bytes. Output: "DMOR", u32 count, then per record u32 decoded length
 // (0 = failed) and the decoded bytes.
 #include "hle.h"
@@ -82,5 +86,39 @@ void dm_oodle_job_maybe(void) {
     }
     fclose(in); fclose(out); free(scratch);
     LOG("DM_OODLE_JOB: %u records decoded with the game's OodleLZ_Decompress (%u failed, %.1f MB out) → %s", n - bad, bad, raw_total / 1048576.0, outp);
+    fflush(stderr); _exit(bad ? 1 : 0);
+}
+
+static int read_all(int fd, void *p, size_t n) {
+    for (uint8_t *q = p; n; ) { ssize_t k = read(fd, q, n); if (k <= 0) return 0; q += k; n -= (size_t)k; }
+    return 1;
+}
+static void write_all(int fd, const void *p, size_t n) {
+    for (const uint8_t *q = p; n; ) { ssize_t k = write(fd, q, n); if (k <= 0) die("DM_OODLE_SERVE: answer write failed"); q += k; n -= (size_t)k; }
+}
+void dm_oodle_serve_maybe(void) {
+    if (!getenv("DM_OODLE_SERVE")) return;
+    oodle_fn fn = NULL; uint64_t off = 0;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { off = oodle_find(&g_mod[i]); fn = (oodle_fn)(void *)(g_mod[i].base + off); }
+    if (!fn) die("DM_OODLE_SERVE: no main module");
+    enum { SLACK = 0x10000 };
+    size_t scratch_n = 16u << 20; uint8_t *scratch = malloc(scratch_n), *comp = NULL, *raw = NULL; size_t comp_cap = 0, raw_cap = 0; uint64_t n = 0, bad = 0;   // the decoder's work memory, as for a job
+    if (!scratch) die("DM_OODLE_SERVE: decoder memory");
+    LOG("DM_OODLE_SERVE: OodleLZ_Decompress at main+%#llx, requests on stdin", (unsigned long long)off);
+    for (;;) {
+        uint64_t hdr[2];
+        if (!read_all(0, hdr, sizeof hdr)) break;
+        if (hdr[0] > (1ull << 32) || hdr[1] > (1ull << 32)) die("DM_OODLE_SERVE: request too large (%#llx → %#llx)", (unsigned long long)hdr[0], (unsigned long long)hdr[1]);
+        if (hdr[0] > comp_cap) { free(comp); comp_cap = hdr[0]; if (!(comp = malloc(comp_cap))) die("DM_OODLE_SERVE: input buffer"); }
+        if (hdr[1] + SLACK > raw_cap) { free(raw); raw_cap = hdr[1] + SLACK; if (!(raw = malloc(raw_cap))) die("DM_OODLE_SERVE: output buffer"); }
+        if (!read_all(0, comp, hdr[0])) die("DM_OODLE_SERVE: request cut short");
+        int64_t got = fn(comp, (int64_t)hdr[0], raw, (int64_t)hdr[1], 1, 0, 0, NULL, 0, NULL, NULL, scratch, (int64_t)scratch_n, 3);   // fuzz safe, no CRC check, silent, unthreaded
+        uint64_t out = got == (int64_t)hdr[1] ? (uint64_t)got : 0;
+        if (!out && hdr[1] && bad++ < 8) LOG("[RED] DM_OODLE_SERVE: request %llu (%llu → %llu bytes) failed (decoder returned %lld)", (unsigned long long)n, (unsigned long long)hdr[0], (unsigned long long)hdr[1], (long long)got);
+        write_all(1, &out, sizeof out);
+        if (out) write_all(1, raw, out);
+        n++;
+    }
+    LOG("DM_OODLE_SERVE: %llu requests, %llu failed", (unsigned long long)n, (unsigned long long)bad);
     fflush(stderr); _exit(bad ? 1 : 0);
 }

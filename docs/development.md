@@ -298,6 +298,14 @@ The game's own work and its frame rate stay as they are; the host avoids work of
 - **Saves:** the first save (about 13 minutes in) needs `fs::GetSaveDataSizeMax`; four saves in a 26-minute run, and a later boot continues from them.
 - **Status:** brought up on the Mac through character creation and the story opening into free play (26 minutes from a fresh save with no red line, 2.74 GB resident), and playable on an iPhone: 30 fps through character creation, name entry and the story opening, no audio underruns, three saves, a footprint of about 2.35 GB after 3.4 minutes; it plays at 60 fps on an iPhone too (`fps_target 60`). Battles are not tested yet.
 
+**Pokémon Legends: Z-A (`0100F43008C44000`)**
+- **Status:** brought up on the Mac: language select, character creation, the opening and the first minutes of play in Lumiose City at a steady 30 fps (a 5-minute walk: GPU about 6 ms a frame, no crash; the red lines are the render condition the host does not evaluate, the placeholder cube and an occasional memory-pool retry). On an iPhone the first build (before the base-instance fix in [04](agents/04-graphics.md)) ran at 30 fps with a memory footprint of about 2 GB.
+- **Engine:** Game Freak's Trinity engine on SDK 19.3.11 (NVN 55) with Havok 2022.2, update 2.0.2 (v393216). The SDK 19 calls the host had to answer are in [03](agents/03-bringup.md).
+- **Files and shaders:** every file sits in the Trinity packs of `arc/data.trpfs` (FlatBuffers, Oodle Mermaid). The shader split decodes them with the game's own `OodleLZ_Decompress`, run in the Mac host's tool mode (`hle_oodle.c`, profile key `shader_oodle`), and finds 28,603 shaders ([01](agents/01-extract.md)).
+- **Memory:** the 5 GB guest block with two cuts for 2.0.2: the StandardAllocator's address space 12 GB → 4 GB and the SDK's node area 1 GB → 62 MB. With `mem_map_limit` the host refuses a map past the application pool, as Horizon does, so the SDK gives back the 3.15 GB it keeps mapped after `nninitStartup`.
+- **Graphics:** characters are skinned with transform feedback, the colour grading LUT is drawn as a layered pass, the deferred lighting reads stencil through a stencil-mode texture view, and the occlusion queries that decide how characters are animated need the draw's base instance in the driver segment ([04](agents/04-graphics.md)).
+- **Mac input:** a fresh save reaches play in Lumiose City with `DM_KBD=Taylor DM_KEYS="f450:A,f1200:LRight~1,f1600:A,f1900:Down,f2000:Down,f2100:A,f2400:A*80/90"`; a save made there continues with `DM_KEYS="f300:A*3/150"` (play from about frame 600), and `LUp~12` then walks along the platform.
+
 ## Tools (`dm/tools`)
 
 | Tool | What it does |

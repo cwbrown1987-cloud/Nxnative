@@ -18,6 +18,7 @@
 #   · G2S (Koei Tecmo's KTGL, Hyrule Warriors: Age of Calamity): GLSLC compiler outputs inside the IDRK entries of the RDB data files (zlib in chunks), see idrk_shaders
 #   · SPKG (the older KTGL of Fire Emblem: Three Houses): shader packages of G2S containers, loose and inside the LINKDATA archive DATA0.bin / DATA1.bin, see kt_shaders and linkdata_jobs
 #   · SDF (Capcom's RE Engine, Monster Hunter Rise): shader definitions inside the PAK archives (KPKA, entries zstd / deflate compressed), only the newest copy of each path, see kpka_jobs and sdf_shaders
+#   · Trinity packs (Game Freak, Pokémon Legends: Z-A): BNSH inside the files of arc/data.trpfs (Oodle Mermaid, decoded by the game's own decoder in the Mac host), see trpfs_jobs and trinity_shaders
 # Code area: 0x30 header + (graphics) 0x50 SPH + instructions; header magic 0x12345678 for graphics, 0x12345679 for compute. The control section starts with 0x98761234, +0x704 = code area length,
 #   +0x700 = start of the c1 constant segment within the code area; for compute +0x748 thread group xyz (u32 ×3), +0x754 shared memory bytes (checked one by one against PC reflection on D2R's 22 compute shaders).
 # Stage: BNSH uses the stage slot; BAHS uses bits 10..13 of SPH word 0 (1 vertex 2 hull 3 domain 4 geometry 5 pixel), and a compute header means compute.
@@ -53,6 +54,14 @@ def ctl_len(ctl):
 
 def skey(ctl, code):
     return hashlib.sha256(ctl[:ctl_len(ctl)] + code).hexdigest()[:16]
+
+def same_shader(a, b):
+    """Two copies of one key hold the same shader: the code areas are equal, and so are the control sections up to their own length (control +0x20). Pokémon Legends: Z-A's UI layout archives
+    (__ArchiveShader.bnsh inside the .truiv packs) give 104 KB control sections whose stage descriptor length runs 456 bytes past their own length, and those trailing bytes differ between copies"""
+    (ca, ka), (cb, kb) = a, b
+    n = struct.unpack_from('<I', ca, 0x20)[0] if len(ca) >= 0x24 else len(ca)
+    n = n if 0x760 <= n <= min(len(ca), len(cb)) else max(len(ca), len(cb))
+    return ka == kb and ca[:n] == cb[:n]
 
 def check(where, st, ctl, code):
     """control section and code area consistent; returns the reason if not"""
@@ -284,6 +293,93 @@ def kpka_shaders(path, rel, ents, out):
         for e in ents:
             if e[3] >= 0x10 and kpka_data(d, e, 4) == b'SDF\0': out.extend(sdf_shaders(kpka_data(d, e), f'/{rel}#{e[0]:016x}'))
 
+ONEPACK = b'ONEPACK\0'
+def fb_field(d, t, i):
+    """FlatBuffers: absolute offset of field i of the table at t, None when the field is absent"""
+    vt = t - struct.unpack_from('<i', d, t)[0]
+    if 4 + 2 * i >= struct.unpack_from('<H', d, vt)[0]: return None
+    off = struct.unpack_from('<H', d, vt + 4 + 2 * i)[0]
+    return t + off if off else None
+
+def fb_vec(d, t, i):
+    """FlatBuffers: (start, count) of the vector in field i"""
+    p = fb_field(d, t, i)
+    if p is None: return 0, 0
+    p += struct.unpack_from('<I', d, p)[0]
+    return p + 4, struct.unpack_from('<I', d, p)[0]
+
+def fb_refs(d, t, i):   # the tables / strings a vector of offsets points at
+    st, n = fb_vec(d, t, i)
+    return [st + 4 * k + struct.unpack_from('<I', d, st + 4 * k)[0] for k in range(n)]
+
+def fb_root(d, at=0): return at + struct.unpack_from('<I', d, at)[0]
+
+def trpfs_jobs(files, parts=64):
+    """Game Freak's Trinity engine (Pokémon Legends: Z-A): almost everything is in arc/data.trpfs, packs of files, with arc/data.trpfd as their index, both FlatBuffers. The descriptor's root table:
+    0 file hashes [u64], 1 pack names [string], 2 file infos [{0 pack index u64}] (in file hash order), 3 pack infos [{0 pack size u64, 1 file count u64}]. The file system: 'ONEPACK\\0', u64 offset of its
+    root table {0 pack name hashes [u64], 1 pack offsets [u64]}, each pack a table of its own at its offset. A pack is named through its first file's hash (its own name hash is not a plain FNV-1a of the
+    descriptor's name). → ([(path, rel, ((pack offset, pack name), …)), …] in about equal sizes, the paths taken)"""
+    import mmap
+    jobs, taken = [], set()
+    for p, r in files:
+        if not p.endswith('.trpfs') or not os.path.exists(p[:-1] + 'd'): continue
+        with open(p, 'rb') as f:
+            if f.read(8) != ONEPACK: continue
+        fd = open(p[:-1] + 'd', 'rb').read(); fr = fb_root(fd)
+        hashes = struct.unpack_from(f'<{fb_vec(fd, fr, 0)[1]}Q', fd, fb_vec(fd, fr, 0)[0])
+        names = [fd[s + 4:s + 4 + struct.unpack_from('<I', fd, s)[0]].decode() for s in fb_refs(fd, fr, 1)]
+        pack_of = {h: struct.unpack_from('<Q', fd, fb_field(fd, t, 0))[0] if fb_field(fd, t, 0) is not None else 0 for h, t in zip(hashes, fb_refs(fd, fr, 2))}
+        sizes = [struct.unpack_from('<Q', fd, fb_field(fd, t, 0))[0] for t in fb_refs(fd, fr, 3)]
+        with open(p, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
+            sr = fb_root(d, struct.unpack_from('<Q', d, 8)[0]); st, n = fb_vec(d, sr, 1)
+            packs = []
+            for off in struct.unpack_from(f'<{n}Q', d, st):
+                pr = fb_root(d, off); h0 = fb_vec(d, pr, 0)
+                if not h0[1] or struct.unpack_from('<Q', d, h0[0])[0] not in pack_of: red(f'{r}: the pack at {off:#x} has no file the descriptor lists')
+                i = pack_of[struct.unpack_from('<Q', d, h0[0])[0]]; packs.append((off, names[i], sizes[i]))
+        cur, size, step = [], 0, sum(s for _, _, s in packs) / parts
+        for off, name, s in sorted(packs):
+            cur.append((off, name)); size += s
+            if size >= step: jobs.append((p, r, tuple(cur))); cur, size = [], 0
+        if cur: jobs.append((p, r, tuple(cur)))
+        taken |= {p, p[:-1] + 'd'}
+    return jobs, taken
+
+_OODLE = None
+def oodle(comp, n):
+    """The game's own OodleLZ_Decompress (Trinity's packs are Oodle Mermaid, and Oodle is linked into main): one Mac host per worker process in its tool mode (dm/host/hle_oodle.c, DM_OODLE_SERVE),
+    fed over a pipe. DM_OODLE_HOST = the host, DM_OODLE_MODULES = the rewritten modules it loads (the NSP script sets both for profiles with shader_oodle on)"""
+    global _OODLE
+    if _OODLE is None:
+        import tempfile
+        host, mods = os.environ.get('DM_OODLE_HOST'), os.environ.get('DM_OODLE_MODULES')
+        if not host or not mods: red('Oodle-compressed packs: set DM_OODLE_HOST (the Mac host, make -C dm/host GAME=<id> dmhost) and DM_OODLE_MODULES (the rewritten modules) to decode them with the game\'s own decoder')
+        err = tempfile.TemporaryFile()
+        _OODLE = (subprocess.Popen([host, mods], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, env=dict(os.environ, DM_OODLE_SERVE='1')), err)
+    p, err = _OODLE
+    try:
+        p.stdin.write(struct.pack('<QQ', len(comp), n)); p.stdin.write(comp); p.stdin.flush()
+        got = struct.unpack('<Q', p.stdout.read(8))[0]
+    except (BrokenPipeError, struct.error): got = None
+    if got != n:
+        err.seek(0); red(f'the Oodle decoder in the Mac host failed on a {len(comp)} → {n} byte stream; ---- host output ----\n' + err.read().decode(errors='replace')[-3000:])
+    return p.stdout.read(n)
+
+def trinity_shaders(path, rel, packs, out):
+    """A range of Trinity packs (trpfs_jobs). Pack table: 0 file hashes [u64], 1 files [{1 compression i8 (3 = Oodle; stored otherwise), 2 level u8, 3 length u64, 4 data [u8]}]; each file is scanned like a loose one"""
+    import mmap
+    with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
+        for off, name in packs:
+            pr = fb_root(d, off); hs = fb_vec(d, pr, 0)
+            for k, t in enumerate(fb_refs(d, pr, 1)):
+                c, ln = fb_field(d, t, 1), fb_field(d, t, 3)
+                comp, n = (struct.unpack_from('<b', d, c)[0] if c is not None else 0), (struct.unpack_from('<Q', d, ln)[0] if ln is not None else 0)
+                st, sz = fb_vec(d, t, 4)
+                if comp == 3: data = oodle(d[st:st + sz], n)
+                elif sz == n: data = d[st:st + sz]
+                else: red(f'/{rel}#{name}: file {k} has compression {comp} ({sz} → {n} bytes), which is not known')
+                scan_blob(data, f'/{rel}#{name}#{struct.unpack_from("<Q", d, hs[0] + 8 * k)[0]:016x}', out)
+
 def yaz0(s):
     """Yaz0 decompression (Super Mario 3D World + Bowser's Fury: almost all of RomFS is .szs = SARC wrapped in Yaz0). Pure Python runs at about 20–45 MB/s per core, under a minute for the whole 4.7 GB RomFS in parallel, and needs no extra dependency.
     Group header bits: 1 = one literal byte; 0 = back-reference, 2 bytes {length high nibble, 12-bit distance} (distance + 1); length 0 reads one more byte + 0x12, else + 2. Overlapping copies are expanded by their period"""
@@ -467,6 +563,9 @@ def scan_file(args):
     if head[:8] == IDRK:
         idrk_shaders(path, '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if len(args) > 2 and head[:8] == ONEPACK:   # a range of Trinity packs (trpfs_jobs)
+        trinity_shaders(path, rel, args[2], found)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and head[:4] == KPKA:   # entries of an RE Engine PAK (kpka_jobs)
         kpka_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -490,7 +589,7 @@ def uniq_keys(found):
     uniq = {}
     for where, st, ctl, code in found:
         key = skey(ctl, code)
-        if key in uniq and (uniq[key][2] != ctl or uniq[key][3] != code): red(f'key {key} is the same but the control section or code area differs ({where})')
+        if key in uniq and not same_shader(uniq[key][2:4], (ctl, code)): red(f'key {key} is the same but the control section or code area differs ({where})')
         uniq.setdefault(key, (where, st, ctl, code))
     return uniq
 
@@ -539,8 +638,9 @@ def main():
     J = int(os.environ.get('J', '8'))
     big = [j for p, r in files for j in (linkdata_jobs(p, r) or [])]   # Three Houses' 6.9 GB DATA1.bin: one job per range of entries, not one read of the whole file
     pak_jobs, paks = kpka_jobs(files)   # Monster Hunter Rise's PAKs: the newest copy of each path, in ranges of entries
-    big += pak_jobs
-    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks]
+    tr_jobs, trp = trpfs_jobs(files)   # Pokémon Legends: Z-A's Trinity packs (data.trpfs and its index data.trpfd), decoded by the game's own Oodle in the Mac host
+    big += pak_jobs + tr_jobs
+    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp]
     with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, {}, zdicts)) as ex:
         results += list(ex.map(scan_file, big)) + list(ex.map(scan_file, files, chunksize=16))
     trees, defer = {}, []
@@ -558,7 +658,7 @@ def main():
         pairs |= pr
         for key, v in uniq.items():
             if key in keys:
-                if keys[key][2] != v[2] or keys[key][3] != v[3]: red(f'key {key} is the same but the control section or code area differs ({v[0]} / {keys[key][0]})')
+                if not same_shader(keys[key][2:4], v[2:4]): red(f'key {key} is the same but the control section or code area differs ({v[0]} / {keys[key][0]})')
                 continue
             keys[key] = v; per_src[group(v[0])] += 1
     if SEPARABLE:
