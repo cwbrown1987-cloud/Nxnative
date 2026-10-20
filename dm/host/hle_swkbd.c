@@ -70,10 +70,14 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
     if (ilen > 0 && work) swkbd_u16_to_u8((const uint16_t *)(work + ioff), (size_t)ilen, init, sizeof init);
 
     const char *script = getenv("DM_KBD");
-    // Freeze the guest clock while the keyboard is up (in offline single-player, monsters should not keep attacking while the player types, nor should ticks be caught up on return; this follows the native iOS experience, not the original game's Switch semantics of "the clock keeps running while an applet holds the foreground")
-    if (!script) guest_clock_freeze_for(2, 1);
+    // The guest clock keeps running while the keyboard is up, as on the Switch: the applet blocks the calling thread and the game's other threads go on in real time. d2r-mobile froze it here
+    // (monsters should not attack while the player typed), which left the threads that wait on the clock spinning: Octopath Traveler 0's sound stuttered and the input box lagged on an iPhone
+    // (5,035 wakeups a second while the box was up, about 1,800 otherwise; 7,936 on the Mac with the box held 8 s). The inline keyboard below still freezes it: there the host's input box
+    // blocks a game that on hardware keeps running and steps by real time (Monster Hunter Rise)
+    // Test switch DM_TEST_SWKBD_HOLD_MS=<ms> (with DM_KBD): the keyboard stays up that long before DM_KBD's text is returned, the way a player types into the input box (for reproducing on the Mac what the game's other threads do meanwhile)
+    static int hold = -1; if (hold < 0) { const char *h = getenv("DM_TEST_SWKBD_HOLD_MS"); hold = h ? atoi(h) : 0; }
+    if (script && hold > 0) usleep((useconds_t)hold * 1000);
     int r = script ? (snprintf(text, sizeof text, "%s", script), 1) : input(title, sub, guide, init, maxlen > 0 ? maxlen : 0, text, sizeof text);
-    if (!script) guest_clock_freeze_for(2, 0);
     g_swkbd_numeric_max = -1;   // the numeric box mark applies to this one time only (set by dm_textinput.c before bringing up the keyboard)
     LOG("swkbd: title '%s' initial '%s' limit %d → %s%s%s", title, init, maxlen,
         r > 0 ? "OK '" : r == 0 ? "cancel" : "no window, treated as cancel", r > 0 ? text : "", r > 0 ? "'" : "");
