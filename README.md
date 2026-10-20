@@ -22,27 +22,29 @@ This project is built on other people's work:
 
 All of these are tested on an iPhone and playable:
 
-| Game | IPA | Notes |
-|---|---|---|
-| Super&nbsp;Mario&nbsp;Bros.&nbsp;Wonder | ~4&nbsp;GB | |
-| Fire&nbsp;Emblem&nbsp;Engage | ~15&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
-| Metroid&nbsp;Dread | ~5&nbsp;GB | |
-| 13&nbsp;Sentinels:&nbsp;Aegis&nbsp;Rim | ~5&nbsp;GB | |
-| Super&nbsp;Mario&nbsp;3D&nbsp;World&nbsp;+&nbsp;Bowser's&nbsp;Fury | ~3&nbsp;GB | |
-| The&nbsp;Legend&nbsp;of&nbsp;Zelda:&nbsp;Breath&nbsp;of&nbsp;the&nbsp;Wild | ~16&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
-| The&nbsp;Legend&nbsp;of&nbsp;Zelda:&nbsp;Link's&nbsp;Awakening | ~6&nbsp;GB | |
-| Super&nbsp;Mario&nbsp;Odyssey | ~6&nbsp;GB | |
-| Hades | ~4&nbsp;GB | |
-| Hyrule&nbsp;Warriors:&nbsp;Age&nbsp;of&nbsp;Calamity | ~15&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
-| Fire&nbsp;Emblem:&nbsp;Three&nbsp;Houses | ~13&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
-| Super&nbsp;Mario&nbsp;Galaxy | ~3&nbsp;GB | |
-| The&nbsp;Legend&nbsp;of&nbsp;Zelda:&nbsp;Tears&nbsp;of&nbsp;the&nbsp;Kingdom | ~17&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
-| Monster&nbsp;Hunter&nbsp;Rise | ~22&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
-| Ace&nbsp;Attorney&nbsp;Investigations&nbsp;Collection | ~7&nbsp;GB | |
-| Hades&nbsp;II | ~4&nbsp;GB | |
-| Unicorn&nbsp;Overlord | ~4&nbsp;GB | |
-| Rhythm&nbsp;Heaven&nbsp;Groove | ~3&nbsp;GB | |
-| Octopath&nbsp;Traveler&nbsp;0 | ~4&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
+| Game | Update | IPA | Notes |
+|---|---|---|---|
+| Super&nbsp;Mario&nbsp;Bros.&nbsp;Wonder | 1.2.1 | ~4&nbsp;GB | |
+| Fire&nbsp;Emblem&nbsp;Engage | 2.0.0 | ~15&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
+| Metroid&nbsp;Dread | 2.1.0 | ~5&nbsp;GB | |
+| 13&nbsp;Sentinels:&nbsp;Aegis&nbsp;Rim | 1.10 | ~5&nbsp;GB | |
+| Super&nbsp;Mario&nbsp;3D&nbsp;World&nbsp;+&nbsp;Bowser's&nbsp;Fury | 1.2.2 | ~3&nbsp;GB | |
+| The&nbsp;Legend&nbsp;of&nbsp;Zelda:&nbsp;Breath&nbsp;of&nbsp;the&nbsp;Wild | 1.9.0 | ~16&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
+| The&nbsp;Legend&nbsp;of&nbsp;Zelda:&nbsp;Link's&nbsp;Awakening | 1.1.0 | ~6&nbsp;GB | |
+| Super&nbsp;Mario&nbsp;Odyssey | 1.4.1 | ~6&nbsp;GB | |
+| Hades | 1.0.38233 | ~4&nbsp;GB | |
+| Hyrule&nbsp;Warriors:&nbsp;Age&nbsp;of&nbsp;Calamity | 1.3.0 | ~15&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
+| Fire&nbsp;Emblem:&nbsp;Three&nbsp;Houses | 1.2.0 | ~13&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
+| Super&nbsp;Mario&nbsp;Galaxy | 1.3.1 | ~3&nbsp;GB | |
+| The&nbsp;Legend&nbsp;of&nbsp;Zelda:&nbsp;Tears&nbsp;of&nbsp;the&nbsp;Kingdom | 1.4.3 | ~17&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
+| Monster&nbsp;Hunter&nbsp;Rise | 16.0.2 | ~22&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
+| Ace&nbsp;Attorney&nbsp;Investigations&nbsp;Collection | 1.0.0.2 | ~7&nbsp;GB | |
+| Hades&nbsp;II | none&nbsp;(base&nbsp;game) | ~4&nbsp;GB | |
+| Unicorn&nbsp;Overlord | 1.05 | ~4&nbsp;GB | |
+| Rhythm&nbsp;Heaven&nbsp;Groove | none&nbsp;(base&nbsp;game) | ~3&nbsp;GB | |
+| Octopath&nbsp;Traveler&nbsp;0 | 1.0.5 | ~4&nbsp;GB | Upgraded to 60 fps (30 fps on Switch) |
+
+Each game is supported on the update in the table only: the script packs that one and stops when it is missing. The 60 fps upgrades in particular change the game's own code at places found in that update, which move in every other one.
 
 | | |
 |:---:|:---:|
@@ -70,7 +72,7 @@ brew install --cask dotnet-sdk
 python3 -m pip install lz4 capstone fonttools
 ```
 
-**2. Put one game's NSPs in a folder**, base game (an NSP, or an XCI cartridge dump) and update (and any DLC):
+**2. Put one game's NSPs in a folder**, base game (an NSP, or an XCI cartridge dump) and the update listed in the table above (and any DLC):
 
 ```
 ~/Games/MarioWonder/
