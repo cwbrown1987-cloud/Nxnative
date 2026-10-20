@@ -10,7 +10,6 @@ import os, re, sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-STAGES = {'vs': 0, 'ps': 1, 'gs': 2, 'hs': 3, 'ds': 4, 'cs': 5}   # NVN shader stage numbers
 
 
 class Game:
@@ -89,8 +88,6 @@ def header(g):
     """the host's game_profile.h: the profile constants the host uses, as macros"""
     q = lambda s: '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
     mods = g.words('modules')
-    ssbo = dict(g.pairs('nvn_ssbo_bases'))
-    sb = ' : '.join(f'(stage) == {STAGES[k]} ? {v}' for k, v in ssbo.items()) + ' : -1'
     vers = ', '.join('{' + q(b['main']) + ', ' + q(b['display']) + '}' for b in g.builds().values() if 'main' in b)
     pi = g.get('present_interval', 'game')   # present interval: game = as the game sets it (as on the Switch), display = one frame per display tick
     if pi not in ('game', 'display'): sys.exit(f'{g.id}: present_interval must be game or display: {pi}')
@@ -144,13 +141,6 @@ def header(g):
          f'#define DM_GAME_MEM_USED {int(g.get("mem_used", "0x4000000"), 0):#x}ull',   # used memory reported beside the heap (hle_svc.c GetInfo UsedMemorySize)
          f'#define DM_GAME_ARGS {q(g.get("game_args", ""))}',   # game arguments when the command line gives none (main.c; Octopath Traveler 0: Unreal's -SwitchVirtualAddressSpaceSize=)
          f'#define DM_GAME_MEM_MAP_LIMIT {int(mml == "on")}',
-         f'#define DM_GAME_NVN_SSBO_BASE(stage) ({sb})',
-         f'#define DM_GAME_NVN_TEX_BASE {g.int("nvn_tex_base"):#x}',
-         f'#define DM_GAME_NVN_TEX_SLOTS {g.int("nvn_tex_slots")}',
-         f'#define DM_GAME_NVN_SAMP_BASE {g.int("nvn_samp_base"):#x}',
-         f'#define DM_GAME_NVN_IMG_BASE {g.int("nvn_img_base"):#x}',
-         f'#define DM_GAME_NVN_IMG_SLOTS {g.int("nvn_img_slots")}',
-         *([f'#define DM_GAME_NVN_SEPTEX_BASE {g.int("nvn_septex_base"):#x}', f'#define DM_GAME_NVN_SEPTEX_SLOTS {g.int("nvn_septex_slots")}'] if g.get('nvn_septex_base', '') else []),   # a separate texture table of its own (Monster Hunter Rise)
          f'#define DM_GAME_DISPLAY_VERSIONS {vers}',
          f'#define DM_GAME_PRESENT_DISPLAY {int(pi == "display")}',
          f'#define DM_GAME_CORE_PREEMPT {int(cp == "on")}',

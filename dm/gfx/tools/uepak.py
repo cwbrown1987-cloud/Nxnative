@@ -2,7 +2,7 @@
 # Unreal Engine game files for the shader tools: pak files (version 11, UE 4.26 and later; Octopath Traveler 0 is UE5), shader code archives (.ushaderbytecode version 2) and the job files the Mac host decodes Oodle with
 # (DM_OODLE_JOB, dm/host/hle_oodle.c). Octopath Traveler 0 keeps everything in one pak, Octopath_Traveler0/Content/Paks/pakchunk0-Switch.pak (1.5 GB, 159,757 files): its index is AES-256 encrypted,
 # its files are stored or Oodle-compressed in blocks. Its two shader code archives are stored, but every shader inside is Oodle-compressed (Mermaid, block header 8C 0A), which no decoder in this
-# repository can undo, so the game's own OodleLZ_Decompress decodes them in the Mac host (profile key shader_ue_decode, the NSP script's decode_ue_shaders).
+# repository can undo, so the game's own OodleLZ_Decompress decodes them in the Mac host (the NSP script's decode_ue_shaders, for any game with Unreal paks).
 # The AES key is in main (Unreal embeds it): the 32-byte window of main's read-only or data segment that decrypts the index start to its mount point ("../../../"; Octopath Traveler 0: one window of
 #   116,287 tried). It is only kept in memory, never printed or written.
 # Pak footer (version 11, the last 0xdd bytes): encryption key GUID (16), encrypted index flag (u8), magic 0x5A6F12E1, version (u32), index offset (u64), index size (u64), index SHA-1 (20),
@@ -141,6 +141,16 @@ def decoded_archive(b, raws):
 def paks(romfs):
     """Every pak under the RomFS"""
     return sorted(os.path.join(dp, f) for dp, _, fs in os.walk(romfs) for f in fs if f.endswith('.pak'))
+
+def unreal_paks(romfs):
+    """The paks under the RomFS that Unreal wrote (its magic in the footer, any version): a game whose shaders the NSP script decodes (decode_ue_shaders) and shader_split.py reads"""
+    out = []
+    for p in paks(romfs):
+        try:
+            with open(p, 'rb') as f: f.seek(-0xdd, 2); ft = f.read(0xdd)
+        except OSError: continue   # shorter than a footer
+        if ft.find(struct.pack('<I', PAK_MAGIC)) >= 1: out.append(p)
+    return out
 
 def job(romfs, main_nso, work):
     """The shader code archives of every pak under the RomFS into <work>/archives, and one Oodle job (<work>/oodle.job) of every compressed shader in them; <work>/job.json lists them"""

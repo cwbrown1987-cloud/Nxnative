@@ -119,6 +119,9 @@ typedef struct { int32_t first, n; NVNbufferRange r[16]; } p_bind_vbuf;
 typedef struct { int32_t stage, index; uint64_t addr, size; } p_bind_buf;  // UBO / SSBO
 // defer / src: the handles of BindTexturesDeferred are read from src at execution time (h at recording time is only a fallback); the replay layer refreshes them with bh_fresh before reading the record (nvn_mtl.m)
 typedef struct { int32_t stage, first, n, defer; uint64_t src; uint64_t h[32]; } p_bind_handles; // Separate texture / sampler handles
+// Texture slots of a stage: 0-127 nvnCommandBufferBindTexture's (combined handles), 128-255 the separate texture binds. The driver keeps the two in tables of their own (c2 0x20 + 8 r and
+// 0x168 + 8 r, dm/gfx/tools/dmsh_build.py), which the shaders' reflection names as these slots, so a game may bind both kinds in the same frame (Monster Hunter Rise: BindTexture slot 0 beside separate slots 0-4)
+#define NVN_SEPTEX_SLOT0 128
 typedef struct { int32_t face, value_mask, mask, ref, which; } p_stencil;  // which: 0 value mask 1 write mask 2 reference value
 typedef struct { float factor, units, clamp; } p_poly_offset;
 typedef struct { int32_t prim, first, count, instances, base_instance; uint64_t ind; uint64_t mdi_cnt; int32_t mdi_i, pad; } p_draw;   // instances 0 counts as 1; ind != 0: DrawArraysIndirect, the arguments are read by the GPU from that address; mdi_cnt != 0: draw mdi_i of an indirect-count multi-draw (drawn only while mdi_i < the u32 at mdi_cnt)

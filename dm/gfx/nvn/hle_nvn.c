@@ -846,17 +846,11 @@ static p_bind_handles *bind_handles(NVNcommandBuffer *c, int op, int st, int fir
 NVN(nvnCommandBufferBindImages, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNimageHandle *h) {
     bind_handles(c, OP_BIND_IMG, st, first, n, (const uint64_t *)h);
 }
-// Separate texture binds: on hardware they fill their own handle table (c2 0x168 + 8 slot), apart from BindTexture's. A game that uses both (Monster Hunter Rise: BindTexture slot 0 beside separate slots 0-4
-// in the same frames) has nvn_septex_base in its profile, and its separate binds go to slots 128 + n of the replay's table, which its shaders' reflection names; other games keep slots 0-127 for both
-#ifdef DM_GAME_NVN_SEPTEX_BASE
-#define SEPTEX_SLOT0 128
-#else
-#define SEPTEX_SLOT0 0
-#endif
+// Separate texture binds: on hardware they fill their own handle table (c2 0x168 + 8 slot), apart from BindTexture's, so they go to slots 128 + n (NVN_SEPTEX_SLOT0)
 NVN(nvnCommandBufferBindSeparateTextures, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNseparateTextureHandle *h) {
-    bind_handles(c, OP_BIND_TEX, st, SEPTEX_SLOT0 + first, n, (const uint64_t *)h);
+    bind_handles(c, OP_BIND_TEX, st, NVN_SEPTEX_SLOT0 + first, n, (const uint64_t *)h);
 }
-NVN(nvnCommandBufferBindSeparateTexture, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNseparateTextureHandle h) { uint64_t v; memcpy(&v, &h, 8); bind_handles(c, OP_BIND_TEX, st, SEPTEX_SLOT0 + i, 1, &v); }   // single (Engage): as the plural version
+NVN(nvnCommandBufferBindSeparateTexture, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNseparateTextureHandle h) { uint64_t v; memcpy(&v, &h, 8); bind_handles(c, OP_BIND_TEX, st, NVN_SEPTEX_SLOT0 + i, 1, &v); }   // single (Engage): as the plural version
 NVN(nvnCommandBufferBindSeparateSamplers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNseparateSamplerHandle *h) {
     bind_handles(c, OP_BIND_SAMP, st, first, n, (const uint64_t *)h);
 }

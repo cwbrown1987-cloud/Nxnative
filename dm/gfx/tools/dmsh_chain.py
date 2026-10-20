@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Translation chain version of the B shader library (the build result must be determined by source alone).
 # Chain version V = first 12 digits of the sha256 of the contents of the following in-repo files + the translation options: this script, dmsh_build.py, dmsh_fetch.py (readable-tile version), the dmsh_xlate sources (Program.cs, csproj),
-# from the current game profile (dm/games/<id>/, chosen by DM_GAME, default smbw) the mapping table (including the conflict table), the vertex / pixel pair table (shader_pairs.tsv, used by vs_pad), the answer table for translation queries (dmsh_facts.py and shader_facts.tsv),
+# from the current game profile (dm/games/<id>/, chosen by DM_GAME) the mapping table (including the conflict table), the vertex / pixel pair table (shader_pairs.tsv, used by vs_pad), the answer table for translation queries (dmsh_facts.py and shader_facts.tsv),
 # the keys of the profile's game.tsv that affect the build (nvn_*, shader_*), the iOS compile convention ios_metal.py, and the tool lock dmsh_chain.lock (measured fingerprints of the Ryujinx shader dll / spirv-cross / metal compiler). The tables differ per game, so V does too.
 # The build (dmsh_build.py) writes into <cache dir>/b-<V>/ and the reflection json records chain = V; at compile time the host takes V from the game profile's dmsh_chain.h, loads only from b-<V>/ and verifies each json.
 # Usage: dmsh_chain.py                 print V (default options)

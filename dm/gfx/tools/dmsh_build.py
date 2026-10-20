@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # Route B offline build: original Switch shaders → SPIR-V (dmsh_xlate, the Ryujinx translator) → spirv-cross MSL → metallib + replay reflection JSON.
 # No translation at runtime (iOS has no JIT): build output goes into the shader cache directory, file name = Switch control segment key (dm_ctl_sha16, same as column 4 of shader_map.tsv) + "_b".
-# Source of query answers: the answer table in the game profile, dm/games/<id>/shader_facts.tsv (dmsh_facts.py) - texture types, vertex attribute / fragment output component types, compute thread group size and shared memory; the build needs no PC version files.
-# Usage: dmsh_build.py <Switch package dir> <output cache dir> [key...] (no keys = all); build output is actually written to <output cache dir>/b-<chain version>/ (same for IOSOUT), for the chain version see dmsh_chain.py   Environment: DM_GAME=game profile (default smbw, dm/games/), XLATE=path to the translation tool (default the in-repo dmsh_xlate_bin), DMSH_CAS=content-addressed cache dir (default <output cache dir>/cas), DMSH_PREFILL=Mac library root[=iOS library root] (separated by :, their b-*/ go into the MSL-keyed compile cache first; sibling b-*/ always do), J=concurrency
-# Graphics shaders embedded in the executable itself (mapping table rows main.rodata@offset) are extracted from MAIN (Switch main NSO, default 3.3.94012 Update/ExeFS/main); extracting the NSO needs lz4, run with dm's venv python
+# Source of query answers: the answer table in the game profile, dm/games/<id>/shader_facts.tsv (dmsh_facts.py) - texture types, vertex attribute / fragment output component types, compute thread group size and shared memory.
+# Usage: dmsh_build.py <Switch package dir> <output cache dir> [key...] (no keys = all); build output is actually written to <output cache dir>/b-<chain version>/ (same for IOSOUT), for the chain version see dmsh_chain.py   Environment: DM_GAME=game profile (required, dm/games/<id>), XLATE=path to the translation tool (default the in-repo dmsh_xlate_bin), DMSH_CAS=content-addressed cache dir (default <output cache dir>/cas), DMSH_PREFILL=Mac library root[=iOS library root] (separated by :, their b-*/ go into the MSL-keyed compile cache first; sibling b-*/ always do), J=concurrency
 # Build output: <key>_b.metallib, <key>_b.json (replay reflection, including drv_reads, the runtime read offsets into driver segments c0 / c2), <key>_b.metal (MSL)
 # Environment IOSOUT=dir: the same MSL also goes through dm/ios/tools/ios_metal.compile to produce an iphoneos metallib + reflection (chain_metal records the iOS compile convention)
 # Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately)
@@ -15,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import dmsh_chai
 _bad = dmsh_chain.check_tools()
 if _bad: sys.exit('\n'.join('[RED] translation chain tools do not match the lock file: ' + b for b in _bad) + '\n(if the tools changed, run dmsh_chain.py --update-lock and commit the lock file; if the translator just was not rebuilt, rebuild it)')
 CHAIN = dmsh_chain.version(); out = os.path.join(out, 'b-' + CHAIN)
-GAME = dmsh_chain.GAME   # the current game profile (DM_GAME, default smbw): the tables and NVN constants come from here
+GAME = dmsh_chain.GAME   # the current game profile (DM_GAME): the tables come from here
 if f'"{CHAIN}"' not in open(dmsh_chain.HEADER).read(): sys.exit(f'[RED] {dmsh_chain.HEADER} does not hold the current translation chain version {CHAIN}: run dmsh_chain.py --header first (otherwise the host cannot find these libraries)')
 XLATE = os.environ.get('XLATE', os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate'))
 FACTS = dmsh_facts.load()
@@ -24,7 +23,6 @@ IOSOUT = os.environ.get('IOSOUT')   # if set, also build the iOS version (iphone
 if IOSOUT:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../ios/tools')); import ios_metal
     IOSOUT = os.path.join(IOSOUT, 'b-' + CHAIN); os.makedirs(IOSOUT, exist_ok=True)
-MAIN = os.environ.get('MAIN', f'{DM_ROOT}/data/switch/3.3.94012/Update/ExeFS/main')
 MAP = str(GAME.table('shader_map.tsv'))
 BF_WANT_FILE = str(GAME.table('bf_want.tsv'))
 BF_WANT = {line.strip() for line in open(BF_WANT_FILE) if line.strip() and not line.lstrip().startswith('#')} if os.path.exists(BF_WANT_FILE) else set()
@@ -39,18 +37,15 @@ MAC_RECORD = ' '.join(MAC_METAL) + '; xcrun -sdk macosx metallib'
 def mac_compile(msl, air, lib):   # same interface as ios_metal.compile
     subprocess.run([*MAC_METAL, msl, '-o', air], check=True)
     subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', air, '-o', lib], check=True)
-# Texture handle table (the driver segment holding texture instructions' immediate handles): Mario (NVN 55) uses 0x20 + 8 r, 32 slots - the immediate handles of all 4888 shaders are exactly 0x20..0xF0 in steps of 8 (D2R's older driver used 0x168).
-#   This game uses only combined handles (nvnCommandBufferBindTexture), with no separate samplers; the image handle table is still at 0x120 + 8 r (8 slots, right after the texture table; measured 0x120 / 0x128 / 0x130 on agl's 10 compute shaders, the same address as D2R).
-TEX_BASE, TEX_SLOTS, SAMP_BASE, IMG_BASE, IMG_SLOTS = (GAME.int(k) for k in ('nvn_tex_base', 'nvn_tex_slots', 'nvn_samp_base', 'nvn_img_base', 'nvn_img_slots'))
-SSBO = {k: int(v, 0) for k, v in GAME.pairs('nvn_ssbo_bases')}   # c0 storage buffer table bases (per stage)
-# A separate texture table of its own (Monster Hunter Rise: bound / combined handles at 0x20 + 8 r, separate texture binds at 0x168 + 8 r, both in use): its slots are reported as 128 + r, where
-# the replay keeps the separate binds of such a profile (hle_nvn.c SEPTEX_SLOT0). Profiles without the key have one texture table (nvn_tex_base) for both kinds of bind
-SEPTEX_BASE, SEPTEX_SLOTS = (GAME.int('nvn_septex_base'), GAME.int('nvn_septex_slots')) if GAME.get('nvn_septex_base', '') else (None, 0)
-# The translator (dmsh_xlate/Program.cs) has the texture / sampler handle table bases built in, used only to turn a handle into a slot and look up that slot's texture / image type in the answer table (TexSlot); the bindings' slots are decoded by this script from the profile (decode_tex).
-#   So the profile's bases must equal the translator's only when the answer table has per-slot texture / image facts (otherwise the wrong slot is looked up); Engage (0x168 / 0x568) has no such facts, so the translator needs no change
-_xb = re.search(r'const int TexBase = (0x[0-9a-fA-F]+), SampBase = (0x[0-9a-fA-F]+);', open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dmsh_xlate/Program.cs')).read())
-if (not _xb or (int(_xb.group(1), 16), int(_xb.group(2), 16)) != (TEX_BASE, SAMP_BASE)) and any(f.get('tex') or f.get('img') for f in FACTS.values()):
-    sys.exit(f'[RED] game profile {GAME.id}: nvn_tex_base / nvn_samp_base ({TEX_BASE:#x} / {SAMP_BASE:#x}) differ from the values built into the translator (dmsh_xlate/Program.cs TexBase / SampBase), and the answer table has per-slot texture / image facts: make the translator take the values from the profile first')
+# The NVN driver's constant segments have one layout in every game (NVN 53 and 55 drivers, SDK 6 to 21: the handles of every shader of every profile fit it); nvn_mtl.m fills them the same way at run time.
+#   c2 0x20 + 8 r: handles bound with nvnCommandBufferBindTexture (combined texture and sampler), slot r. The driver has 32 such slots, but a game may bind higher ones, whose words lie in the
+#     image table (Hades II binds slot 34, at 0x130, and no image), so a texture instruction's handle anywhere below the separate texture table names a combined slot
+#   c2 0x120 + 8 r: images (nvnCommandBufferBindImage), slot r < 8
+#   c2 0x168 + 8 r: separate textures (nvnCommandBufferBindSeparateTexture), reported as slot 128 + r, where the host binds them (hle_nvn.c, NVN_SEPTEX_SLOT0); Unity, Unreal and RE Engine bind these
+#   c2 0x568 + 8 r: separate samplers (nvnCommandBufferBindSeparateSampler), slot r < 128
+#   c0 base + 0x10 r: storage buffer r (64-bit address, 32-bit size), base vertex 0x110, compute 0x310, pixel 0x510 (the hull / domain stages' bases were never seen)
+TEX_BASE, IMG_BASE, IMG_SLOTS, SEPTEX_BASE, SEPTEX_SLOT0, SAMP_BASE = 0x20, 0x120, 8, 0x168, 128, 0x568
+SSBO = {'vs': 0x110, 'cs': 0x310, 'ps': 0x510}
 
 def records(d):
     r = [m.start() for m in re.finditer(b'BTCDBTCD', d)]
@@ -92,8 +87,7 @@ def shader_key(key, name, rec):
     MSL. Before, these were only in the chain version, so a build after changing only them hit the old entries and filed them under the new version (with an empty DMSH_CAS as the workaround)"""
     pc = dmsh_facts.row(key, FACTS[key]).encode() if key in FACTS else 'missing'.encode()
     map_row = MAP_ROWS.get(key, 'missing'.encode()) + MAP_CONFLICT_ROWS.get(key, b'')
-    embedded = rec if name.startswith('main.rodata@') else b''
-    payload = (b'record\0' + rec + b'\0map\0' + map_row + b'\0pc\0' + pc + b'\0embedded\0' + embedded +
+    payload = (b'record\0' + rec + b'\0map\0' + map_row + b'\0pc\0' + pc +
                b'\0tools\0' + TOOL_FP + b'\0code\0' + CODE_FP.encode() +
                b'\0rule\0' + shader_rule_source(name) + b'\0profile\0' + PROFILE_ROWS + b'\0pairs\0' + ','.join(sorted(PAIRS.get(key, ()))).encode())
     return hashlib.sha256(payload).hexdigest()
@@ -229,7 +223,7 @@ def fetch_finish(key, src, refl):
     write_refl(key, refl)
     return refl
 
-pc_of, loc, stage_of = {}, {}, {}
+pc_of, loc = {}, {}
 MAP_ROWS, MAP_CONFLICT_ROWS = {}, {}
 for raw in open(MAP, 'rb'):
     c = raw.rstrip(b'\n').split(b'\t')
@@ -240,21 +234,12 @@ for raw in open(MAP + '.conflicts.tsv', 'rb'):
 for ln in open(MAP):
     c = ln.rstrip('\n').split('\t')
     if len(c) > 4 and c[0].endswith('.bin'): pc_of.setdefault(c[3], c[4]); loc.setdefault(c[3], (c[0], int(c[1])))
-    if len(c) > 4 and c[0].startswith('main.rodata@'):   # embedded: location = main image offset (start of the control segment), stage taken from column 3 of the mapping table
-        pc_of.setdefault(c[3], c[4]); loc.setdefault(c[3], (c[0], int(c[0].split('@')[1], 16))); stage_of[c[3]] = {'vertex': 'vs', 'pixel': 'ps'}[c[2]]
 for ln in open(MAP + '.conflicts.tsv'):
     c = ln.rstrip('\n').split('\t')
     if len(c) > 1 and not ln.startswith('#') and not ln.startswith('dm_') and c[0] in pc_of: pc_of[c[0]] = c[1]
 
-def main_rec(mi, o):
-    """Embedded shader → bytes in the same layout as a package record: in a package record the code area starts at +0x38 (0x30 header + SPH + instructions, marker 78563412), immediately followed by the control segment (34127698);
-        the embedded code area sits immediately before the control segment (checked 5: code area length 0x100–0x300, c1 empty in all, consistent with the layout of the same-named package records)"""
-    g = mi.rfind(bytes.fromhex('78563412'), o - 0x1000, o)
-    if g < 0 or mi[o:o + 4] != bytes.fromhex('34127698'): sys.exit(f'[RED] main image @{o:#x} is not the control section of an embedded shader (MAIN={MAIN})')
-    return bytes(0x38) + mi[g:o + 0x880]
-
 def job_for(key, name, rec, w):
-    ci = rec.find(bytes.fromhex('34127698')); code = rec[0x38:ci]; stage = stage_of.get(key, name[:2])
+    ci = rec.find(bytes.fromhex('34127698')); code = rec[0x38:ci]; stage = name[:2]
     c1o, c1t = struct.unpack_from('<2I', rec, ci + 0x700)   # control segment +0x700: c1 relative to the start of the instruction area, +0x704: total length of the instruction area (c1 = what lies between the two; lengths across the whole library are 0 / 256 / 512 / 768)
     c1 = rec[0x38 + c1o:0x38 + c1t]
     if stage != 'cs': code = code[0x30:]   # strip the 0x30 header (the 0x50 SPH after it is read by the translator itself)
@@ -267,7 +252,7 @@ def job_for(key, name, rec, w):
     tf = tf_layout(key, rec[ci:]) if stage == 'vs' else None
     j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), **({'tf': tf} if tf else {}),
          'debug': os.environ.get('XLATE_DEBUG', '1') != '0', 'reduced': os.environ.get('XLATE_REDUCED', '1') == '1'}   # translation options (see dmsh_xlate/Program.cs); relaxed precision is on by default (GPU float last-bit error does not enter game state, whole frame −26% on the second Mac)   # c1: used by the translator to read indirect jump tables
-    if key not in FACTS: j['pc_missing'] = True; return j, c1   # not in the answer table: queries use defaults (listed separately in the summary)
+    if key not in FACTS: j['no_facts'] = True; return j, c1   # not in the answer table: queries use defaults (listed separately in the summary)
     j.update(FACTS[key])
     return j, c1
 
@@ -359,9 +344,8 @@ def decode_tex(name):
     if re.match(r'[a-z]+_i', name):   # image
         return next((slot(x, IMG_BASE, tb) for x in words if IMG_BASE <= x * 4 < IMG_BASE + 8 * IMG_SLOTS and slot(x, IMG_BASE, tb) is not None), None), None, ty
     tw = [o0] if ty == 3 else words
-    t = next((slot(x, TEX_BASE, tb) for x in tw if slot(x, TEX_BASE, tb) is not None and x * 4 < TEX_BASE + 8 * TEX_SLOTS), None)
-    if t is None and SEPTEX_BASE is not None:
-        t = next((128 + slot(x, SEPTEX_BASE, tb) for x in tw if slot(x, SEPTEX_BASE, tb) is not None and x * 4 < SEPTEX_BASE + 8 * SEPTEX_SLOTS), None)
+    t = next((slot(x, TEX_BASE, tb) for x in tw if slot(x, TEX_BASE, tb) is not None and x * 4 < SEPTEX_BASE), None)
+    if t is None: t = next((SEPTEX_SLOT0 + slot(x, SEPTEX_BASE, tb) for x in tw if slot(x, SEPTEX_BASE, tb) is not None and x * 4 < SAMP_BASE), None)
     s = next((slot(x, SAMP_BASE, sb) for x in words if x * 4 >= SAMP_BASE and slot(x, SAMP_BASE, sb) is not None), None) if ty != 3 else None
     return t, s, ty
 
@@ -426,8 +410,7 @@ def reflect(key, stage, msl, res):
     return binds
 
 DRV_FILL = {0: [(b, b + 0x100) for b in sorted(SSBO.values())],   # c0: storage buffer address tables (vertex / compute / pixel, 16 slots × 0x10 each)
-            2: [(TEX_BASE, TEX_BASE + 8 * TEX_SLOTS), (IMG_BASE, IMG_BASE + 8 * IMG_SLOTS), (SAMP_BASE, SAMP_BASE + 8 * 128)] + ([(SEPTEX_BASE, SEPTEX_BASE + 8 * SEPTEX_SLOTS)] if SEPTEX_BASE is not None else [])}
-# c2: texture handle table (Mario 0x20 + 8 r, 32 slots; Engage 0x168 + 8 r, 128 slots), image handle table (0x120 + 8 r, 8 slots), separate sampler handle table (0x568 + 8 r, 128 slots; the replay layer fills them all)
+            2: [(TEX_BASE, SEPTEX_BASE), (IMG_BASE, IMG_BASE + 8 * IMG_SLOTS), (SEPTEX_BASE, SAMP_BASE), (SAMP_BASE, SAMP_BASE + 8 * 128)]}   # c2: the handle tables above, all filled by the replay layer
 
 def drv_reads(src):
     """Reads of driver segments c0 / c2 in the MSL: constant index → byte range; non-constant indices are recorded as dynamic"""
@@ -459,7 +442,7 @@ _CAST = ('as_type<int>(', 'as_type<uint>(')
 def int_inputs(src):
     """Inputs that a vertex shader only uses as integers (under a float declaration every use is an as_type<int/uint> bit cast, or a plain copy) → {location: 'uint'}.
     Maxwell does no type conversion when reading vertex attribute registers: the bit pattern of integer formats (bone indices R8UI / RG8UI / RGBA8UI etc.) goes into the register as is and the shader uses it as an integer.
-    This game has no PC version to pair reflection with, so the translator's attribute type queries all defaulted to float: Metal converts the integer format to a float value, and after the bit cast it is garbage - every bone index is wrong and skinned models (the characters) are stretched into streaks or thrown off screen."""
+    The answer table has no attribute types (the machine code does not say them), so the translator's attribute type queries all defaulted to float: Metal converts the integer format to a float value, and after the bit cast it is garbage - every bone index is wrong and skinned models (the characters) are stretched into streaks or thrown off screen."""
     ins = {m.group(2): int(m.group(3)) for m in re.finditer(r'(\w+)\s+(\w+)\s*\[\[attribute\((\d+)\)\]\]', src)}
     i = src.find('vertex main0_out main0(')
     if i < 0: return {}
@@ -626,7 +609,7 @@ def finish(key, w, j, c1):
     refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
             'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None, **({'entry_z': 'main0_z'} if j['stage'] == 'vs' else {}),
             **({'entry_tf': 'main0_tf', 'tf_strides': [e[2] if e else 0 for e in j['tf']]} if j.get('tf') else {}),
-            'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['no paired PC reflection, queries use defaults'] if j.get('pc_missing') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
+            'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
             'bindings': reflect(key, j['stage'], src, res),
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],
             'raster': raster_facts(j['stage'], src), 'vs_pad': pad}
@@ -649,18 +632,8 @@ packs, jobs, c1s = {}, {}, {}
 digests, rule_fps, cache_reasons, cache_hits = {}, {}, {}, set()
 def rec_of(key):   # → (package name, the shader's record)
     name, k = loc[key]
-    if name.startswith('main.rodata@'):
-        if 'main' not in packs:
-            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../verify'))
-            try: import nsoimg
-            except ImportError as e: sys.exit(f'[RED] extracting the main NSO needs lz4 ({e}): run with $DM_ROOT/build/cache/dm/venv/bin/python')
-            packs['main'] = nsoimg.load(MAIN)
-        rec = main_rec(packs['main'], k)
-        if hashlib.sha256(rec[rec.find(bytes.fromhex('34127698')):][:0x880]).hexdigest()[:16] != key: sys.exit(f'[RED] {name}: control section hash does not match shader map key {key} (MAIN={MAIN})')
-    else:
-        if name not in packs: packs[name] = records(open(os.path.join(dm_dir, name), 'rb').read())
-        rec = packs[name][k]
-    return name, rec
+    if name not in packs: packs[name] = records(open(os.path.join(dm_dir, name), 'rb').read())
+    return name, packs[name][k]
 recs = {}
 for key in keys: recs[key] = rec_of(key); digests[key] = shader_key(key, *recs[key])
 def plain_digest(k):   # a paired pixel shader's key, also when it is not built this time
@@ -716,5 +689,5 @@ unk = [x for x in ok if any(b['kind'] == '?' for b in x['bindings'])]
 print(f'shaders with a binding whose slot was not decoded {len(noreg)}, with an unrecognized binding kind {len(unk)} (loading them at run time prints [RED] lines)')
 for e, n in collections.Counter(f"{b['kind']} {b['msl_name'][:28]}" for x in noreg + unk for b in x['bindings'] if b['kind'] == '?' or (b['kind'] in SLOTK and b.get('reg') is None)).most_common(8): print(f'  {n:5d}  {e}')
 nt = collections.Counter(nn.split(' (')[0] for x in ok for nn in x['notes'])
-for e, n in nt.most_common(8): print(f'  queries without a PC answer {n:5d}  {e}')
+for e, n in nt.most_common(8): print(f'  queries without an answer {n:5d}  {e}')
 json.dump([{'key': r[0], 'st': r[1], 'err': r[2]} for r in res], open(os.path.join(out, '_b_build.json'), 'w'), ensure_ascii=False)

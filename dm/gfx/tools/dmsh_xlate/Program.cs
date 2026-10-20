@@ -1,6 +1,6 @@
 // Original Switch shaders (Maxwell machine code) → SPIR-V (the Ryujinx.Graphics.Shader translator), for route B's offline metallib build.
 // Difference from Ryujinx.ShaderTools: the translator's "queries" are answered truthfully rather than always with defaults -
-//   texture type / image format / vertex attribute type / fragment output type / compute thread group size come from the job file (given by the PC reflection paired via the mapping table; same slot number = same resource);
+//   texture type / image format / vertex attribute type / fragment output type / compute thread group size come from the job file (the game profile's answer table shader_facts.tsv, by the slot numbers of the reflection);
 //   window origin upper-left; depth is not rewritten (z goes out unchanged, NVN's near=0 convention). A game's depth convention is runtime state (nvnDeviceSetDepthMode: Mario / Metroid etc. keep the default near=-w, the GL convention;
 //   Link's Awakening / 13 Sentinels / Engage set near=0), so dmsh_build.py adds the GL rewrite z' = z/2 + w/2 in the MSL as two entry points, main0 (rewritten, GL) and main0_z (unchanged, near=0), and the host picks by the game's convention.
 //   This used to rewrite for GL always: a near=0 game's depth was squeezed into 0.5..1, and effects that turn depth into distance (Link's Awakening's outdoor depth of field blurring the whole screen, occlusion) were all wrong.
@@ -21,7 +21,9 @@ using System.Text.Json.Nodes;
 
 static class SwshXlate
 {
-    const int TexBase = 0x20, SampBase = 0x568;   // byte base of NVN texture handles in c[2] (8 bytes per slot): 0x20 for this game (NVN 55), measured over the whole library, see TEX_BASE in dm/gfx/tools/dmsh_build.py; separate samplers keep D2R's 0x568 (unused by this game)
+    // NVN's handle tables in c[2], byte offsets, 8 bytes per slot (one layout in every game, see dm/gfx/tools/dmsh_build.py): combined textures 0x20 + 8 r, images 0x120 + 8 r (8 slots),
+    // separate textures 0x168 + 8 r (slot 128 + r), separate samplers 0x568 + 8 r
+    const int TexBase = 0x20, ImgBase = 0x120, ImgSlots = 8, SepTexBase = 0x168, SepTexSlot0 = 128, SampBase = 0x568;
 
     sealed class Accessor : IGpuAccessor
     {
@@ -41,17 +43,27 @@ static class SwshXlate
         public int QueryTextureArrayLengthFromPool() => 32;
 
         string Get(string table, int slot) => _job[table] is JsonObject t && t[slot.ToString()] is JsonNode n ? (n is JsonObject o ? (string)o["type"] : (string)n) : null;
-        int TexSlot(int handle, int cbufSlot)
+        // A handle's texture or image slot, numbered as dmsh_build.py decode_tex numbers the reflection's (so an answer table row names the slot the reflection shows): the handle ORs two
+        // c[2] words in no fixed order, so both are tried (only the first for a combined handle or a constant sampler); -1 when neither is in the table
+        static int Slot(int handle, int cbufSlot, bool image)
         {
-            (int off0, _, _) = TextureHandle.UnpackOffsets(handle);
-            int bytes = off0 * 4;
-            return (cbufSlot < 0 || (cbufSlot & 0xffff) == 2) && bytes >= TexBase && bytes < SampBase && (bytes - TexBase) % 8 == 0 ? (bytes - TexBase) / 8 : -1;
+            if (cbufSlot >= 0 && (cbufSlot & 0xffff) != 2) return -1;
+            (int w0, int w1, TextureHandleType ty) = TextureHandle.UnpackOffsets(handle);
+            foreach (int w in ty == TextureHandleType.CombinedSampler || ty == TextureHandleType.SeparateConstantSamplerHandle ? new[] { w0 } : new[] { w0, w1 })
+            {
+                int b = w * 4;
+                if (b % 8 != 0) continue;
+                if (image && b >= ImgBase && b < ImgBase + 8 * ImgSlots) return (b - ImgBase) / 8;
+                if (!image && b >= TexBase && b < SepTexBase) return (b - TexBase) / 8;
+                if (!image && b >= SepTexBase && b < SampBase) return SepTexSlot0 + (b - SepTexBase) / 8;
+            }
+            return -1;
         }
         public SamplerType QuerySamplerType(int handle, int cbufSlot = -1)
         {
-            int slot = TexSlot(handle, cbufSlot);
-            string t = slot >= 0 ? Get("tex", slot) ?? Get("img", slot) : null;
-            if (t == null) { Notes.Add($"texture handle {handle:X} (constant buffer {cbufSlot}, slot {slot}) has no PC type, using 2D"); return SamplerType.Texture2D; }
+            int slot = Slot(handle, cbufSlot, false), islot = Slot(handle, cbufSlot, true);
+            string t = (slot >= 0 ? Get("tex", slot) : null) ?? (islot >= 0 ? Get("img", islot) : null);
+            if (t == null) { Notes.Add($"texture handle {handle:X} (constant buffer {cbufSlot}, slot {slot}) has no type in the answer table, using 2D"); return SamplerType.Texture2D; }
             return t switch
             {
                 "1d" => SamplerType.Texture1D, "1darray" => SamplerType.Texture1D | SamplerType.Array,
@@ -63,16 +75,16 @@ static class SwshXlate
         }
         public TextureFormat QueryTextureFormat(int handle, int cbufSlot = -1)
         {
-            int slot = TexSlot(handle, cbufSlot);
+            int slot = Slot(handle, cbufSlot, true);
             string f = _job["img"] is JsonObject t && slot >= 0 && t[slot.ToString()] is JsonObject o ? (string)o["fmt"] : null;
-            if (f == null) { Notes.Add($"image handle {handle:X} slot {slot} has no PC format, using R8G8B8A8Unorm"); return TextureFormat.R8G8B8A8Unorm; }
+            if (f == null) { Notes.Add($"image handle {handle:X} slot {slot} has no format in the answer table, using R8G8B8A8Unorm"); return TextureFormat.R8G8B8A8Unorm; }
             return Enum.TryParse(f, true, out TextureFormat tf) ? tf : TextureFormat.R8G8B8A8Unorm;
         }
         int Local(int i) => _job["local"] is JsonArray a && a.Count > i ? (int)a[i] : 1;
         public int QueryComputeLocalSizeX() => Local(0);
         public int QueryComputeLocalSizeY() => Local(1);
         public int QueryComputeLocalSizeZ() => Local(2);
-        public int QueryComputeSharedMemorySize() => _job["shared"] is JsonNode n ? (int)n : 0;   // sum of the paired PC shader's groupshared declarations
+        public int QueryComputeSharedMemorySize() => _job["shared"] is JsonNode n ? (int)n : 0;   // the shared memory size in the compute shader's control section (shader_split.py)
         static AttributeType Attr(string s) => s switch { "sint" => AttributeType.Sint, "uint" => AttributeType.Uint, _ => AttributeType.Float };
         public GpuGraphicsState QueryGraphicsState()
         {

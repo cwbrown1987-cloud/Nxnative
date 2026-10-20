@@ -24,14 +24,15 @@
 #include "nvn_refl.h"
 #include "nvn_cover.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree (in the game profile folder, -I from the Makefile)
-#include "game_profile.h"   // game profile constants (NVN driver constant segment bases, profile id)
-// Texture slot table per stage: 0-127 the slots of the bound / combined handle table (nvnCommandBufferBindTexture; for a profile without nvn_septex_base also the separate texture binds),
-// 128-255 the separate texture binds of a profile with nvn_septex_base (Monster Hunter Rise binds both kinds, the hardware keeps them in two tables: c2 0x20 and c2 0x168)
+#include "game_profile.h"   // game profile constants (profile id, the profile's switches)
+// Texture slot table per stage: 0-127 the combined handles (nvnCommandBufferBindTexture), 128-255 the separate texture binds (NVN_SEPTEX_SLOT0, nvn_obj.h)
 #define NTEX 256
-_Static_assert(DM_GAME_NVN_TEX_SLOTS <= 128 && DM_GAME_NVN_IMG_SLOTS <= 32 && DM_GAME_NVN_TEX_BASE + 8 * DM_GAME_NVN_TEX_SLOTS <= 0xA00 && DM_GAME_NVN_IMG_BASE + 8 * DM_GAME_NVN_IMG_SLOTS <= 0xA00 && DM_GAME_NVN_SAMP_BASE + 8 * 128 <= 0xA00, "the profile's NVN handle tables exceed the driver segment buffer (0xA00) or the binding tables");
-#ifdef DM_GAME_NVN_SEPTEX_BASE
-_Static_assert(DM_GAME_NVN_SEPTEX_SLOTS <= 128 && DM_GAME_NVN_SEPTEX_BASE + 8 * DM_GAME_NVN_SEPTEX_SLOTS <= 0xA00, "the profile's separate texture table exceeds the driver segment buffer (0xA00) or the slot table");
-#endif
+// The NVN driver's constant segments, one layout in every game (dm/gfx/tools/dmsh_build.py), byte offsets: c2 holds the combined handles at 0x20 + 8 r (41 slots up to the separate table:
+// past slot 31 they lie in the image table, 0x120 + 8 r, 8 slots), the separate textures at 0x168 + 8 r and the separate samplers at 0x568 + 8 r (128 each);
+// c0 the storage buffer table at base + 0x10 r (address 64 bits, size 32 bits), base vertex 0x110, compute 0x310, pixel 0x510. The replay fills one DRV_SIZE buffer per segment a shader reads
+enum { C2_TEX = 0x20, C2_TEX_SLOTS = 41, C2_IMG = 0x120, C2_IMG_SLOTS = 8, C2_SEPTEX = 0x168, C2_SAMP = 0x568, DRV_SIZE = 0xA00 };
+_Static_assert(C2_TEX + 8 * C2_TEX_SLOTS == C2_SEPTEX && C2_SEPTEX + 8 * 128 == C2_SAMP && C2_SAMP + 8 * 128 <= DRV_SIZE && NVN_SEPTEX_SLOT0 + 128 == NTEX, "NVN driver handle tables");
+static int c0_ssbo_base(int stage) { return stage == 0 ? 0x110 : stage == 1 ? 0x510 : stage == 5 ? 0x310 : -1; }   // NVN stages 0 vertex, 1 pixel, 5 compute; geometry / hull / domain never seen
 #include "nvn_hmap.h"
 #include "../../host/dm.h"
 #import <CommonCrypto/CommonDigest.h>
@@ -3768,10 +3769,10 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
-        } else if (b->kind == NVN_RB_TEXD) {   // dynamic handle array (profile key tex_dyn_slots): element k = the texture in slot k, since c2 holds slot indices for this shader (see DRV2 below)
+        } else if (b->kind == NVN_RB_TEXD) {   // dynamic handle array (profile key tex_dyn_slots): element k = the texture in slot k (combined, else separate), since c2 holds slot indices for this shader (see DRV2 below)
             uint64_t real = 0;   // the elements that got a texture of the declared kind (logged on the shader's first encode: logged bit 0)
             for (int k = 0; k < b->n; k++) {
-                int tid = k < NTEX ? (int)(S.tex[nvn_stage][k] & 0xfffff) : 0;
+                uint64_t hk = k < 128 ? (S.tex[nvn_stage][k] ? S.tex[nvn_stage][k] : S.tex[nvn_stage][NVN_SEPTEX_SLOT0 + k]) : 0; int tid = (int)(hk & 0xfffff);
                 void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
                 if (b->dtt == (uint8_t)MTLTextureTypeTextureBuffer) {
                     if (t && t.textureType != MTLTextureTypeTextureBuffer) t = nil;   // a slot the shader does not pick here may hold another kind of texture
@@ -3816,13 +3817,13 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             USE(support_buf(), MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_DRV0 || b->kind == NVN_RB_DRV2) {
             // NVN driver constant segments: those proven unread by static analysis at packaging time are supplied as 0; those read are filled on the spot from the current bindings - c0 = storage buffer table (base + 0x10 r: address 64 bits, size 32 bits),
-            // c2 = texture handle table (0x168 + 8 r) and sampler handle table (0x568 + 8 r), the values being the NVN handles the game gave at bind time; positions read outside the tables are registered at packaging time and reported a failure at load time
+            // c2 = the handle tables (C2_*), the values being the NVN handles the game gave at bind time; positions read outside the tables are registered at packaging time and reported a failure at load time
             int bank = b->kind == NVN_RB_DRV2 ? 2 : 0;
             if (!sh->rf.drv_read[bank]) { slots[aid] = zero_bank_gpu(); USE(zero_bank(), MTLResourceUsageRead); }
             else {
-                id<MTLBuffer> db; size_t doff = arena_alloc(0xA00, &db); uint8_t *d = (uint8_t *)db.contents + doff; memset(d, 0, 0xA00);
+                id<MTLBuffer> db; size_t doff = arena_alloc(DRV_SIZE, &db); uint8_t *d = (uint8_t *)db.contents + doff; memset(d, 0, DRV_SIZE);
                 if (bank == 0) {
-                    int base = DM_GAME_NVN_SSBO_BASE(nvn_stage);   // game profile nvn_ssbo_bases (Mario: vertex 0x110, pixel 0x510, compute 0x310)
+                    int base = c0_ssbo_base(nvn_stage);
                     if (base < 0) RED_ONCE(45, "stage %d shader reads driver segment c0; the storage buffer table base was never measured", nvn_stage);
                     else for (int r = 0; r < 16; r++) { uint64_t a = S.ssbo[nvn_stage][r].addr; uint32_t n = (uint32_t)S.ssbo[nvn_stage][r].size; memcpy(d + base + 16 * r, &a, 8); memcpy(d + base + 16 * r + 8, &n, 4); }
                     // Compute also has the dispatch size at 0x200 (x, y, z) and the uniform buffer table at 0x210 + 16 r (address 64 bits, size 32 bits), ending where the storage buffer table
@@ -3843,20 +3844,16 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                         for (int r = 0; r < 16; r++) { uint64_t a = S.ubo[5][r].addr; uint32_t n = (uint32_t)S.ubo[5][r].size; memcpy(d + 0x210 + 16 * r, &a, 8); memcpy(d + 0x210 + 16 * r + 8, &n, 4); }
                     }
                 } else {
-                    for (int r = 0; r < DM_GAME_NVN_TEX_SLOTS; r++) { uint32_t th = (uint32_t)S.tex[nvn_stage][r]; memcpy(d + DM_GAME_NVN_TEX_BASE + 8 * r, &th, 4); }
-#ifdef DM_GAME_NVN_SEPTEX_BASE   // the separate texture table (Monster Hunter Rise: c2 0x168 + 8 r) from the slots after the bound ones
-                    for (int r = 0; r < DM_GAME_NVN_SEPTEX_SLOTS; r++) { uint32_t th = (uint32_t)S.tex[nvn_stage][128 + r]; memcpy(d + DM_GAME_NVN_SEPTEX_BASE + 8 * r, &th, 4); }
-#endif
-                    for (int r = 0; r < DM_GAME_NVN_IMG_SLOTS; r++) { uint32_t ih = (uint32_t)S.img[nvn_stage][r]; memcpy(d + DM_GAME_NVN_IMG_BASE + 8 * r, &ih, 4); }   // This game (NVN 55): texture handle table at 0x20 + 8 r (dm/gfx/tools/dmsh_build.py TEX_BASE)
-                    // separate sampler handle table (older driver layout such as Engage's: textures 0x168 + 8 r, samplers 0x568 + 8 r; Mario uses no separate samplers, so this is all zero)
-                    for (int r = 0; r < 128; r++) { uint32_t sh_ = (uint32_t)S.samp[nvn_stage][r]; memcpy(d + DM_GAME_NVN_SAMP_BASE + 8 * r, &sh_, 4); }
                     // A shader with dynamic handle arrays (TEXD / SAMPD, profile key tex_dyn_slots) picks a table slot at run time and ORs a texture word with a sampler word into a handle,
-                    // whose texture / sampler IDs index the arrays. Here the tables hold slot indices instead (texture slot r → r, and r << 20 when its handle carries a sampler;
-                    // sampler slot r → r << 20), and the arrays hold the bound slots, so the shader's own arithmetic picks the binding (Octopath Traveler 0: texture slots 0-10, samplers 0-4)
-                    if (sh->rf.dyn) {
-                        for (int r = 0; r < DM_GAME_NVN_TEX_SLOTS; r++) { uint64_t h = S.tex[nvn_stage][r]; uint32_t v = !h ? 0 : (uint32_t)r | (h >> 20 ? (uint32_t)r << 20 : 0); memcpy(d + DM_GAME_NVN_TEX_BASE + 8 * r, &v, 4); }
-                        for (int r = 0; r < 128; r++) { uint32_t v = S.samp[nvn_stage][r] ? (uint32_t)r << 20 : 0; memcpy(d + DM_GAME_NVN_SAMP_BASE + 8 * r, &v, 4); }
-                    }
+                    // whose texture / sampler IDs index the arrays. For it the tables hold slot indices instead of handles (texture slot r → r, and r << 20 when a combined handle carries
+                    // a sampler; sampler slot r → r << 20), and the arrays hold the bound slots, so the shader's own arithmetic picks the binding (Octopath Traveler 0: separate texture slots 0-10, samplers 0-4)
+                    const uint64_t *tx = S.tex[nvn_stage], *im = S.img[nvn_stage]; int dyn = sh->rf.dyn;
+                    for (int r = 0; r < C2_IMG_SLOTS; r++) { uint32_t ih = (uint32_t)im[r]; memcpy(d + C2_IMG + 8 * r, &ih, 4); }
+                    for (int r = 0; r < C2_TEX_SLOTS; r++) {   // a combined slot past 31 is written when it is bound and the image slot it shares is not (Hades II binds texture slot 34, no image)
+                        if (r >= 32 && (!tx[r] || (r - 32 < C2_IMG_SLOTS && im[r - 32]))) continue;
+                        uint32_t v = !dyn ? (uint32_t)tx[r] : !tx[r] ? 0 : (uint32_t)r | (tx[r] >> 20 ? (uint32_t)r << 20 : 0); memcpy(d + C2_TEX + 8 * r, &v, 4); }
+                    for (int r = 0; r < 128; r++) { uint64_t h = tx[NVN_SEPTEX_SLOT0 + r]; uint32_t v = !dyn ? (uint32_t)h : h ? (uint32_t)r : 0; memcpy(d + C2_SEPTEX + 8 * r, &v, 4); }
+                    for (int r = 0; r < 128; r++) { uint64_t h = S.samp[nvn_stage][r]; uint32_t v = !dyn ? (uint32_t)h : h ? (uint32_t)r << 20 : 0; memcpy(d + C2_SAMP + 8 * r, &v, 4); }
                 }
                 slots[aid] = g_cur_arena->gpu + doff;
                 USE(db, MTLResourceUsageRead);
@@ -4956,7 +4953,7 @@ planned:
         int touches = 0;
         for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr2->sh[st]; if (!sh || sh->stage >= 6) continue;
             for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *bb = &sh->rf.b[i]; uint64_t h;
-                if (bb->kind == NVN_RB_IMG) h = bb->reg < 32 ? i2[sh->stage][bb->reg] : 0; else if (bb->kind == NVN_RB_TEX || bb->kind == NVN_RB_TBUF) h = bb->reg < 128 ? t2[sh->stage][bb->reg] : 0; else continue;
+                if (bb->kind == NVN_RB_IMG) h = bb->reg < 32 ? i2[sh->stage][bb->reg] : 0; else if (bb->kind == NVN_RB_TEX || bb->kind == NVN_RB_TBUF) h = bb->reg < NTEX ? t2[sh->stage][bb->reg] : 0; else continue;
                 uint64_t ser = h ? h_ser(h) : 0; if (!ser) continue;
                 int j = -1; for (int m = 0; m < R.rt.n; m++) if (R.rt.color[m] && R.rt.color[m]->serial == ser) { j = m; break; }
                 if (j < 0) continue;

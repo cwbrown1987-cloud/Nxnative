@@ -49,16 +49,6 @@ tex_flush_upload	on
 # over the bound ranges that was millions of vertices a frame in battle (26 fps at any target on the Mac); only over the vertices each draw reads
 vconv_range	on
 
-# ---- NVN driver constant segments (Mario's values, the translator's built-in layout) ----
-nvn_tex_base	0x20
-nvn_tex_slots	32
-nvn_samp_base	0x568
-nvn_img_base	0x120
-nvn_img_slots	8
-nvn_ssbo_bases	vs=0x110 ps=0x510 cs=0x310
-
 # ---- Shader split ----
 shader_groups	/asset/system.rdb=system /asset/MaterialEditor.rdb=material /asset/FieldEditor4.rdb=field /asset/CharacterEditor.rdb=character /asset/EventMaker3.rdb=event /asset/ScreenLayout.rdb=layout /asset/RRPreview.rdb=preview /asset/KIDSSystemResource.rdb=kids
 shader_note	Hyrule Warriors: Age of Calamity shaders
-shader_main_glslc	on
-shader_separable	on

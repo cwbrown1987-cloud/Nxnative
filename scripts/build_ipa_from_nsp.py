@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # Unsigned IPA straight from the NSPs: identify the game (title ID → game profile dm/games/<id>/) → extract (nx_extract) → rewrite the code modules (patch_nso.py)
-#   → (profiles with shader_glslc_capture: capture the shaders the game compiles at run time, by booting it in the Mac host for a few seconds) → split out the shaders and check them against the profile's tables (shader_split.py)
-#   (a Vulkan game with shader_vk_capture, Super Mario Galaxy, boots the same way to capture the SPIR-V shaders it generates)
-#   (a game with shader_oodle, Pokémon Legends: Z-A, has its Oodle-compressed archives decoded for the split by its own decoder, run in the Mac host's tool mode)
-#   → iOS shader libraries (dmsh_build.py) → build_ipa.sh. A Vulkan game (profile key graphics vulkan: Hades) skips the NVN shader steps: vk_shaders.py translates its SPIR-V shaders instead. A game with no matching profile is surveyed (<NSP folder>/<title ID>_survey/survey.md), then gets a provisional profile guessed from
+#   → (a game that compiles shaders at run time: capture them, by booting it in the Mac host for a few seconds; an Unreal game: decode its shaders with its own Oodle, the same way)
+#   → split out the shaders and check them against the profile's tables (shader_split.py) (a Vulkan game without SPIR-V files, Super Mario Galaxy, boots the same way to capture the SPIR-V shaders it generates;
+#   a game with Trinity packs, Pokémon Legends: Z-A, has them decoded for the split by its own Oodle decoder, run in the Mac host's tool mode)
+#   → iOS shader libraries (dmsh_build.py) → build_ipa.sh. A Vulkan game (main imports Vulkan, not NVN: Hades) skips the NVN shader steps: vk_shaders.py translates its SPIR-V shaders instead.
+#   Which of these steps a game needs follows from its files (dm/games/profile_guess.py shader_sources), not from its profile. A game with no matching profile is surveyed (<NSP folder>/<title ID>_survey/survey.md), then gets a provisional profile guessed from
 #   the survey (<NSP folder>/<title ID>_build/profile/<title ID>/, outside the repository, found through DM_GAMES_DIR) and a best-effort IPA that may not boot; SURVEY_ONLY / --survey-only stops after the survey.
 # Two ways to run it: open this file in Spyder and press F5 (it uses the values under "Settings" below; an empty NSP folder or prod.keys is asked for at run time);
 #   or in a terminal: python3 scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> [options] (values given on the command line override "Settings", -h lists every option;
@@ -415,15 +416,19 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
 
     # What it means for a port
     G = pg.guess(F)   # the provisional profile's keys (write_profile writes the same)
-    vulkan = G.get('graphics', ('nvn',))[0] == 'vulkan'
+    keep = G['modules'][0].split()   # how the build will get the shaders (decided again from the extraction at build time; the survey has only a RomFS manifest, so Unreal paks are guessed from main's markers)
+    S = pg.shader_sources(mods['main']['imports'], F['glsl_src'], [m for m in keep if 'glslcCompile' in mods[m]['exports']], rom['mags']['SPIR-V'],
+                          rom['exts'].get('.pak', 0) if F.get('main_markers', set()) & {'Unreal', 'Unreal 4'} else 0, rom['mags']['Trinity pack'])
+    vulkan = S['graphics'][0] == 'vulkan'
     notes = []
     if not vulkan and 'nvnBootstrapLoader' not in mods['main']['imports']: notes.append('main imports neither nvnBootstrapLoader nor Vulkan functions: the host implements only NVN and Vulkan')
-    if vulkan: notes.append(f'{G["graphics"][1]}; the NVN shader steps are skipped' + (', and its shaders are captured by booting it on the Mac (no SPIR-V file in the RomFS)' if 'shader_vk_capture' in G else ''))
+    if vulkan: notes.append(f'{S["graphics"][1]}; the NVN shader steps are skipped' + (', and its shaders are captured by booting it on the Mac (no SPIR-V file in the RomFS)' if S['vk_capture'][0] else ''))
+    notes += [S[k][1] for k in ('glslc_capture', 'ue_decode') if S[k][0]]
     if extra: notes.append(f'modules besides main / sdk: {", ".join(f"{n} ({mods[n]["kind"]})" for n in extra)}; the provisional profile loads {G["modules"][0]} (load order main, subsdk*, sdk)')
     if rom['mags']['UnityFS'] or 'Unity IL2CPP' in F['markers']: notes.append('Unity: the shaders are Shader objects in UnityFS bundles and data.unity3d, which shader_split.py reads through unityfs.py (written for Unity 2020.3\'s Switch format, also read for 2017.4 and 2022.3; check other Unity versions first)')
-    if F['glslc']: notes.append(f'main has {F["glslc"]} GLSLC compiler output magics (0x19866891): ' + ('the shaders are compiled into main (13 Sentinels, the KTGL games): shader_main_glslc on' if 'shader_main_glslc' in G else 'not its shaders, the RomFS has shader containers (Engage)'))
-    if rom['mags']['Trinity pack']: notes.append('Trinity packs (Game Freak, arc/data.trpfs with its index data.trpfd): the shaders are BNSH inside Oodle Mermaid streams; shader_split.py decodes them with the game\'s own OodleLZ_Decompress in the Mac host, whose address dm/host/hle_oodle.c lists per main build (find it by its error strings, as for Pokémon Legends: Z-A)')
-    elif not (rom['mags']['BNSH'] or rom['mags']['BAHS']) and not rom['mags']['UnityFS'] and not vulkan and 'shader_main_glslc' not in G:
+    if F['glslc']: notes.append(f'main has {F["glslc"]} GLSLC compiler output magics (0x19866891): shader_split.py takes those that are whole outputs (13 Sentinels and the KTGL games compile their shaders into main; Unity\'s player has 11 of its own)')
+    if rom['mags']['Trinity pack']: notes.append('Trinity packs (Game Freak, arc/data.trpfs with its index data.trpfd): the shaders are BNSH inside Oodle Mermaid streams; shader_split.py decodes them with the game\'s own OodleLZ_Decompress in the Mac host, which dm/host/hle_oodle.c finds by the library\'s name string')
+    elif not (rom['mags']['BNSH'] or rom['mags']['BAHS']) and not rom['mags']['UnityFS'] and not vulkan and not F['glslc']:
         notes.append('no BNSH / BAHS at the top level: the shaders are inside compressed or other containers or in main, and must be located first')
     major = {v.split('_')[0] for v in F['sdkver']}
     if not major: notes.append('no SDK version string found')
@@ -462,8 +467,9 @@ EMPTY_TABLES = {   # the shader tables before (or, for a Vulkan game, instead of
 
 def write_profile(pdir, app, f):
     """A provisional game.tsv (+ the empty tables) from the survey, in pdir (outside the repository). An existing game.tsv is kept, so it can be edited by hand; delete it to regenerate.
-    The keys the game files decide come from dm/games/profile_guess.py (each written under its reason): the graphics API, the modules to load, the shader sources, the memory partition,
-    the SDK 8 / 10 font and NVN API, engine presets; the rest keeps game.py's defaults until the heap check (below) or a developer sets it"""
+    The keys the game files decide come from dm/games/profile_guess.py (each written under its reason): the modules to load, the memory partition, engine presets; the rest keeps game.py's
+    defaults until the heap check (below) or a developer sets it. What the files show at every build is not written: the graphics API and the shader sources (shader_sources), the shared-font
+    layout and the NVN API version (the host reads the SDK version)"""
     pdir.mkdir(parents=True, exist_ok=True)
     if (pdir / 'game.tsv').exists():
         say(f'reusing the provisional profile: {pdir / "game.tsv"} (delete it to regenerate from the survey)')
@@ -489,16 +495,12 @@ def write_profile(pdir, app, f):
          '# ---- App ----', f'name{T}{name}', f'ipa{T}{ipa_name(name, app)}', f'app_category{T}public.app-category.games', *key('pad_layout'), *key('op_mode'), '',
          '# ---- Versions ----', T.join(['build', f['version'], f['display']] + [f'{m}={F["mods"][m]["bid"]}' for m in mods]), f'package{T}{f["version"]}', f'shader_versions{T}{f["version"]}', '',
          '# ---- Files ----', *key('modules'), f'romfs_marker{T}{R["biggest"][1]}', f'zip_store{T}{":".join(store + [".metallib"])}', '',
-         '# ---- Graphics ----', *key('graphics'), *key('shader_vk_capture'), '',
          '# ---- Memory ----', *key('mem_reserve'), *key('mem_alias'), *key('mem_stack'), *key('app_pool'), '',
-         '# ---- NVN driver constant segments (Mario\'s values, the translator\'s built-in layout, unless the engine says otherwise) ----',
-         *key('nvn_tex_base', '0x20'), *key('nvn_tex_slots', '32'), f'nvn_samp_base{T}0x568', f'nvn_img_base{T}0x120', f'nvn_img_slots{T}8', f'nvn_ssbo_bases{T}vs=0x110 ps=0x510 cs=0x310', '',
-         '# ---- Shader split ----', *key('shader_groups', " ".join(groups) or "/=romfs"), f'shader_note{T}{name} shaders (provisional profile)',
-         *key('shader_main_glslc'), *key('shader_separable'), *key('shader_glslc_capture'), *key('shader_ue_decode'), *key('shader_oodle')]
+         '# ---- Shader split ----', *key('shader_groups', " ".join(groups) or "/=romfs"), f'shader_note{T}{name} shaders (provisional profile)']
     (pdir / 'game.tsv').write_text('\n'.join(L) + '\n', encoding='utf-8')
     for n, text in EMPTY_TABLES.items(): (pdir / n).write_text(text)
     say(f'wrote a provisional game profile: {pdir / "game.tsv"}')
-    for k in ('graphics', 'modules', 'shader_vk_capture', 'shader_main_glslc', 'shader_glslc_capture', 'shader_ue_decode', 'shader_oodle', 'mem_reserve', 'op_mode'):
+    for k in ('modules', 'mem_reserve', 'op_mode'):
         if k in G and G[k][1]: say(f'  {k} {G[k][0]}: {G[k][1]}')
 
 
@@ -544,7 +546,7 @@ def reused(keyfile, key):   # the note the stage's last successful run wrote bes
 
 
 def tool_files(repo):   # what the shader stages run: dm/gfx/tools' scripts and the lock of the translator's fingerprints, the profile reader, the iOS compile convention, the NSO reader
-    return sorted((repo / 'dm/gfx/tools').glob('*.py')) + [repo / p for p in ('dm/gfx/tools/dmsh_chain.lock', 'dm/games/game.py', 'dm/ios/tools/ios_metal.py', 'dm/verify/nsoimg.py')]
+    return sorted((repo / 'dm/gfx/tools').glob('*.py')) + [repo / p for p in ('dm/gfx/tools/dmsh_chain.lock', 'dm/games/game.py', 'dm/ios/tools/ios_metal.py')]
 
 
 def profile_files(g):   # every file of the game profile (game.tsv and its tables)
@@ -711,7 +713,7 @@ def host_stopped(log, rc, secs):   # a capture run whose host stopped by itself 
 
 
 def capture_glslc(repo, dirs, pkg_ver, patched, work, env, logs, g):
-    """Profiles with shader_glslc_capture on (Fire Emblem: Three Houses): the game compiles some shaders at run time with its own GLSLC, so no game file holds them. The game boots in the Mac host
+    """A game that compiles some shaders at run time with its own GLSLC (Fire Emblem: Three Houses; profile_guess.py shader_sources), so no game file holds them. The game boots in the Mac host
     (headless and silent) with DM_GLSLC_CAPTURE (dm/host/hle_glslc.c), which writes each output to <version dir>/glslc_capture, where shader_split.py reads them; the outputs are the same on every run.
     dirs: {shader version: its extraction}; a folder that already holds every file the profile's shader map names is reused"""
     want = glslc_wanted(g)
@@ -755,7 +757,7 @@ def ue_stamp(d):   # what an extraction's decoded shader archives were made from
 
 
 def decode_ue_shaders(repo, dirs, pkg_ver, patched, work, env, logs, g):
-    """Profiles with shader_ue_decode on (Octopath Traveler 0): Unreal Engine keeps its shaders in the shader code archives of its paks, each shader Oodle-compressed, and only the game's own Oodle
+    """A game with Unreal paks (Octopath Traveler 0): Unreal Engine keeps its shaders in the shader code archives of its paks, each shader Oodle-compressed, and only the game's own Oodle
     decodes them. dm/gfx/tools/uepak.py takes the archives out of the paks (the pak index is AES-encrypted with a key from main) and writes one Oodle job; the game's code decodes it in the Mac host
     (DM_OODLE_JOB, dm/host/hle_oodle.c: right before nnMain, then the host exits), and the decoded archives go to <version dir>/ue_shaders, where shader_split.py reads them.
     The job runs the packed version's code (Oodle's format does not change between builds). A folder whose stamp matches its paks is reused"""
@@ -774,7 +776,7 @@ def decode_ue_shaders(repo, dirs, pkg_ver, patched, work, env, logs, g):
         for s in ('save', 'temp'): (rd / s).mkdir(parents=True)
         PROG.set(step=f'{v}: shader archives out of the paks')
         listing, n = uepak.job(str(d / 'RomFS'), str(d / 'ExeFS/main'), str(jd))
-        if not listing: raise BuildError(f'the profile has shader_ue_decode on, but no pak under {d / "RomFS"} holds a shader code archive')
+        if not listing: raise BuildError(f'the RomFS has Unreal paks, but none under {d / "RomFS"} holds a shader code archive: where the shaders are has to be found first')
         say(f'{v}: ' + '; '.join(f'{x["name"]} {x["shaders"]:,} shaders' for x in listing) + f'; decoding {n:,} with the game\'s Oodle in the Mac host')
         PROG.set(step=f'{v}: decoding {n:,} shaders in the Mac host')
         henv = dict(env, DM_ROMFS=str(dirs[pkg_ver] / 'RomFS'), DM_SAVE=str(rd / 'save'), DM_TEMP=str(rd / 'temp'), DM_MSL_DIR=str(rd / 'msl'), DM_OODLE_JOB=str(jd / 'oodle.job'))
@@ -805,7 +807,7 @@ def vk_done(d):   # keys of the whole SPIR-V files in a capture folder (the host
 
 
 def capture_vk(repo, d, patched, work, env, logs, g):
-    """Profiles with shader_vk_capture on (Super Mario Galaxy): the game generates its SPIR-V shaders at run time (Hagi's GX shaders, from its pipeline database), so no game file holds them.
+    """A Vulkan game without SPIR-V files (Super Mario Galaxy): it generates its SPIR-V shaders at run time (Hagi's GX shaders, from its pipeline database), so no game file holds them.
     The game boots in the Mac host (headless and silent, no shader library) with DM_VK_CAPTURE (dm/gfx/vk/hle_vk.m), which writes each module to <version dir>/vk_capture, where vk_shaders.py
     reads them with the RomFS; the modules are the same on every run. The run stops once every key the profile's vk_capture.tsv lists is there; without the table, once none has been added for 20 s.
     A folder that already holds every listed key is reused"""
@@ -919,7 +921,7 @@ def data_rows(b):   # a table's data rows (without # comment lines: the header c
 def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, oodle=None):
     """The shader split into pkg, checked against the profile's tables. Returns its key (None for a provisional profile or damaged files, which never reuse it): the package is reused
     when the tools, the profile and each version's main, RomFS (paths and sizes) and run-time capture are as at the last successful split.
-    oodle: for profiles with shader_oodle on (Pokémon Legends: Z-A's Trinity packs), a function that builds the Mac host and returns the split's DM_OODLE_HOST / DM_OODLE_MODULES; called only when the split runs"""
+    oodle: for a game with Trinity packs (Pokémon Legends: Z-A; profile_guess.py shader_sources), a function that builds the Mac host and returns the split's DM_OODLE_HOST / DM_OODLE_MODULES; called only when the split runs"""
     names = ('shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv')
     PROG.stage('shader split', step='checking the inputs')   # then a spinner: shader_split.py writes the package and the tables only at the end
     kf = pkg.with_name(pkg.name + '.key')
@@ -954,9 +956,9 @@ class ShaderWatch:
     and writes <key>_b.json again for every miss and every pixel shader: the furthest key written so far tells how far it got"""
     def __init__(self, g, ios, tmp):
         keys = set()
-        for ln in open(g.table('shader_map.tsv'), errors='replace'):   # the keys dmsh_build.py builds: column 4 of the rows from a shader package or from main
+        for ln in open(g.table('shader_map.tsv'), errors='replace'):   # the keys dmsh_build.py builds: column 4 of the rows from a shader package
             c = ln.rstrip('\n').split('\t')
-            if len(c) > 4 and (c[0].endswith('.bin') or c[0].startswith('main.rodata@')): keys.add(c[3])
+            if len(c) > 4 and c[0].endswith('.bin'): keys.add(c[3])
         pairs = {ln.split()[0] for ln in open(g.table('shader_pairs.tsv'), errors='replace') if ln.strip() and not ln.startswith('#')}
         order = sorted(keys - pairs) + sorted(keys & pairs)
         self.pos, self.n = {k: i for i, k in enumerate(order)}, len(order)
@@ -1008,7 +1010,7 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, provisional=False, split_ke
     if split_key:
         PROG.set(step='checking the inputs')
         key = fingerprint(split_key, ('files', tool_files(repo)), ('stat', xlate.parent), ('files', profile_files(g)), *toolchain(), str(xlate),
-                          {k: env.get(k) for k in ('MAIN', 'XLATE_DEBUG', 'XLATE_REDUCED')}, env=env)
+                          {k: env.get(k) for k in ('XLATE_DEBUG', 'XLATE_REDUCED')}, env=env)
         if next(libs.glob('*_b.metallib'), None) and (note := reused(kf, key)) is not None:
             PROG.end(f'{note}, reused (inputs unchanged)'); return ios
     else: key = None
@@ -1175,9 +1177,6 @@ def main(args=None):
         g, provisional = gamemod.load(f'{app:016X}'), True
         say('[RED] provisional game profile: values guessed from the survey, the game may not boot; bring it up per docs/agents after packing')
     say(f'game profile: {g.id}{" (provisional: " + str(g.dir) + ")" if provisional else ""}')
-    gfx = g.get('graphics', 'nvn')   # nvn, or vulkan (Hades: the host's Vulkan layer, SPIR-V shaders)
-    if gfx not in ('nvn', 'vulkan'): raise BuildError(f'game profile {g.id}: graphics must be nvn or vulkan: {gfx}')
-    if gfx == 'vulkan': say('Vulkan game: vk_shaders.py translates the shaders instead of the NVN shader chain')
     builds, need = g.builds(), g.words('shader_versions')
     pkg_ver = args.package or PACKAGE or g.get('package')
     if pkg_ver not in builds: raise BuildError(f"the version to pack (-p / PACKAGE) must be one the game profile registers: {', '.join(builds)}")
@@ -1198,11 +1197,8 @@ def main(args=None):
     ex = work / 'extract'; ex.mkdir(parents=True, exist_ok=True); (work / 'tmp').mkdir(exist_ok=True)
     gb = sum({p.stat().st_size for b, u in picks.values() for p in (b, u) if p}) / 2**30 + 6   # extraction + shader cache + slack
     if free_gb(work) < gb and not all((ex / v).exists() for v in versions): raise BuildError(f'less than {gb:.0f} GB free on the volume of {work}')
-    glslc = gfx == 'nvn' and g.get('shader_glslc_capture', 'off') == 'on'   # shaders the game compiles at run time, captured in the Mac host (capture_glslc)
-    vkcap = gfx == 'vulkan' and g.get('shader_vk_capture', 'off') == 'on'   # SPIR-V shaders the game generates at run time, captured in the Mac host (capture_vk)
-    uedec = gfx == 'nvn' and g.get('shader_ue_decode', 'off') == 'on'   # Unreal Engine shaders, Oodle-compressed in the paks' shader code archives, decoded in the Mac host (decode_ue_shaders)
     heapck = provisional and HEAP_CHECK and not args.no_heap_check and not heap_checked(g)   # the heap check, when the game needs one (once per provisional profile: it stamps the profile)
-    PROG.plan(1 + len(versions) + bool(fam['dlc']) + glslc + vkcap + uedec + (5 if gfx == 'nvn' else 4))   # nx_extract, each version's extraction, the DLC, rewrite, the GLSLC / Vulkan capture or the UE shader decode, shader split + iOS shaders (or the Vulkan shaders), app build, IPA pack
+    PROG.plan(1 + len(versions) + bool(fam['dlc']) + 4)   # nx_extract, each version's extraction, the DLC, rewrite, the Vulkan shaders (or the NVN shader split; iOS shaders and the run-time steps added below), app build, IPA pack
     PROG.stage('build nx_extract')
     nx = build_nx_extract(repo, work, logs, env)
     PROG.end()
@@ -1212,6 +1208,16 @@ def main(args=None):
         dirs[ver] = extract(nx, keys, ex, ver, b, u, clone, logs, g)
         if u is None and clone is None and can_clone(ex): clone = dirs[ver] / 'RomFS'
     game = dirs[pkg_ver]
+    # how the shaders are got follows from the packed version's files (profile_guess.py shader_sources): the graphics API, and the shaders made only at run time
+    src = pg.build_sources(game / 'ExeFS', game / 'RomFS', g.words('modules'))
+    gfx = src['graphics'][0]   # nvn, or vulkan (Hades: the host's Vulkan layer, SPIR-V shaders)
+    glslc = gfx == 'nvn' and src['glslc_capture'][0]   # shaders the game compiles at run time, captured in the Mac host (capture_glslc)
+    vkcap = gfx == 'vulkan' and src['vk_capture'][0]   # SPIR-V shaders the game generates at run time, captured in the Mac host (capture_vk)
+    uedec = gfx == 'nvn' and src['ue_decode'][0]   # Unreal Engine shaders, Oodle-compressed in the paks' shader code archives, decoded in the Mac host (decode_ue_shaders)
+    if gfx == 'vulkan': say(f'Vulkan game ({src["graphics"][1]}): vk_shaders.py translates the shaders instead of the NVN shader chain')
+    for on, k in ((glslc, 'glslc_capture'), (vkcap, 'vk_capture'), (uedec, 'ue_decode'), (gfx == 'nvn' and src['oodle_packs'][0], 'oodle_packs')):
+        if on: say(src[k][1])
+    PROG.add(glslc + vkcap + uedec + (gfx == 'nvn'))
     aoc = extract_aoc(nx, keys, work, app, fam, logs)
     base = next((dirs[v] for v in versions if picks[v][1] is None), dirs[versions[0]])   # the folder the base game was extracted to alone
     # the app name and bundle ID both come from the base NSP: the game name in its control data, and a bundle ID from its title ID; a setting / the command line overrides them
@@ -1236,14 +1242,14 @@ def main(args=None):
         cap = capture_vk(repo, game, patched, work, env, logs, g) if vkcap else None
         ios = build_vk_shaders(py, repo, [game / 'RomFS'] + ([cap] if cap else []), sh, env, logs, g, reuse=not (provisional or ALLOW_DAMAGED))
     else:
-        # Trinity packs (shader_oodle): the split decodes them with the packed version's own Oodle decoder, in the Mac host built for the profile
-        oodle = (lambda: {'DM_OODLE_HOST': str(build_mac_host(repo, work / 'tools/dmhost', env, logs, g)), 'DM_OODLE_MODULES': str(patched)}) if g.get('shader_oodle', 'off') == 'on' else None
+        # Trinity packs: the split decodes them with the packed version's own Oodle decoder, in the Mac host built for the profile
+        oodle = (lambda: {'DM_OODLE_HOST': str(build_mac_host(repo, work / 'tools/dmhost', env, logs, g)), 'DM_OODLE_MODULES': str(patched)}) if src['oodle_packs'][0] else None
         skey = split_shaders(py, repo, [dirs[v] / 'RomFS' for v in need], [dirs[v] / 'ExeFS/main' for v in need], sh / 'pkg', env, logs, g, provisional, oodle)
         ios = build_shaders(py, repo, sh, xlate, env, logs, g, provisional, skey)
 
     if free_gb(out_ipa.parent) < 5: raise BuildError(f'less than 5 GB free on the volume of {out_ipa.parent}')
     say(f'building the IPA → {out_ipa}')
-    ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(game / 'RomFS'), MSL_IOS=str(ios), FONT_PY=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''))
+    ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(game / 'RomFS'), MSL_IOS=str(ios), GFXAPI=gfx, FONT_PY=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''))
     if app_version: ipa_env['DM_APP_VERSION'] = app_version
     # app icon: the game icon nx_extract saved from the control data (English, icon.jpg); the packed version's first, then the base game's
     icon = next((d / 'icon.jpg' for d in (game, base) if (d / 'icon.jpg').exists()), None)

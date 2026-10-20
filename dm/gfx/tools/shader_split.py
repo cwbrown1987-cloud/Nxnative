@@ -32,12 +32,11 @@
 # Pair table: (vertex key, pixel key) of every BNSH variation (every Unity program); dmsh_build uses it to give vertex shaders the outputs their pixel shaders read but they do not write (see dmsh_build.py vs_pad)
 import collections, concurrent.futures as cf, hashlib, json, os, re, struct, subprocess, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../games')); import game as _game
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import uepak
 GAME = _game.load()   # the current game profile (DM_GAME, required): source group rules and the table header note
 GROUPS, NOTE = GAME.pairs('shader_groups'), GAME.get('shader_note')
-GLSLC = GAME.get('shader_main_glslc', 'off') == 'on'   # GLSLC compiler outputs in main (glslc_shaders)
-SEPARABLE = GAME.get('shader_separable', 'off') == 'on'   # single-stage programs combined per stage at draw time (separable_pairs)
-CAPTURE = GAME.get('shader_glslc_capture', 'off') == 'on'   # GLSLC outputs the game compiles at run time, captured on the Mac (DM_GLSLC_CAPTURE, hle_glslc.c)
-UE = GAME.get('shader_ue_decode', 'off') == 'on'   # Unreal Engine shader code archives, decoded on the Mac with the game's own Oodle (uepak.py, DM_OODLE_JOB, hle_oodle.c)
+# The sources are what the game files hold, with no profile switch: GLSLC outputs in main (glslc_shaders), the outputs the game compiles at run time when a capture is there (DM_GLSLC_CAPTURE,
+# hle_glslc.c), the shader code archives of Unreal paks once decoded on the Mac (uepak.py, DM_OODLE_JOB, hle_oodle.c); the NSP script decides from the files which of the last two to make
 
 CTL_MAGIC, GFX_MAGIC, CS_MAGIC = bytes.fromhex('34127698'), bytes.fromhex('78563412'), bytes.fromhex('79563412')
 STAGES = ['vs', 'hs', 'ds', 'gs', 'ps', 'cs']
@@ -124,8 +123,9 @@ def mshd_shaders(d, label):
 
 def glslc_shaders(d, label, need=True):
     """GLSLC compiler outputs (838 in 13 Sentinels' main read-only segment, one stage each): from the magic 0x19866891, +0x44 = the whole output's length; each output holds exactly one control section with the code area right after it (control +0x20 = control length).
-    The magic is only 4 bytes and other games' mains have it too (Fire Emblem Engage has 11), so this runs only when the profile's shader_main_glslc is on, and keeps only outputs that pass the triple check.
-    need: stop when there is none (main with shader_main_glslc on); a Koei Tecmo G2S container (idrk_shaders) may hold none.
+    The magic is only 4 bytes, so only outputs that pass the triple check are kept. Every game's main is searched: Unity's player has 11 of its own (Fire Emblem Engage, Ace Attorney Investigations
+    Collection) beside the game's shaders in its bundles, KTGL and Vanillaware's engine compile theirs into main (13 Sentinels: 838), the others have none.
+    need: stop when there is none (a capture file); a Koei Tecmo G2S container (idrk_shaders) or a main may hold none.
     SDK 6's GLSLC (output version 0x1d.2, Fire Emblem: Three Houses) writes 0x848- and 0x850-byte control sections (ctl_len's lower range) and compute code with no 0x12345679 header: the instructions
     start at code +0 (the first word is a scheduling word), and the stage then comes from the control's thread group (+0x748), which only compute sections fill. Its few version-0x1d.0 outputs keep
     something else at control +0x20 (odd values such as 0x136b), so a length that is not a multiple of 4 is not a control length"""
@@ -141,7 +141,7 @@ def glslc_shaders(d, label, need=True):
         st = 'cs' if code[:4] == CS_MAGIC or headerless_cs else SPH_STAGE.get((struct.unpack_from('<I', code, 0x30)[0] >> 10) & 0xf) if code[:4] == GFX_MAGIC else None
         if not st or check(label, st, ctl, code): continue
         out.append((f'{label}#GLSLC@{h:#x}', st, ctl, code))
-    if not out and need: red(f'{label}: the profile has shader_main_glslc on, but there is no GLSLC output')
+    if not out and need: red(f'{label}: no GLSLC output')
     return out
 
 IDRK, ZCHUNKED = b'IDRK0000', 0x100000
@@ -348,7 +348,7 @@ def trpfs_jobs(files, parts=64):
 _OODLE = None
 def oodle(comp, n):
     """The game's own OodleLZ_Decompress (Trinity's packs are Oodle Mermaid, and Oodle is linked into main): one Mac host per worker process in its tool mode (dm/host/hle_oodle.c, DM_OODLE_SERVE),
-    fed over a pipe. DM_OODLE_HOST = the host, DM_OODLE_MODULES = the rewritten modules it loads (the NSP script sets both for profiles with shader_oodle on)"""
+    fed over a pipe. DM_OODLE_HOST = the host, DM_OODLE_MODULES = the rewritten modules it loads (the NSP script sets both for a game with Trinity packs, profile_guess.py shader_sources)"""
     global _OODLE
     if _OODLE is None:
         import tempfile
@@ -520,22 +520,29 @@ def ps_inputs(code):
     """Generic attributes a pixel shader reads: SPH words 6–13 are the input map, 8 bits for each of the 32 attributes (Ryujinx ShaderHeader.ImapTypes), non-zero = read; the translated MSL inputs are exactly user(locn<attribute>)"""
     return {i for i in range(32) if struct.unpack_from('<I', code, 0x30 + 4 * (6 + (i >> 2)))[0] >> ((i & 3) * 8) & 0xff}
 
+SINGLE_STAGE = ('#GLSLC@', '#UE')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records (BNSH variations, Unity programs, MSHD and SDF pair theirs)
 def separable_pairs(keys):
-    """Single-stage programs (13 Sentinels: each GLSLC output becomes a program with one stage, and BindProgram's stage bits combine vertex and pixel programs per draw) have their real pairs only at draw time.
-    vs_pad uses only the union of the locations the paired pixel shaders read, so every vertex shader is paired with a "cover": the fewest pixel shaders whose read locations together equal those of all pixel shaders (greedy, ties go to the smaller key);
-    padded that way, a vertex shader links with any pixel shader. All pairs would be 376 × 375 rows; the cover needs a few rows × 376"""
+    """Single-stage programs (13 Sentinels: each GLSLC output becomes a program with one stage, and BindProgram's stage bits combine vertex and pixel programs per draw; Unreal combines its shaders per draw
+    from the pipeline state) have their real pairs only at draw time. vs_pad uses only the union of the locations the paired pixel shaders read, so every single-stage vertex shader is paired with
+    a "cover": the fewest pixel shaders whose read locations together equal those of all pixel shaders (greedy, ties go to the smaller key); padded that way, a vertex shader links with any pixel shader.
+    All pairs would be 376 × 375 rows; the cover needs a few rows × 376. No single-stage vertex shader, no cover"""
+    single = [v for v in keys if keys[v][1] == 'vs' and any(s in keys[v][0] for s in SINGLE_STAGE)]
+    if not single: return set(), []
     ins = {k: ps_inputs(v[3]) for k, v in keys.items() if v[1] == 'ps'}
     left, cover = set().union(*ins.values()) if ins else set(), []
     while left:
         k = min(ins, key=lambda k: (-len(ins[k] & left), k)); cover.append(k); left -= ins[k]
-    return {(v, p) for v in keys if keys[v][1] == 'vs' for p in cover}, cover
+    return {(v, p) for v in single for p in cover}, cover
 
 UE_TAG = {'SV': 'vs', 'SH': 'hs', 'SD': 'ds', 'SG': 'gs', 'SP': 'ps', 'SC': 'cs'}
+def main_imports(img):   # the names main imports (its dynamic symbols)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../tools')); import nso_syms
+    return {s for s, defined, _ in nso_syms.dynsyms(img) if not defined}
+
 def ue_shaders(d, label):
     """An Unreal Engine shader code archive with every shader decoded (Octopath Traveler 0: the two .ushaderbytecode files of its pak, whose shaders are Oodle-compressed; the NSP script decodes them
     on the Mac with the game's own Oodle, uepak.py): each shader is an LSLG record holding one stage's code area and control section (uepak.lslg); the stage is the record's tag (SV vertex,
-    SP pixel, SC compute), checked against the archive entry's frequency. The engine combines vertex and pixel shaders per draw, so the profile pairs them with shader_separable"""
-    import uepak
+    SP pixel, SC compute), checked against the archive entry's frequency. The engine combines vertex and pixel shaders per draw, so they are paired as single-stage programs (separable_pairs)"""
     a, out = uepak.archive(d), []
     for i, (off, size, raw, fr) in enumerate(a['shaders']):
         if size != raw: red(f'{label}: shader {i} is still compressed (an archive the NSP script has not decoded)')
@@ -620,17 +627,19 @@ def main():
             try: common = unityfs.common_strings(img)
             except ValueError: common = None   # not a Unity game
         found = []; scan_blob(img, 'main' + ('@' + tag if tag else ''), found)
-        if GLSLC: found += glslc_shaders(img, 'main' + ('@' + tag if tag else ''))
-        if CAPTURE:   # GLSLC outputs the game compiles at run time, captured on the Mac (hle_glslc.c): <version dir>/glslc_capture, or DM_GLSLC_CAPTURE
-            cap = os.environ.get('DM_GLSLC_CAPTURE') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'glslc_capture')
-            names = sorted(f for f in os.listdir(cap) if f.endswith('.glslc')) if os.path.isdir(cap) else []
-            if not names: print(f'[RED] the profile has shader_glslc_capture on, but there are no captured GLSLC outputs in {cap}: the shaders the game compiles at run time will have no translation', flush=True)
-            for nm in names: found += glslc_shaders(open(os.path.join(cap, nm), 'rb').read(), f'/glslc_capture/{nm}')
-        if UE:   # Unreal Engine shader code archives decoded on the Mac (uepak.py): <version dir>/ue_shaders, or DM_UE_SHADERS
-            ued = os.environ.get('DM_UE_SHADERS') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'ue_shaders')
-            names = sorted(f for f in os.listdir(ued) if f.endswith('.ushaderbytecode')) if os.path.isdir(ued) else []
-            if not names: red(f'the profile has shader_ue_decode on, but there are no decoded shader code archives in {ued} (the NSP script writes them)')
-            for nm in names: found += ue_shaders(open(os.path.join(ued, nm), 'rb').read(), f'/ue_shaders/{nm}')
+        found += glslc_shaders(img, 'main' + ('@' + tag if tag else ''), need=False)
+        # GLSLC outputs the game compiles at run time, captured on the Mac (hle_glslc.c): <version dir>/glslc_capture, or DM_GLSLC_CAPTURE. A game needs them when main holds GLSL sources and
+        # imports glslcCompile (Fire Emblem: Three Houses; profile_guess.py shader_sources)
+        cap = os.environ.get('DM_GLSLC_CAPTURE') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'glslc_capture')
+        names = sorted(f for f in os.listdir(cap) if f.endswith('.glslc')) if os.path.isdir(cap) else []
+        if not names and img.count(b'#version ') and 'glslcCompile' in main_imports(img):
+            print(f'[RED] main holds GLSL sources and imports glslcCompile, but there are no captured GLSLC outputs in {cap}: the shaders the game compiles at run time will have no translation', flush=True)
+        for nm in names: found += glslc_shaders(open(os.path.join(cap, nm), 'rb').read(), f'/glslc_capture/{nm}')
+        # Unreal Engine shader code archives decoded on the Mac (uepak.py): <version dir>/ue_shaders, or DM_UE_SHADERS; needed when the RomFS has Unreal paks
+        ued = os.environ.get('DM_UE_SHADERS') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'ue_shaders')
+        names = sorted(f for f in os.listdir(ued) if f.endswith('.ushaderbytecode')) if os.path.isdir(ued) else []
+        if not names and uepak.unreal_paks(romfs): red(f'the RomFS has Unreal paks, but there are no decoded shader code archives in {ued} (the NSP script writes them)')
+        for nm in names: found += ue_shaders(open(os.path.join(ued, nm), 'rb').read(), f'/ue_shaders/{nm}')
         results.append(('main', {skey(c, k): (w, s, c, k) for w, s, c, k in found}, var_pairs(found), {}))
     zdicts = {k: v for r in romfs_v for k, v in zs_dicts(r).items()}   # Tears of the Kingdom's zstd dictionaries (zs_dicts)
     keys = {}
@@ -661,9 +670,8 @@ def main():
                 if not same_shader(keys[key][2:4], v[2:4]): red(f'key {key} is the same but the control section or code area differs ({v[0]} / {keys[key][0]})')
                 continue
             keys[key] = v; per_src[group(v[0])] += 1
-    if SEPARABLE:
-        sp, cover = separable_pairs(keys); pairs |= sp
-        print(f'single-stage programs: every vertex shader is paired with a cover of {len(cover)} pixel shader(s) ({" ".join(cover)})')
+    sp, cover = separable_pairs(keys); pairs |= sp
+    if cover: print(f'single-stage programs: {len({v for v, _ in sp}):,} vertex shaders are paired with a cover of {len(cover)} pixel shader(s) ({" ".join(cover)})')
     os.makedirs(pkg, exist_ok=True)
     for f in os.listdir(pkg):
         if f.endswith('.bin'): os.unlink(os.path.join(pkg, f))

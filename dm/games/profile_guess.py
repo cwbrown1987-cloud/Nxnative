@@ -22,7 +22,6 @@ PACKED = {'UnityFS', 'UnityWeb', 'Yaz0', 'zstd', 'BWAV', 'CRI CPK', 'CRI USM', '
 # IL2CPP by the metadata file every IL2CPP player opens: Unity 2022's main (Ace Attorney Investigations Collection) has no il2cpp_ API names, Engage's 2020.3 has both
 MARKERS = [(b'nvnBootstrapLoader', 'NVN'), (b'vkCreateInstance', 'Vulkan'), (b'eglGetProcAddress', 'EGL / OpenGL'), (b'global-metadata.dat', 'Unity IL2CPP'), (b'UnityEngine', 'Unity'),
            (b'sead::', 'Nintendo sead'), (b'agl::', 'Nintendo agl'), (b'gsys::', 'Nintendo gsys'), (b'Unreal', 'Unreal'), (b'UE4', 'Unreal 4'), (b'Havok', 'Havok'), (b'CRIWARE', 'CRIWARE'), (b'Wwise', 'Wwise')]
-SHADER_CONTAINERS = ('BNSH', 'BAHS', 'UnityFS', 'Trinity pack')   # RomFS files that hold a game's shaders: with them, GLSLC outputs in main are not its shaders (Engage's main has 11 it does not use)
 GLSLC_MAGIC = b'\x91\x68\x86\x19'   # GLSLC compiler outputs (shader_split.py glslc_shaders)
 APP_POOL = 0xCD500000               # the application memory pool of a 4 GB Switch (3285 MiB), what every profile but Engage's reports
 MiB = 1 << 20
@@ -133,22 +132,6 @@ def guess(F, hooks=None):
         else: drop.append(f'{name} ({mods[name]["kind"]})')
     G['modules'] = (' '.join(keep), f'not loaded, main takes nothing from them the host does not supply: {", ".join(drop)}' if drop else 'every module main imports from')
 
-    vk = sorted(s for s in imp if re.match(r'vk[A-Z]', s))
-    vulkan = bool(vk) and 'nvnBootstrapLoader' not in imp
-    if vulkan:
-        G['graphics'] = ('vulkan', f'main imports {len(vk)} Vulkan functions and not nvnBootstrapLoader: the host\'s Vulkan layer (dm/gfx/vk/hle_vk.m)')
-        if not R['mags']['SPIR-V']:
-            G['shader_vk_capture'] = ('on', 'no SPIR-V file in the RomFS: the game generates its shaders at run time (Super Mario Galaxy), captured by booting it on the Mac')
-
-    if F['glslc'] and not any(R['mags'][m] for m in SHADER_CONTAINERS):
-        why = f'main holds {F["glslc"]} GLSLC outputs and the RomFS has no {" / ".join(SHADER_CONTAINERS)}: the shaders are compiled into main (13 Sentinels, the KTGL games)'
-        G['shader_main_glslc'] = ('on', why)
-        G['shader_separable'] = ('on', 'with shader_main_glslc: single-stage programs combined per draw (every GLSLC output in main seen so far is one stage)')
-    if R['mags']['Trinity pack']:
-        G['shader_oodle'] = ('on', 'the RomFS has Trinity packs (ONEPACK, arc/data.trpfs: Pokémon Legends: Z-A), Oodle-compressed: the shader split decodes them with the game\'s own decoder in the Mac host (dm/host/hle_oodle.c, its address per build)')
-    glslc_mod = [m for m in keep if 'glslcCompile' in mods[m]['exports']]
-    if F['glsl_src'] and 'glslcCompile' in imp and glslc_mod:
-        G['shader_glslc_capture'] = ('on', f'main holds {F["glsl_src"]} GLSL sources and calls glslcCompile in {glslc_mod[0]}: shaders compiled at run time (Fire Emblem: Three Houses), captured by booting it on the Mac')
 
     # Memory: the guest block is 256 MB in front + alias region + stack region + heap region (hle_svc.c mem_init)
     giant = sum(m['bss'] for n, m in mods.items() if n in keep and m['far'])
@@ -163,13 +146,8 @@ def guess(F, hooks=None):
                if heap_api else 'main never sets a heap (its memory is its own bss): a 256 MB heap region')
     G['mem_reserve'] = (f'{mem[0]:#x}', mem[3]); G['mem_alias'] = (f'{mem[1]:#x}', ''); G['mem_stack'] = ('0x10000000', ''); G['app_pool'] = (f'{mem[2]:#X}'.replace('0X', '0x'), '')
 
-    if 'Unity IL2CPP' in F.get('main_markers', ()):
-        G['nvn_tex_base'] = ('0x168', 'Unity: separate texture bindings (Engage)'); G['nvn_tex_slots'] = ('128', '')
     if F.get('main_markers', set()) & {'Unreal', 'Unreal 4'} and R['exts'].get('.pak') and 'nvnBootstrapLoader' in imp:
-        G['shader_ue_decode'] = ('on', 'Unreal Engine with paks: the shaders are Oodle-compressed in the paks\' shader code archives (Octopath Traveler 0), decoded by booting the game on the Mac')
-        G['shader_separable'] = ('on', 'Unreal combines vertex and pixel shaders per draw from its pipeline state')
-        G['shader_groups'] = ('ShaderArchive-Global-=global ShaderArchive-=game', 'the decoded archives: the engine\'s global shaders and the game\'s material shaders')
-        G['nvn_tex_base'] = ('0x168', 'Unreal: separate texture bindings (Octopath Traveler 0, measured over all its shaders)'); G['nvn_tex_slots'] = ('128', '')
+        G['shader_groups'] = ('ShaderArchive-Global-=global ShaderArchive-=game', 'the decoded shader code archives: the engine\'s global shaders and the game\'s material shaders')
         G['mem_reserve'] = ('0x1028000000', 'Unreal: nninitStartup reserves a 62 GB address region and its FMallocBinned3 takes 37 GB of it, so a 64 GB alias region for the bring-up on the Mac. '
                             'An iPhone needs the allocator cut for the build and a capped region (game_args), as Octopath Traveler 0\'s profile (docs/agents/03)')
         G['mem_alias'] = ('0x1008000000', '')
@@ -178,6 +156,40 @@ def guess(F, hooks=None):
 
 
 HEAP_API = '_ZN2nn2os17SetMemoryHeapSizeEm'
+
+
+# ---- Shader sources: decided from the game files at every build, not kept in the profile (scripts/build_ipa_from_nsp.py; shader_split.py reads what those steps write) ----
+def shader_sources(imports, glsl_src, glslc_mods, spirv, unreal_paks, trinity_packs=0):
+    """{name: (value, reason)}: graphics (vulkan when main imports Vulkan functions and not nvnBootstrapLoader, else nvn), vk_capture (a Vulkan game without SPIR-V files generates its shaders at
+    run time), glslc_capture (main holds GLSL sources and calls glslcCompile in a module the game loads: it compiles some shaders at run time), ue_decode (Unreal paks keep the shaders Oodle-compressed
+    in their shader code archives, which only the game's own Oodle decodes), oodle_packs (Trinity packs, Oodle-compressed file by file, which the shader split decodes with the game's own decoder in
+    the Mac host's tool mode). Checked against every profile: Hades and Super Mario Galaxy Vulkan, Galaxy alone with no SPIR-V file, Three Houses alone compiling shaders (13 Sentinels holds 106 GLSL
+    sources but does not import glslcCompile), Octopath Traveler 0 alone with Unreal paks, Pokémon Legends: Z-A alone with Trinity packs"""
+    vk = sum(1 for s in imports if re.match(r'vk[A-Z]', s)); vulkan = bool(vk) and 'nvnBootstrapLoader' not in imports
+    return {'graphics': ('vulkan', f'main imports {vk} Vulkan functions and not nvnBootstrapLoader: the host\'s Vulkan layer (dm/gfx/vk/hle_vk.m)') if vulkan else ('nvn', 'main imports nvnBootstrapLoader'),
+            'vk_capture': (vulkan and not spirv, 'no SPIR-V file in the RomFS: the game generates its shaders at run time (Super Mario Galaxy), captured by booting it on the Mac'),
+            'glslc_capture': (not vulkan and bool(glsl_src) and 'glslcCompile' in imports and bool(glslc_mods),
+                              f'main holds {glsl_src} GLSL sources and calls glslcCompile in {", ".join(glslc_mods) or "no module it loads"}: shaders compiled at run time (Fire Emblem: Three Houses), captured by booting it on the Mac'),
+            'ue_decode': (not vulkan and bool(unreal_paks), f'{unreal_paks} Unreal pak(s): the shaders are Oodle-compressed in their shader code archives (Octopath Traveler 0), decoded by booting the game on the Mac'),
+            'oodle_packs': (not vulkan and bool(trinity_packs), f'{trinity_packs} Trinity pack file(s) (ONEPACK, arc/data.trpfs: Pokémon Legends: Z-A), Oodle-compressed: the shader split decodes them with the game\'s own decoder in the Mac host (dm/host/hle_oodle.c DM_OODLE_SERVE)')}
+
+
+def build_sources(exefs, romfs, modules):
+    """shader_sources from an extraction (its ExeFS and RomFS folders) and the modules the profile loads"""
+    exefs = Path(exefs); main = nso(exefs / 'main')[0]
+    imports = {s for s, defined, _ in nso_syms.dynsyms(main) if not defined}; glsl_src = main.count(b'#version ')
+    glslc_mods = [m for m in modules if m != 'main' and glsl_src and 'glslcCompile' in imports and (exefs / m).exists()
+                  and any(s == 'glslcCompile' and defined for s, defined, _ in nso_syms.dynsyms(nso(exefs / m)[0]))]
+    spirv = 0
+    if any(re.match(r'vk[A-Z]', s) for s in imports):   # only a Vulkan game's RomFS is read
+        spirv = sum(1 for _, _, head in romfs_files(romfs) if head.startswith(bytes.fromhex('03022307')))
+    sys.path.insert(0, str(HERE.parent / 'gfx/tools')); import uepak
+    trinity = 0
+    for d, _, names in os.walk(romfs):
+        for n in names:
+            if n.endswith('.trpfs'):
+                with open(os.path.join(d, n), 'rb') as f: trinity += f.read(8) == b'ONEPACK\0'
+    return shader_sources(imports, glsl_src, glslc_mods, spirv, len(uepak.unreal_paks(str(romfs))), trinity)
 
 
 def va_heap(sysres, imports):   # virtual address memory (an NPDM system resource) and a heap: the alias / heap split is a starting point the heap check corrects (Wonder, Tears of the Kingdom; Engage's pool is its own measurement)
@@ -228,8 +240,7 @@ def heap_signals(log, g):
 
 
 # ---- Checking the rules against the hand-made profiles ----
-DEFAULTS = {'graphics': 'nvn', 'shader_vk_capture': 'off', 'shader_main_glslc': 'off', 'shader_separable': 'off', 'shader_glslc_capture': 'off', 'shader_ue_decode': 'off', 'shader_oodle': 'off',
-            'op_mode': 'console', 'pad_layout': 'simple', 'nvn_tex_base': '0x20', 'nvn_tex_slots': '32'}
+DEFAULTS = {'op_mode': 'console', 'pad_layout': 'simple'}
 NO_SIGNAL = {'pad_layout', 'op_mode'}   # no static signal outside the engine presets; the player switches the pad layout in game, DM_OPMODE in env.txt sets the mode
 
 
