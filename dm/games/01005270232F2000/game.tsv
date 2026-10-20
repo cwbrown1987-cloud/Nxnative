@@ -22,6 +22,10 @@ romfs_marker	Octopath_Traveler0/Content/Paks/pakchunk0-Switch.pak
 zip_store	.awb:.pak:.ttf:.txt:.usm:.metallib
 
 # ---- Graphics ----
+# 60 fps (30 on the Switch): the game's config caps Unreal at 30 (t.MaxFPS 30, FrameRateLimit 30, and rhi.SyncInterval 2, the present interval 2 it asks for); the host writes t.MaxFPS 60 and
+# rhi.SyncInterval 1 into its console variables (hle_fpslock.c), so the game asks for present interval 1 itself. Unreal steps the game by the time that really passed.
+# DM_FPS_TARGET=30 (Documents/env.txt on the iPhone) keeps the game's 30 and saves power
+fps_target	60
 
 # ---- Memory ----
 # Unreal Engine: nninitStartup (main+0x12d74) needs virtual address memory and reserves one address region for the engine (-SwitchVirtualAddressSpaceSize= in MB, game_args below; 62 GB by default).
