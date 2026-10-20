@@ -296,7 +296,7 @@ The game's own work and its frame rate stay as they are; the host avoids work of
 - **Keyboard:** the character's name and favourite dish come from the system keyboard (`DM_KBD` on the Mac, the input box on the iPhone). The game keeps running behind it, so the guest clock does too (it used to freeze: the sound stuttered and the box lagged on the iPhone).
 - **Mac input:** a fresh save reaches the story with `DM_KBD=Lyra DM_KEYS="20:Plus,24:A*27/4,150:Plus,154:A*62/3,340:Right*12/3,341.5:A*12/3,380:Plus*5/3,396:A*20/3,470:A,474:Up,476:A,480:A*140/3"` (initial settings, the prologue, character creation with three belongings, "Begin Lyra's journey?").
 - **Saves:** the first save (about 13 minutes in) needs `fs::GetSaveDataSizeMax`; four saves in a 26-minute run, and a later boot continues from them.
-- **Status:** brought up on the Mac through character creation and the story opening into free play (26 minutes from a fresh save with no red line, 2.74 GB resident), and playable on an iPhone: 30 fps through character creation, name entry and the story opening, no audio underruns, three saves, a footprint of about 2.35 GB after 3.4 minutes. Battles are not tested yet.
+- **Status:** brought up on the Mac through character creation and the story opening into free play (26 minutes from a fresh save with no red line, 2.74 GB resident), and playable on an iPhone: 30 fps through character creation, name entry and the story opening, no audio underruns, three saves, a footprint of about 2.35 GB after 3.4 minutes; it plays at 60 fps on an iPhone too (`fps_target 60`). Battles are not tested yet.
 
 ## Tools (`dm/tools`)
 
