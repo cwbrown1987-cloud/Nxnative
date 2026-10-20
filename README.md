@@ -42,6 +42,7 @@ All of these are tested on an iPhone and playable:
 | Hades&nbsp;II | ~4&nbsp;GB | |
 | Unicorn&nbsp;Overlord | ~4&nbsp;GB | |
 | Rhythm&nbsp;Heaven&nbsp;Groove | ~3&nbsp;GB | |
+| Octopath&nbsp;Traveler&nbsp;0 | ~4&nbsp;GB | |
 
 | | |
 |:---:|:---:|
@@ -54,8 +55,7 @@ All of these are tested on an iPhone and playable:
 | ![The Legend of Zelda: Tears of the Kingdom](docs/images/zelda-tears-of-the-kingdom.jpg)<br>The Legend of Zelda: Tears of the Kingdom | ![Monster Hunter Rise](docs/images/monster-hunter-rise.jpg)<br>Monster Hunter Rise |
 | ![Ace Attorney Investigations Collection](docs/images/ace-attorney-investigations.jpg)<br>Ace Attorney Investigations Collection | ![Hades II](docs/images/hades-ii.jpg)<br>Hades II |
 | ![Unicorn Overlord](docs/images/unicorn-overlord.jpg)<br>Unicorn Overlord | ![Rhythm Heaven Groove](docs/images/rhythm-heaven-groove.jpg)<br>Rhythm Heaven Groove |
-
-**On the Mac, not yet tested on an iPhone:** OCTOPATH TRAVELER 0 (update 1.0.5, ~4&nbsp;GB IPA). On the Mac it plays from a new game through character creation and the story opening into free play, and its saves load. Its IPA is packed the same way; whether it runs on a phone is not known yet.
+| ![Octopath Traveler 0](docs/images/octopath-traveler-0.jpg)<br>Octopath Traveler 0 | |
 
 Needs iOS / iPadOS 26 or later on an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later: the games' textures are BC-compressed, and older iPhones can't read that format. Other games aren't supported yet. For them the script writes a survey and still tries its best to pack an IPA, guessing the game's settings; such an IPA may not start.
 
