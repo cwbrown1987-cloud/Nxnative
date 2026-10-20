@@ -32,6 +32,8 @@ mem_reserve	0x100000000
 mem_alias	0x10000000
 mem_stack	0x10000000
 app_pool	0xCD500000
+# The engine cuts ring heaps out of a memory pool at 64 KB GPU alignment, and the pool's storage comes from malloc: allocations of 64 KB or more are 64 KB aligned (hle_os.c), or the third ring heap keeps base 0
+alloc_big_align	on
 
 # ---- NVN driver constant segments (dmsh_build.py at packaging, nvn_mtl.m filled at run time) ----
 # Mario's values. All 751 shaders translate with these bases and every binding resolves to a slot (dmsh_build: 0 shaders with unresolved bindings); textures go through bindless handles

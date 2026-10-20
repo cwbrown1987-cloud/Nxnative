@@ -276,6 +276,18 @@ The game's own work and its frame rate stay as they are; the host avoids work of
 - **Frame rate:** 60 fps, as on the Switch (present interval 1).
 - **Mac input:** a fresh save goes through the first-boot notices (the privacy prompt's second button is "Next"), the title and Investigations 1's Episode 1 with `DM_KEYS="f600:A~0.3,f1200:A~0.3,f1800:A~0.3,f2400:A~0.3,f3000:Down~0.3,f3200:A~0.3,f3800:A~0.3,f4400:A~0.3,f5000:A~0.3,f5600:A~0.3,f6200:A~0.3,f6800:A~0.3*270/120"` (the first investigation in Edgeworth's office at about frame 18,000; at about frame 30,000 the first Logic prompt waits for L).
 
+**Unicorn Overlord (`010069401ADB8000`)**
+- **Status:** brought up on the Mac (logos, title, a new game and the opening story scene; no red line) and playable on an iPhone.
+- **Engine:** Vanillaware's engine, as in 13 Sentinels, SDK 16.2.4, update 1.05 (v262144). Its ExeFS holds only main and sdk. All data is in 7 CRI CPK archives; audio is CRI ADX2 with Opus streams. Both DLC NSPs are licences only.
+- **Shaders:** 2,188 GLSLC outputs compiled into main (1,725 distinct: 614 vertex, 1,111 pixel), single-stage programs combined per draw (`shader_main_glslc`, `shader_separable`). Binding layout as Mario's; every binding decodes.
+- **Service calls:** three host changes, each found by one boot ([03](agents/03-bringup.md)):
+  - the hardware multi-stream Opus decoder's C interface, forwarded to the SDK's software decoder;
+  - `nn::crypto::GenerateCryptographicallyRandomBytes`, which the sdk's own `getentropy` calls under `std::random_device`;
+  - the profile key `alloc_big_align` it shares with 13 Sentinels. Without it, a ring heap cut from a memory pool kept base 0 and the game wrote to `0x268` right after the title screen.
+- **Memory:** no system resource; the game sets a 3.12 GB heap (pool − used), which the 4 GB layout's heap region holds. The rewritten modules are 92 MB (`mem_used`). On the Mac about 2.9 GB resident in the opening scene. On an iPhone (A20 Pro): a 2.88 GB footprint with at least 3.2 GB of headroom.
+- **Frame rate:** 60 fps. The game sets present interval 1; on the iPhone the frame time is 16.7 ms at the median.
+- **Mac input:** `DM_KEYS=f2400:A*20/300` goes from the title screen (about frame 2,500) through a new game into the opening story scene (about frame 4,900).
+
 ## Tools (`dm/tools`)
 
 | Tool | What it does |

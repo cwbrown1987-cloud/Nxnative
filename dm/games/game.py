@@ -100,6 +100,8 @@ def header(g):
     if fs not in ('ticks', 'legacy'): sys.exit(f'{g.id}: frame_step must be ticks or legacy: {fs}')
     cp = g.get('core_preempt', 'off')   # same-core preemption approximation (hle_thread.c): on / off
     if cp not in ('on', 'off'): sys.exit(f'{g.id}: core_preempt must be on or off: {cp}')
+    aba = g.get('alloc_big_align', 'off')   # nn::mem::StandardAllocator::Allocate aligns blocks of 64 KB or more to 64 KB (hle_os.c; Vanillaware's memory pool storage): on / off
+    if aba not in ('on', 'off'): sys.exit(f'{g.id}: alloc_big_align must be on or off: {aba}')
     sf = g.get('shared_font', 'bfttf')   # what the shared-font address points at (hle_sdk16.c): bfttf = 8-byte header + TTF, ttf = the TTF alone
     if sf not in ('bfttf', 'ttf'): sys.exit(f'{g.id}: shared_font must be bfttf or ttf: {sf}')
     pl = g.get('pad_layout', 'simple')   # the virtual gamepad's first layout (DmGamepad.m; afterwards whatever the player switched to in game is kept): simple = 2D, full = 3D (D-pad, right stick, L3 / R3)
@@ -146,6 +148,7 @@ def header(g):
          f'#define DM_GAME_DISPLAY_VERSIONS {vers}',
          f'#define DM_GAME_PRESENT_DISPLAY {int(pi == "display")}',
          f'#define DM_GAME_CORE_PREEMPT {int(cp == "on")}',
+         f'#define DM_GAME_ALLOC_BIG_ALIGN {int(aba == "on")}',
          f'#define DM_GAME_FPS_TARGET {int(ft)}',
          f'#define DM_GAME_FRAME_STEP_LEGACY {int(fs == "legacy")}',
          f'#define DM_GAME_SHARED_FONT_TTF {int(sf == "ttf")}',
