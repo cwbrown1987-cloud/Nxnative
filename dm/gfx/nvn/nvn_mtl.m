@@ -2847,7 +2847,8 @@ static id<MTLTexture> tex_fit(int tid, id<MTLTexture> t, MTLTextureType want, ui
     else if (want == MTLTextureTypeCube && have == MTLTextureType2DArray && t.arrayLength >= 6) ns = 6;
     else if (want == MTLTextureTypeCubeArray && have == MTLTextureType2DArray && t.arrayLength >= 6) ns = t.arrayLength / 6 * 6;
     else if (want == MTLTextureTypeCube && have == MTLTextureTypeCubeArray) ns = 6;   // a cube array read as a cube: the first cube
-    if (!ns || tid <= 0 || tid >= g_ntreg) { RED_ONCE(76, "texture type mismatch: shader declares %lu, texture is %lu (texture ID %d); bound as is", (unsigned long)want, (unsigned long)have, tid); return nil; }
+    if (!ns || tid <= 0 || tid >= g_ntreg) { RED_ONCE(76, "texture type mismatch: shader declares %lu, texture is %lu (texture ID %d); %s", (unsigned long)want, (unsigned long)have, tid,
+                                                      want == MTLTextureTypeTextureBuffer || have == MTLTextureTypeTextureBuffer ? "a buffer texture: the slot reads 0 (dummy)" : "bound as is"); return nil; }
     treg_t *r = &g_treg[tid];
     if (r->alt && r->alt_of == (__bridge void *)t && r->alt_type == (uint8_t)want) { *rid = r->alt_rid; return (__bridge id<MTLTexture>)r->alt; }
     if (r->alt) { defer_obj_unref((__bridge id)r->alt); CFRelease(r->alt); r->alt = r->alt_of = NULL; r->alt_rid = 0; }
