@@ -1,4 +1,4 @@
-# Game profile of Ace Attorney Investigations Collection (Switch, base game v0 + update 1.0.0.2 = v131072). Bring-up on the Mac in progress
+# Game profile of Ace Attorney Investigations Collection (Switch, base game v0 + update 1.0.0.2 = v131072). Plays on the Mac and on the iPhone
 # Format: see dm/games/README.md
 # Unity 2022.3.17f1 (IL2CPP), SDK 17.5.3: the shaders are Shader objects in the Addressables bundles and the player's serialized files (read by shader_split.py through unityfs.py).
 # Unity 2022's Switch subprograms, the IL2CPP file API and the first boots were worked out by armyja (GitHub issues #17, #18, #19 and pull requests #15, #16)
