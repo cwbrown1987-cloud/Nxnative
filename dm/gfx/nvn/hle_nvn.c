@@ -365,11 +365,10 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     nvn_tex_layout(&o->d, &o->L);
     o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
     o->serial = nvn_new_serial(); mtl_tex_init(o);
-    // See SetPackagedTextureData. Linear textures are not re-uploaded as packaged: in a CPU-visible pool they are created on the pool buffer (tex_linear) and read what was copied in
+    // See SetPackagedTextureData. Linear textures are not re-uploaded as packaged: they are created on the pool buffer (tex_linear), whatever the pool's CPU access, and read what was copied in
     if (s->pkg_data && o->mem) {
         memcpy(o->mem, s->pkg_data, o->L.size);
         if (!(o->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) mtl_tex_cpu_written(o);
-        else if (o->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) { static int once_; if (!once_++) LOG("[nvn] [RED] linear texture with packaged data in a pool the CPU cannot see: the host creates a private texture and does not upload the data (%ux%u format %#x)", o->d.width, o->d.height, o->d.format); }
     }
     OLOG("Texture %p %ux%ux%u lv%u fmt=%#x tgt=%d flags=%#x size=%#llx", (void *)t, o->d.width, o->d.height, o->d.depth,
          o->d.levels, o->d.format, o->d.target, o->d.flags, o->L.size);

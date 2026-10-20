@@ -112,40 +112,50 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "close 
 // SDK 6 (Fire Emblem: Three Houses, CommandListProcessor::Process at sdk+0xaaa00) lays out the command header differently: +0x04 size (s16), +0x06 command ID (s16), +0x10 enabled (u8),
 //   where SDK 8–20 have +0x04 enabled (u8), +0x05 ID (u8), +0x06 size (s16); DeviceSink is ID 16 there (its case in Process is a no-op). Walked with the newer header, the first command's ID
 //   was taken as its size, the second "command" had no magic and the game was silent. The first full command list decides the layout: the one whose walk finds the magic on every command
-static int g_sink_id = 0x13, g_hdr6;
-static int cmd_size(const uint8_t *q) { return g_hdr6 ? *(const int16_t *)(q + 4) : *(const int16_t *)(q + 6); }
-static int cmd_id(const uint8_t *q) { return g_hdr6 ? *(const int16_t *)(q + 6) : q[5]; }
-static int cmd_on(const uint8_t *q) { return g_hdr6 ? q[0x10] : q[4]; }
-static int cmd_walks(const uint8_t *cl, uint32_t ncmd) {
+// SDK 21 (Rhythm Heaven Groove, CommandListProcessor::Process at sdk+0x24fd50) has no magic: +0x00 enabled (bit 0), +0x01 command ID (u8), +0x02 size (s16), +0x04 estimated time, +0x08 node ID,
+//   and every command body sits 8 bytes earlier. DeviceSink is still ID 0x14 but 0x140 bytes (written at sdk+0x23a7b0): +0x18 device name, +0x120 upsample buffer, +0x128 input count, +0x12c input
+//   indices. Walked as SDK 20, the first command's enabled / ID / size bytes read as a magic of 0x181901 and the game was silent. With no magic, that walk must stay inside the generated list
+static int g_sink_id = 0x13, g_hdr6, g_hdr21;
+static int cmd_size(const uint8_t *q) { return g_hdr21 ? *(const int16_t *)(q + 2) : g_hdr6 ? *(const int16_t *)(q + 4) : *(const int16_t *)(q + 6); }
+static int cmd_id(const uint8_t *q) { return g_hdr21 ? q[1] : g_hdr6 ? *(const int16_t *)(q + 6) : q[5]; }
+static int cmd_on(const uint8_t *q) { return g_hdr21 ? q[0] & 1 : g_hdr6 ? q[0x10] : q[4]; }
+static int cmd_ok(const uint8_t *q, const uint8_t *end) { int n = cmd_size(q); return g_hdr21 ? n >= 0x10 && q + n <= end : *(const uint32_t *)q == 0xcafebabeu && n > 0; }
+static int sink_body(void) { return g_hdr21 ? -8 : 0; }   // where DeviceSink's fields sit relative to SDK 8–20
+static int cmd_walks(const uint8_t *cl, uint32_t ncmd, const uint8_t *end) {
     const uint8_t *q = cl + 0x20;
-    for (uint32_t i = 0; i < ncmd; i++) { if (*(const uint32_t *)q != 0xcafebabeu || cmd_size(q) <= 0) return 0; q += cmd_size(q); }
+    for (uint32_t i = 0; i < ncmd; i++) { if (!cmd_ok(q, end)) return 0; q += cmd_size(q); }
     return 1;
 }
-static int capture(const uint8_t *cl, int16_t *dst) {
+static int capture(const uint8_t *cl, size_t len, int16_t *dst) {
     uint32_t ncmd = *(const uint32_t *)(cl + 4), samples = *(const uint32_t *)(cl + 0x14), rate = *(const uint32_t *)(cl + 0x18);
-    const int32_t *mix = *(const int32_t *const *)(cl + 8);
-    static int logged, hist_logged;
-    if (!hist_logged && ncmd > 4) {   // first full command list: header layout, command ID histogram, and the sink ID check
+    const int32_t *mix = *(const int32_t *const *)(cl + 8); const uint8_t *cend = cl + len;
+    static int logged, hist_logged, layout_done;
+    if (!layout_done && ncmd) {   // first command list: the header layout (SDK 21's first lists have 4 commands or fewer, which the old layout would report as malformed)
+        layout_done = 1;
+        if (!cmd_walks(cl, ncmd, cend)) { g_hdr6 = 1; if (cmd_walks(cl, ncmd, cend)) { g_sink_id = 0x10; LOG("audren: command headers in the SDK 6 layout (+4 size, +6 command ID, +0x10 enabled), DeviceSink is ID 0x10"); } else g_hdr6 = 0; }
+        if (!g_hdr6 && !cmd_walks(cl, ncmd, cend)) { g_hdr21 = 1; if (cmd_walks(cl, ncmd, cend)) LOG("audren: command headers in the SDK 21 layout (no magic: +0 enabled, +1 command ID, +2 size), DeviceSink 0x140 bytes"); else g_hdr21 = 0; }
+    }
+    if (!hist_logged && ncmd > 4) {   // first full command list: command ID histogram and the sink ID check
         hist_logged = 1;
-        if (!cmd_walks(cl, ncmd)) { g_hdr6 = 1; if (cmd_walks(cl, ncmd)) { g_sink_id = 0x10; LOG("audren: command headers in the SDK 6 layout (+4 size, +6 command ID, +0x10 enabled), DeviceSink is ID 0x10"); } else g_hdr6 = 0; }
-        int hist[64] = {0}, cand = -1, ncand = 0; const uint8_t *q = cl + 0x20; char line[512]; size_t o = 0;
-        for (uint32_t i = 0; i < ncmd && *(const uint32_t *)q == 0xcafebabeu && cmd_size(q) > 0; i++) {
+        int hist[64] = {0}, cand = -1, ncand = 0, sink_sz = 0x148 + sink_body(); const uint8_t *q = cl + 0x20; char line[512]; size_t o = 0;
+        for (uint32_t i = 0; i < ncmd && cmd_ok(q, cend); i++) {
             int sz = cmd_size(q); hist[cmd_id(q) & 63]++;
-            if (sz == 0x148 && *(const uint32_t *)(q + 0x130) - 1 < 6) { cand = cmd_id(q); ncand++; }
+            if (sz == sink_sz && *(const uint32_t *)(q + 0x130 + sink_body()) - 1 < 6) { cand = cmd_id(q); ncand++; }
             q += sz;
         }
         for (int k = 0; k < 64; k++) if (hist[k]) o += snprintf(line + o, sizeof line - o, " %d×%d", k, hist[k]);
         LOG("audren: first-frame commands %u, by command ID: %s", ncmd, line);
         if (!hist[g_sink_id & 63] && ncand == 1) { LOG("audren: no command with ID %#x in the command list; the only 0x148-byte command is ID %#x, taking it as DeviceSink", g_sink_id, cand); g_sink_id = cand; }
-        else if (!hist[g_sink_id & 63]) LOG("[RED] audren: no DeviceSink (ID %#x) in the command list, %d commands of 0x148 bytes: the game will have no sound", g_sink_id, ncand);
+        else if (!hist[g_sink_id & 63]) LOG("[RED] audren: no DeviceSink (ID %#x) in the command list, %d commands of %#x bytes: the game will have no sound", g_sink_id, ncand, sink_sz);
     }
     const uint8_t *c = cl + 0x20;
     for (uint32_t i = 0; i < ncmd; i++) {
-        uint32_t magic = *(const uint32_t *)c; int size = cmd_size(c);
-        if (magic != 0xcafebabeu || size <= 0) { if (!logged++) LOG("[RED] audren: command %u in the command list is malformed (magic %#x size %d)", i, magic, size); return 0; }
+        int size = cmd_size(c);
+        if (!cmd_ok(c, cend)) { if (!logged++) LOG("[RED] audren: command %u in the command list is malformed (first word %#x size %d)", i, *(const uint32_t *)c, size); return 0; }
         if (cmd_id(c) == g_sink_id && cmd_on(c)) {
-            uint32_t nin = *(const uint32_t *)(c + 0x130); const int16_t *in = (const int16_t *)(c + 0x134);
-            const int32_t *up = *(const int32_t *const *)(c + 0x128);
+            const uint8_t *b = c + sink_body();
+            uint32_t nin = *(const uint32_t *)(b + 0x130); const int16_t *in = (const int16_t *)(b + 0x134);
+            const int32_t *up = *(const int32_t *const *)(b + 0x128);
             if (!logged++) LOG("audren: DeviceSink inputs %u (%d %d …) rate %u samples per frame %u mix buffer %p upsample buffer %p", nin, nin ? in[0] : -1, nin > 1 ? in[1] : -1, rate, samples, (void *)mix, (void *)up);
             if (!nin || samples > FRAME_MAX) return 0;
             // Input buffers: at 48 kHz the mix buffers; with 32 kHz rendering DeviceSink reads the upsampled buffer (inputs laid out in order)
@@ -205,9 +215,9 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
     else { cl = cbuf(sys); n = gen(sys, cl, cbsz(sys)); }
     unlock(sys + mu_off);
     atomic_fetch_add(&g_renders, 1);
-    uint64_t proc[16] __attribute__((aligned(16))) = {0};   // CommandListProcessor (0x58 bytes)
+    uint64_t proc[16] __attribute__((aligned(16))) = {0};   // CommandListProcessor (0x58 bytes; 0x60 in SDK 21, whose Process reads +0x58)
     tmax(proc, 0xffffffffu); setup(proc, cl, n); process(proc);
-    if (dst) *nout = capture(cl, dst);
+    if (dst) *nout = capture(cl, n, dst);
     // render time per frame (budget: 5 ms per frame): mean / max every 2000 frames
     static uint64_t sum, mx, cnt; uint64_t d = now_ns() - t0; sum += d; if (d > mx) mx = d;
     if (++cnt == 2000) { LOG("audren: render time mean %.2f ms / max %.2f ms (5 ms budget per frame, last 2000 frames); catch-up renders so far %llu", sum / 2000 / 1e6, mx / 1e6, (unsigned long long)atomic_load(&g_catchups)); sum = mx = cnt = 0; }

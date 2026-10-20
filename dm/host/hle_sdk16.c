@@ -99,6 +99,20 @@ static const size_t k_font_skip = DM_GAME_SHARED_FONT_TTF ? 8 : 0;
 HLE_FORCE("_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE", "shared font load state: loaded (1)", int, h_pl_LoadState, int type) { return font_get(type).p ? 1 : 0; }
 HLE_FORCE("_ZN2nn2pl20GetSharedFontAddressENS0_14SharedFontTypeE", "shared font address → BFTTF header (archive shared_font ttf: the TTF itself)", const void *, h_pl_Addr, int type) { const uint8_t *p = font_get(type).p; return p ? p + k_font_skip : NULL; }
 HLE_FORCE("_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE", "shared font size → 8-byte header + stand-in font file size (archive shared_font ttf: without the header)", size_t, h_pl_Size, int type) { font_t f = font_get(type); return f.p ? f.n - k_font_skip : 0; }
+// Every shared font at once (Rhythm Heaven Groove, SDK 21): the SDK asks the pl service for GetSharedFontInOrderOfPriority and, when the fonts are loaded, fills min(count, max) SharedFontData {u32 type; const void *address; size_t size}
+//   (0x18 bytes) with the shared memory base + each font's offset (sdk+0x40f270), then returns whether they are loaded; the game retries every 10 ms until they are (main+0x501f04). The service's offsets point past each font's 8-byte
+//   BFTTF header, and the game hands each address straight to ScalableFontEngine::LoadFont (main+0x501ff0), so this always gives the TTF itself, whatever the profile's shared_font. Unhooked, the SDK opens the pl service and aborts
+//   in nn::sm::Initialize. All six types in their numeric order, whatever the language, as the pl service reimplementations do; the stand-ins make types 0-4 one font
+typedef struct { uint32_t type, pad; const void *address; size_t size; } pl_font_data_t;
+HLE_FORCE("_ZN2nn2pl13GetSharedFontEPiPNS0_14SharedFontDataEiNS_8settings12LanguageCodeE", "every shared font: the stand-in TTFs (past the BFTTF header), types 0-5 in order", unsigned, h_pl_GetSharedFont, int *count, pl_font_data_t *out, int max, uint64_t lang) {
+    (void)lang; int n = 0;
+    for (int t = 0; t < 6; t++) {
+        font_t f = font_get(t); if (!f.p) continue;
+        if (n < max) out[n] = (pl_font_data_t){ (uint32_t)t, 0, f.p + 8, f.n - 8 };
+        n++;
+    }
+    *count = n; return n > 0;
+}
 // Whether running on a Switch 2 (codename Ounce) (returns bool): the host reports false, as a Switch 1. Mario 1.2.1 uses it to decide whether to count add-on content (the upgrade pack) and suggest the Switch 2 Edition
 HLE_FORCE("_ZN2nn2pl16IsRunningOnOunceEv", "running on Switch 2: no", unsigned, h_pl_IsOunce, void) { return 0; }
 // The Legend of Zelda: Breath of the Wild (SDK 20): asks for the shared fonts to be loaded before querying their state; the host's stand-in fonts are there on demand. VR mode (the Labo VR goggles): the host never enters VR; the query is always false, entering / leaving is a no-op

@@ -426,7 +426,9 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
     major = {v.split('_')[0] for v in F['sdkver']}
     if not major: notes.append('no SDK version string found')
     elif major != {'16'}: notes.append(f'SDK {"/".join(sorted(major))}, not Mario\'s 16: NVN object sizes, API version and service layouts differ by SDK (the host was converted from D2R\'s SDK 12 to SDK 16 sizes); check them one by one per docs/agents/03')
-    if any(l.split()[:1] == ['nn::ro'] for l in R): notes.append('imports nn::ro (loads NRO modules at run time): not in the host')
+    if any(l.split()[:1] == ['nn::ro'] for l in R):   # hle_ro.c answers nn::ro as if no NRO were loaded: enough unless the game ships NRO modules
+        nro = rom['exts']['.nro']
+        notes.append(f'imports nn::ro (loads NRO modules at run time): the RomFS has {nro} .nro files; the host loads none (hle_ro.c)' + (', so their code never runs' if nro else ', which is enough'))
     if fam['dlc']: notes.append('DLC present: it is extracted into the IPA and the host reports the indices as owned and mounts them; check that the host hooks every aoc / fs add-on content call main imports')
     R += ['', '## What it means for a port', ''] + [f'- {n}' for n in notes or ['—']]
     R += ['', '## Provisional profile keys (dm/games/profile_guess.py)', '', 'What the game files decide; mem_used follows the rewrite, and a game with virtual address memory that sets a heap gets a heap check on the Mac (scripts/build_ipa_from_nsp.py heap_check).', '', '```']

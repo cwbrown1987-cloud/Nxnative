@@ -64,8 +64,13 @@ def fn_starts():               # All function starts in the eh_frame_hdr binary 
         a, k = rd(o, tenc); o += k; _, k = rd(o, tenc); o += k; out.append(a)
     return sorted(set(out))
 
-def resolve(s):
-    return int(s, 16) if s.startswith('0x') else defs[s][0]
+def resolve(s):                # 0xoffset, a defined symbol, or an imported one (its PLT stub: --callers then lists the module's calls of that import)
+    if s.startswith('0x'): return int(s, 16)
+    if s in defs: return defs[s][0]
+    if not plt: plt_scan()
+    for a, n in plt.items():
+        if n == s: return a
+    sys.exit(f'{s}: neither defined nor imported through the PLT')
 
 if sys.argv[2] == '--sym':      # sdis.py <image> --sym 0xoffset...  give the containing function for each one
     plt_scan()
@@ -99,6 +104,8 @@ if sys.argv[2] == '--find':
     sys.exit()
 if sys.argv[2] == '--callers':
     tgt = resolve(sys.argv[3]); textend = max(v + s for v, s in defs.values() if v < 0x10000000 and s)  # Coarse upper bound
+    if not plt: plt_scan()
+    if plt: textend = max(textend, max(plt) + 16)   # the PLT ends the text segment (a main exports too few symbols to bound it)
     for o in range(0, min(len(img), textend), 4):
         w = struct.unpack_from('<I', img, o)[0]
         if w >> 26 in (0x25, 0x05) and o + ((((w & 0x3ffffff) ^ 0x2000000) - 0x2000000) * 4) == tgt:
