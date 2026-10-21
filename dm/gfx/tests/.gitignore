@@ -6,6 +6,8 @@ t_deswz_gpu.dSYM/
 t_builtin.dSYM/
 t_pace
 t_fstep
+t_responsive
+t_responsive.dSYM/
 .precommit.err
 .precommit_snap/
 t_refl

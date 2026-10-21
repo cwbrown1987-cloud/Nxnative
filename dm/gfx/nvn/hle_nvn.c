@@ -1118,6 +1118,7 @@ extern uint32_t mtl_present_qos(void);
 static uint64_t g_frame;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 static uint64_t g_fs_start, g_fs_wait;   // frame step (fstep_tick): when the first acquire after a present returned (the frame's start, 0 = none yet), and its pacing wait
+static uint64_t g_fs_pace_total, g_fs_acquires;
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // Host process start point (main.c; same base as the UIMSG timestamps)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
@@ -1144,6 +1145,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
     if (s) { ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed
+    g_fs_pace_total += pace_ns; g_fs_acquires++;
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
@@ -1370,7 +1372,8 @@ static _Atomic uint64_t g_itv2_since;   // start of the game's current run of in
 // The one-second hold: Mario 1.2.1 picks the interval from the previous frame's time (main+0xcfd24), setting 2 for the frame after a slow one and then 1 again (123 times in two minutes on an iPhone). Following that frame by frame would flap the display-link mode;
 //   a single interval-2 frame is instead kept on screen for its own period by the display-link callback, and the next acquire waits as many ticks (mtl_link_wait_tick, nvn_mtl.m), without changing the mode
 // Frame step (patch_nso.py FRAME_STEP: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0): the game no longer picks an interval. The host hands it each frame's step in whole vsyncs
-// (fstep_tick, nvn_fstep.h) and presents follow the hold k it decides with it
+// (fstep_tick, nvn_fstep.h). Adaptive presentation follows the hold k; responsive
+// presentation keeps k at the cap while game steps compensate elapsed time.
 __attribute__((weak)) uint8_t *dm_fps_state;   // loader.c; graphics unit tests have no loader
 __attribute__((weak)) void dm_fps_lock_tick(void) {}   // hle_fpslock.c: engine frame limits in game memory (Monster Hunter Rise); graphics unit tests have no host
 static int fps_step_cap(void) {
@@ -1379,6 +1382,16 @@ static int fps_step_cap(void) {
     return t <= 0 ? 0 : __atomic_load_n((uint32_t *)(dm_fps_state + 4), __ATOMIC_RELAXED) || t <= 30 ? 30 : 60;
 }
 static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides the steps in whole vsyncs
+static int fstep_responsive(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DM_FRAME_PACING");
+        mode = e && !strcmp(e, "responsive");
+        if (e && strcmp(e, "responsive") && strcmp(e, "adaptive")) LOG("[RED] DM_FRAME_PACING=%s: expected adaptive or responsive; using adaptive", e);
+        LOG("[nvn] frame pacing: %s", mode ? "responsive (cap-only presentation, bounded elapsed-time compensation)" : "adaptive (60/30/20 holds)");
+    }
+    return mode;
+}
 static nvn_fstep g_fs;   // present thread only
 static _Atomic int g_fs_k;   // the hold presentation follows (0 = not decided yet)
 // The display link runs at 30 Hz at a 30 cap, except while the game fixes its own step at 1 (BotW's VFR override)
@@ -1427,9 +1440,21 @@ static void fstep_tick(const win_t *o) {
     double shown = prev ? (st - prev) / v : 0, gpu = 0; prev = st;
     for (uint64_t f = g_frame; f-- > 0 && g_frame - f <= 8;) { double g = mtl_gpu_ms(f); if (g >= 0) { gpu = g * 1e6 / v; break; } }
     double cpu = shown - pw / v, cost = cpu > gpu ? cpu : gpu;
+    g_fs.presentation_slack = 0;
+#if TARGET_OS_OSX
+    // A 60 Hz virtual tick on e.g. 165 Hz is quantized to physical refreshes. A
+    // cheap 50 ms frame can therefore be shown for 54.55 ms: this is display
+    // jitter, not work. Otherwise fit_run never reaches 30 after a load hitch.
+    // Keep the CPU/GPU work threshold unchanged so real overload still steps up.
+    int screen_hz = front_screen_max_fps();
+    if (screen_hz > 60 && screen_hz % 60 && mtl_link_active()) g_fs.presentation_slack = FSTEP_LATE + 60.0 / screen_hz;
+#endif
+    if (getenv("DM_FSTEP_TRACE") && o->presents % 60 == 0) LOG("[fstep-cost] present=%llu hold=%d shown=%.3f cpu=%.3f gpu=%.3f first-wait=%.3f all-wait=%.3f acquires=%llu", (unsigned long long)o->presents, g_fs.k, shown*v/1e6, cpu*v/1e6, gpu*v/1e6, pw/1e6, g_fs_pace_total/1e6, (unsigned long long)g_fs_acquires);
+    g_fs_pace_total = g_fs_acquires = 0;
     int c = fps_step_cap(), kmin = 60 / c, kmax = kmin >= 2 ? 2 : FSTEP_MAX, k0 = g_fs.k, kmin0 = g_fs.kmin;
     int fixed = (int)__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED);
-    int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed);
+    int responsive = fstep_responsive();
+    int n = responsive ? nvn_fstep_responsive(&g_fs, shown, kmin, fixed) : nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed);
     __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED); atomic_store(&g_fs_k, g_fs.k);
     held[g_fs.k]++; if (fixed) fixed_sum += (uint64_t)n;   // the stubs count only the host's steps
     static int fixed_was, nfix;

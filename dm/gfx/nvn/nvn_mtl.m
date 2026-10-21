@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <ctype.h>
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>   // os_proc_available_memory: for the memory readout line
@@ -756,12 +757,49 @@ static int ubd_covers(uint64_t lo, uint64_t hi) {
         if (next == at) return 0; at = next; }
     return 1;
 }
-// GPU address of the shadow of uniform range [lo, hi) (ubd_covers holds): one deferred update holding all of it and suitably aligned is used in place; otherwise the updates are laid into the arena in order
+// The bytes [a, b) as the GPU will read them once the writes queued in this submission land, into d (byte a at d[0]; d NULL: only whether they are known). The newest queued write
+// overlapping the range gives the bytes it covers when it is an inline update (its data is in the update ring), and the rest is resolved the same way on each side; bytes no queued
+// write touches are the memory as it is now, once every earlier submission is complete. A copy or fill, too many writes to tell, or earlier work still in flight → 0
+static int pend_bytes(uint64_t a, uint64_t b, uint8_t *d, int *idle, int depth) {
+    if (a >= b) return 1;
+    if (depth > 64) return 0;
+    int e = pend_last(a, b - a);
+    if (e == -2) return 0;
+    if (e == -1) {
+        if (*idle < 0) { pthread_mutex_lock(&g_mu); *idle = g_done >= g_fence; pthread_mutex_unlock(&g_mu); }
+        if (!*idle) return 0;
+        void *mb; uint64_t mo; const uint8_t *base;
+        if (!mtl_addr(a, b - a, &mb, &mo) || !(base = [(__bridge id<MTLBuffer>)mb contents])) return 0;
+        if (d) memcpy(d, base + mo, (size_t)(b - a));
+        return 1;
+    }
+    if (!g_pend_upd[e]) return 0;
+    const upd_ent *u = &g_upd[g_pend_upd[e] - 1];
+    uint64_t lo = g_pend_lo[e] > a ? g_pend_lo[e] : a, hi = g_pend_hi[e] < b ? g_pend_hi[e] : b;
+    if (d) memcpy(d + (lo - a), (const uint8_t *)u->buf.contents + u->off + (lo - u->lo), (size_t)(hi - lo));
+    return pend_bytes(a, lo, d, idle, depth + 1) && pend_bytes(hi, b, d ? d + (hi - a) : NULL, idle, depth + 1);
+}
+// The bytes of [lo, hi) no deferred update covers, as the pass will read them (pend_bytes), into d + (byte - lo); d NULL: only whether they are all known. Not known → the pass
+// ends before the draw, as before
+static int ubd_gaps(uint64_t lo, uint64_t hi, uint8_t *d) {
+    int idle = -1;
+    for (uint64_t at = lo; at < hi;) {
+        uint64_t next = at; for (int i = 0; i < g_nubd; i++) if (g_ubd[i].lo <= at && g_ubd[i].hi > next) next = g_ubd[i].hi;
+        if (next > at) { at = next; continue; }   // covered by the deferred updates
+        uint64_t end = hi; for (int i = 0; i < g_nubd; i++) if (g_ubd[i].lo > at && g_ubd[i].lo < end) end = g_ubd[i].lo;   // the gap [at, end)
+        if (!pend_bytes(at, end, d ? d + (at - lo) : NULL, &idle, 0)) return 0;
+        at = end;
+    }
+    return 1;
+}
+// GPU address of the shadow of uniform range [lo, hi) (ubd_covers or ubd_gaps holds): one deferred update holding all of it and suitably aligned is used in place; otherwise the gaps
+// (ubd_gaps) and then the updates are laid into the arena in order
 static uint64_t ubd_shadow(uint64_t lo, uint64_t hi) {
     for (int i = g_nubd - 1; i >= 0; i--) { const ubd_ent *e = &g_ubd[i];
         if (e->lo <= lo && hi <= e->hi) { int later = 0; for (int j = i + 1; j < g_nubd; j++) later |= lo < g_ubd[j].hi && g_ubd[j].lo < hi;
             uint64_t g = e->gpu + (lo - e->lo); if (!later && !(g & 15)) return g; break; } }
     id<MTLBuffer> ab; size_t o = arena_alloc((size_t)(hi - lo), &ab); uint8_t *d = (uint8_t *)ab.contents + o;
+    if (!ubd_covers(lo, hi)) ubd_gaps(lo, hi, d);
     for (int i = 0; i < g_nubd; i++) { const ubd_ent *e = &g_ubd[i]; uint64_t a = e->lo > lo ? e->lo : lo, b = e->hi < hi ? e->hi : hi;
         if (a < b) memcpy(d + (a - lo), (const uint8_t *)e->buf.contents + e->off + (a - e->lo), (size_t)(b - a)); }
     return ab.gpuAddress + o;
@@ -2427,7 +2465,8 @@ static void shmap_load(void) {
 @interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn; uint16_t tf_stride[4]; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     // The argument buffer encoded last time
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass; uint32_t ab_binst;   // ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
-    id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; } @end   // bflib: readable-tile version <key>_bf (merge B step 2)
+    id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn;
+    uint32_t cbx[16]; int cbx_done; } @end   // bflib: readable-tile version <key>_bf (merge B step 2); cbx: bytes the shader reads from uniform slot r (cb_scan; UINT32_MAX = not known)
 @implementation NvShader
 - (void)dealloc { free(rf.c1); }
 @end
@@ -2594,6 +2633,54 @@ static NvShader *shader_load(NSString *pc, int stage) {
     }
     if (o->rf.has_c1) c1_store(o);
     return o;
+}
+
+// The bytes a shader reads from each uniform slot, from its MSL beside the library: Ryujinx's translation reads a slot as (*<set>.<name>)._m0[i] of a float4 array. When every
+// use of the slot's name is such a read with a literal index, the shader reads at most 16 * (max i + 1) bytes; otherwise (a computed index, the pointer passed on, no MSL) the whole
+// binding counts. Lets inline updates deferred in a pass cover a large binding the shader reads only the start of (Breath of the Wild binds 64 KB and updates 64 bytes per draw)
+static void cb_scan(NvShader *sh) {
+    sh->cbx_done = 1;
+    for (int r = 0; r < 16; r++) sh->cbx[r] = UINT32_MAX;
+    @autoreleasepool {
+    NSString *pc = @(sh->key);
+    NSData *jd = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"%@/%@.json", g_msl_dir, pc]];
+    NSData *md = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"%@/%@.metal", g_msl_dir, pc]];
+    NSDictionary *j = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
+    if (!j || !md || ![j[@"bindings"] isKindOfClass:[NSArray class]]) return;
+    const char *t = md.bytes, *end = t + md.length;
+    for (NSDictionary *b in j[@"bindings"]) {
+        if (![b isKindOfClass:[NSDictionary class]] || ![b[@"kind"] isEqual:@"cbuf"] || ![b[@"msl_name"] isKindOfClass:[NSString class]]) continue;
+        int reg = [b[@"reg"] intValue]; if (reg < 0 || reg >= 16) continue;
+        const char *name = [b[@"msl_name"] UTF8String]; size_t nl = strlen(name);
+        char ty[64] = ""; int ok = 1; long top = -1;
+        for (const char *p = t; ok && (p = memmem(p, (size_t)(end - p), name, nl)); p += nl) {
+            if ((p > t && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) || (p + nl < end && (isalnum((unsigned char)p[nl]) || p[nl] == '_'))) continue;   // part of a longer name
+            const char *q = p + nl;
+            if (q + 3 < end && !memcmp(q, " [[", 3)) {   // the declaration "constant <type>* <name> [[id(n)]]": its element type is checked below
+                const char *ls = p; while (ls > t && ls[-1] != '\n') ls--;
+                if (sscanf(ls, " constant %63[A-Za-z0-9_]*", ty) != 1) ok = 0;
+                continue; }
+            if (q + 6 > end || memcmp(q, ")._m0[", 6)) { ok = 0; break; }
+            q += 6; long i = 0; int nd = 0; while (q < end && isdigit((unsigned char)*q)) { i = i * 10 + (*q++ - '0'); nd++; }
+            if (q < end && *q == 'u') q++;
+            if (!nd || q >= end || *q != ']') { ok = 0; break; }
+            if (i > top) top = i;
+        }
+        if (ok && ty[0]) {   // the slot's type must be a struct of one 16-byte vector array (struct T { float4 _m0[n]; })
+            char hd[96]; snprintf(hd, sizeof hd, "struct %s\n{\n    ", ty); const char *sd = memmem(t, (size_t)(end - t), hd, strlen(hd));
+            if (!sd) ok = 0;
+            else { sd += strlen(hd); char el[16]; long n = 0;
+                if (sscanf(sd, "%15[a-z0-9] _m0[%ld];", el, &n) != 2 || (strcmp(el, "float4") && strcmp(el, "uint4") && strcmp(el, "int4"))) ok = 0;
+                else { const char *nx = strchr(sd, '\n'); if (!nx || strncmp(nx + 1, "};", 2)) ok = 0; } }
+        } else ok = 0;
+        if (ok) sh->cbx[reg] = (uint32_t)(16 * (top + 1));
+    }
+    }
+}
+// The part of uniform slot reg's binding of size bytes that shader sh reads
+static inline uint64_t cb_need(NvShader *sh, int reg, uint64_t size) {
+    if (!sh->cbx_done) cb_scan(sh);
+    return reg < 16 && sh->cbx[reg] < size ? sh->cbx[reg] : size;
 }
 
 static int stage_of(NSString *stage) {
@@ -3700,8 +3787,9 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
             void *mb; uint64_t mo, gpu;
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "stage %d cb%d has no uniform buffer bound", nvn_stage, reg); continue; }
-            if (g_nubd && ubd_hits(u->addr, u->addr + u->size)) {   // inline updates deferred in this pass (see mtl_sub_update); ubd_conflict made sure they cover the binding
-                if (ubd_covers(u->addr, u->addr + u->size)) gpu = ubd_shadow(u->addr, u->addr + u->size);
+            uint64_t need = g_nubd ? cb_need(sh, reg, u->size) : 0;   // the part of the binding this shader reads
+            if (g_nubd && ubd_hits(u->addr, u->addr + need)) {   // inline updates deferred in this pass (see mtl_sub_update); ubd_conflict made sure they cover what the shader reads
+                if (ubd_covers(u->addr, u->addr + need) || ubd_gaps(u->addr, u->addr + need, NULL)) gpu = ubd_shadow(u->addr, u->addr + need);
                 else RED_ONCE(92, "a uniform update deferred inside the pass covers only part of the binding (stage %d cb%d): the content before the update is read", nvn_stage, reg); }
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
@@ -5523,7 +5611,7 @@ static int ubd_conflict(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; if (b->reg >= 16) continue;
             const p_bind_buf *u = b->kind == NVN_RB_SBUFP ? &S.ssbo[st][b->reg] : &S.ubo[st][b->reg];
             if (!u->addr) continue;
-            if (b->kind == NVN_RB_CBUF) { if (ubd_hits(u->addr, u->addr + u->size) && !ubd_covers(u->addr, u->addr + u->size)) return 1; }
+            if (b->kind == NVN_RB_CBUF) { uint64_t hi = u->addr + cb_need(sh, b->reg, u->size); if (ubd_hits(u->addr, hi) && !ubd_covers(u->addr, hi) && !ubd_gaps(u->addr, hi, NULL)) return 1; }   // only the part the shader reads
             else if (b->kind == NVN_RB_TEXU || b->kind == NVN_RB_SAMPU || b->kind == NVN_RB_SBUFU) { uint64_t h = u->addr + b->off, n = b->kind == NVN_RB_SBUFU ? 8 : 4; if (ubd_hits(h, h + n) && !ubd_covers(h, h + n)) return 1; }
             else if (b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_UBOP) { if (ubd_hits(u->addr, u->addr + (u->size ? u->size : 1))) return 1; } } }
     return 0;
@@ -7053,6 +7141,7 @@ static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
 static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double);
 
+static double g_link_vperiod, g_link_vnext, g_link_vhalf;   // seconds per counted tick (0: every callback is a tick), the next tick's due time, half a refresh (see link_range)
 @interface NvMetalDisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
 @end
 
@@ -7073,6 +7162,13 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     if (g_stall_t0) { uint64_t since = dm_focus_in_since(), t = now_ns();
         MLOG("display link recovered: stalled %.0f ms (%.0f ms of it active), fallback dropped %llu frames (stall #%llu)", (t - g_stall_t0) / 1e6, (t - (g_stall_t0 > since ? g_stall_t0 : since)) / 1e6, (unsigned long long)g_stall_drop, (unsigned long long)g_stall_n); g_stall_t0 = 0; }
     pthread_mutex_unlock(&g_pq_mu);
+    double vp = g_link_vperiod;
+    if (vp > 0) {   // only the refresh nearest each slot of the steady clock is a tick (see link_range)
+        double t = update.targetPresentationTimestamp;
+        if (!g_link_vnext || t > g_link_vnext + vp) g_link_vnext = t;   // the first callback, or after a stall: start the clock again here
+        if (t < g_link_vnext - g_link_vhalf) return;
+        g_link_vnext += vp;
+    }
     pthread_mutex_lock(&g_link_mu);
     g_link_tick_ns = now_ns();
     g_link_tick_n++;
@@ -7106,7 +7202,22 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
 static CAMetalDisplayLink *g_link; static CFRunLoopRef g_link_rl; static int g_link_started;
 static int g_link_owns_layer, g_classic_busy;   // Under g_pq_mu: nextDrawable throws while the layer has the display link object attached, so the present thread that takes its own drawable and the display link object are mutually exclusive
 static int link_on(void) { return g_dm_present_link && g_link != nil; }
-static CAFrameRateRange link_range(int mode) { return mode == 3 ? CAFrameRateRangeMake(30, 30, 30) : mode == 2 ? CAFrameRateRangeMake(60, 120, 120) : CAFrameRateRangeMake(60, 60, 60); }
+// Screens whose refresh rate is not a multiple of the link's rate (165 or 144 Hz against 60; 30 in power-saving mode): asked for 60 Hz, the system fires the link on every third
+// refresh of a 165 Hz screen, 55 Hz, and the game, paced by the link, ran at 55 fps (27.5 at 30). There the link runs at the screen's rate and only the refreshes nearest a steady
+// clock of the wanted rate count as ticks (g_link_vperiod, NvMetalDisplayLinkDelegate): 60 frames a second on average, each shown for the refreshes closest to its 1/60 s slot.
+// DM_LINK_VTICK=0 keeps the system's choice
+__attribute__((weak)) int front_screen_max_fps(void) { return 0; }   // front_mac.m; none on iOS, whose screens run at multiples of 60 Hz
+static CAFrameRateRange link_range(int mode) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_LINK_VTICK"); on = !(e && !strcmp(e, "0")); }
+    int rate = mode == 3 ? 30 : mode == 2 ? 120 : 60, hz = on ? front_screen_max_fps() : 0;
+    if (hz > rate && hz % rate && mode != 2) {
+        if (g_link_vperiod != 1.0 / rate) { g_link_vnext = 0; MLOG("display link at the screen's %d Hz, counting a tick every 1/%d s (the screen's rate is not a multiple of it)", hz, rate); }
+        g_link_vhalf = 0.5 / hz; g_link_vperiod = 1.0 / rate;
+        return CAFrameRateRangeMake(rate, hz, hz);
+    }
+    g_link_vperiod = 0;
+    return mode == 3 ? CAFrameRateRangeMake(30, 30, 30) : mode == 2 ? CAFrameRateRangeMake(60, 120, 120) : CAFrameRateRangeMake(60, 60, 60);
+}
 static int g_link_mode = 1;   // Current mode of the display link object: 1 / 2 same as g_dm_present_link, 3 = power-saving mode 30 Hz
 static void *link_main(void *arg) {   // Display link thread: started when switching to display-link mode, exits when switching back to 0
     (void)arg;

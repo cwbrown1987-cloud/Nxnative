@@ -22,6 +22,7 @@ typedef struct {
     double debt;              // real time the game is behind, in vsyncs
     int late_run, fit_run, trial;   // late frames in a row; frames in a row whose cost fits k − 1; frames left of a trial at k − 1 (0 = none)
     double hold, since;       // vsyncs a trial waits for after a step up; vsyncs since the last step up
+    double presentation_slack; // allowed display-interval jitter in vsyncs; work cost still uses FSTEP_LATE
     uint64_t late, paid, ups, downs, failed; double dropped;   // statistics for the log
 } nvn_fstep;
 
@@ -48,7 +49,8 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     if (kmin < s->kmin || s->k < kmin) s->k = kmin;   // the cap rose (a movie or the game's own step ended) or fell
     if (s->k > kmax) s->k = kmax;
     s->kmin = kmin;
-    int late = shown > held + FSTEP_LATE || cost > held + FSTEP_LATE;
+    double slack = s->presentation_slack > FSTEP_LATE ? s->presentation_slack : FSTEP_LATE;
+    int late = shown > held + slack || cost > held + FSTEP_LATE;
     if (late) { s->late++; s->late_run++; s->fit_run = 0; } else s->late_run = 0;
     if (s->late_run >= 3 && s->k < kmax) {   // step up to the cost, at least one vsync
         int want = (int)ceil(cost - 0.05);
@@ -61,5 +63,33 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     if (s->fit_run >= FSTEP_RUN && s->since >= s->hold && !s->trial) { s->k--; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
     s->step = s->k + (s->debt >= 1 && s->k < FSTEP_MAX);
     s->paid += s->step > s->k;
+    return s->step;
+}
+
+// Responsive pacing: presentation always targets the cap. A late frame never
+// starts a 30/20 fps hold or a recovery trial. Keep the existing integer game
+// steps, compensating elapsed time without making presentation wait for them.
+// At most two vsyncs of debt survive a load/pause, avoiding a long fast-forward.
+static inline int nvn_fstep_responsive(nvn_fstep *s, double shown, int kmin, int fixed) {
+    if (kmin < 1) kmin = 1;
+    if (kmin > FSTEP_MAX) kmin = FSTEP_MAX;
+    if (fixed > 0) {
+        s->k = s->step = fixed < FSTEP_MAX ? fixed : FSTEP_MAX;
+        s->kmin = FSTEP_MAX + 1;
+        s->debt = 0; s->late_run = s->fit_run = s->trial = 0;
+        return s->step;
+    }
+    if (!s->k || s->kmin > FSTEP_MAX || s->kmin != kmin) {
+        s->k = s->step = s->kmin = kmin;
+        s->debt = 0;
+        return s->step;
+    }
+    s->debt += shown - s->step;
+    if (s->debt > 2) { s->dropped += s->debt - 2; s->debt = 2; }
+    if (s->debt < -1) s->debt = -1;
+    if (shown > kmin + FSTEP_LATE) s->late++;
+    s->k = kmin;
+    s->step = kmin + (s->debt >= 1 && kmin < FSTEP_MAX);
+    s->paid += s->step > kmin;
     return s->step;
 }

@@ -85,6 +85,25 @@ int main(void) {
         run(&m, 2, 0.5, 1, 3, 0);
         check(m.s.k == 1 && m.next == 1 && m.s.late == 0, "  the override ends: hold 1, step 1, no late frame counted");
     }
+    {   // 165 Hz: 20 fps holds alternate between 8/9 physical refreshes. Their
+        // 54.55 ms intervals are > 50+1.67, but no workload exceeds its budget.
+        for (int fixed = 0; fixed <= 1; fixed++) {
+            nvn_fstep s = {.k=3,.step=3,.kmin=1,.hold=FSTEP_HOLD0};
+            s.presentation_slack = fixed ? FSTEP_LATE + 60.0/165 : 0;
+            for (int i=0;i<360;i++) {
+                double shown = s.k == 3 ? (i%3 ? 48.485 : 54.545) / (1000.0/60) :
+                               s.k == 2 ? (i%2 ? 30.303 : 36.364) / (1000.0/60) :
+                                          (i%4 ? 18.182 : 12.121) / (1000.0/60);
+                nvn_fstep_next(&s, shown, 0.6, 1, 3, 0);
+            }
+            check(fixed ? s.k == 1 && s.downs == 2 : s.k == 3 && s.downs == 0,
+                  fixed ? "165 Hz quantization: recover 20 -> 30 -> 60 with display-only tolerance" :
+                          "regression reproduction: original tolerance remains stuck at 20 fps");
+        }
+        sim m = {0}; m.s.presentation_slack=FSTEP_LATE+60.0/165;
+        run(&m,60,0.5,1,3,0); run(&m,300,1.32,1,3,0);
+        check(m.s.k==2,"display jitter tolerance does not hide sustained 22 ms CPU/GPU work");
+    }
     printf("== %d checks, %d failed ==\n", checks, fail);
     return fail != 0;
 }
