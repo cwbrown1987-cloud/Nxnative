@@ -246,14 +246,16 @@ DEFAULTS = {'op_mode': 'console', 'pad_layout': 'simple'}
 NO_SIGNAL = {'pad_layout', 'op_mode'}   # no static signal outside the engine presets; the player switches the pad layout in game, DM_OPMODE in env.txt sets the mode
 
 
-def find_extraction(root, g):   # (ExeFS, RomFS manifest or folder) for a profile: its survey, else the work folder's extraction of the packed version
+def find_extraction(root, g):   # (ExeFS, RomFS manifest or folder) for a profile: its survey, else a work folder's extraction of the packed version
     for d in sorted(Path(root).iterdir()):
         s = d / f'{g.id}_survey/extract'
         if (s / 'ExeFS').is_dir() and (s / 'romfs_manifest.tsv').exists(): return s / 'ExeFS', s / 'romfs_manifest.tsv'
-    for d in sorted(Path(root).iterdir()):
-        for v in [g.get('package', '')] + sorted(x.name for x in (d / f'{g.id}-work/data').glob('v*')):
-            w = d / f'{g.id}-work/data' / v
-            if (w / 'ExeFS').is_dir() and (w / 'RomFS').is_dir(): return w / 'ExeFS', w / 'RomFS'
+    for data in (f'{g.id}-work/data', f'{g.id}_build/extract'):   # the by-hand work layout (docs/development.md), then the NSP script's (<NSP folder>/<id>_build/extract/<version>): either holds what --check needs
+        for d in sorted(Path(root).iterdir()):
+            base = d / data
+            for v in [g.get('package', '')] + sorted(x.name for x in base.glob('v*')):
+                w = base / v
+                if (w / 'ExeFS').is_dir() and (w / 'RomFS').is_dir(): return w / 'ExeFS', w / 'RomFS'
     return None
 
 
