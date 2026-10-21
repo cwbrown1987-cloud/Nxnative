@@ -19,6 +19,8 @@
 #include "../tex/nvn_fmt_mtl.h"
 #include "../tex/nvn_deswizzle.h"
 #include "../tex/nvn_deswizzle_gpu.h"
+#define BCDEC_IMPLEMENTATION
+#include "../../third_party/bcdec/bcdec.h"   // CPU BC1–7 decoder for devices without hardware BC texture support (iPhone A16 and older)
 #include "nvn_builtin.h"
 #include "nvn_dirty.h"
 #include "nvn_refl.h"
@@ -322,7 +324,7 @@ void mtl_init(void) {
     g_present_args = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
     if (!g_present_args) MDIE("failed to create the present argument table: %s", ate.localizedDescription.UTF8String);
     for (int i = 0; i < 3; i++) {
-        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 16 options:MTLResourceStorageModeShared];
         if (!g_present_uv[i]) MDIE("failed to create present UV buffer[%d]", i);
         res_add(g_present_uv[i]);
     }
@@ -1167,6 +1169,54 @@ static int g_red_once[109];
 
 // ---------- Texture → MTLTexture ----------
 static int fmt_compressed(int f) { return (f >= 0x41 && f <= 0x50) || (f >= 0x79 && f <= 0x94); }
+static int nvn_fmt_bc(uint32_t f);
+// A16 / older Apple GPUs have no hardware BC texture sampling. Decode such textures to RGBA8 on the CPU at upload
+// (DM_NVN_BC_SOFTWARE=1 forces it, 0 forces hardware BC; unset follows MTLDevice.supportsBCTextureCompression).
+static int bc_soft_fmt(const tex_t *t) {
+    if (!t || !nvn_fmt_bc(t->d.format)) return 0;
+    static int force = -1;
+    if (force < 0) { const char *e = getenv("DM_NVN_BC_SOFTWARE"); force = e ? atoi(e) : 2; }
+    if (force == 1) return 1;
+    if (force == 0) return 0;
+    return ![g_dev supportsBCTextureCompression];
+}
+static uint32_t bc_soft_pf(uint32_t f) {
+    return (f == 0x45 || f == 0x46 || f == 0x47 || f == 0x48 || f == 0x4e) ? (uint32_t)MTLPixelFormatRGBA8Unorm_sRGB : (uint32_t)MTLPixelFormatRGBA8Unorm;
+}
+// Decode linear BC blocks (the output of nvn_deswizzle) into a padded RGBA8 image. dst_pitch is in bytes.
+static void bc_decode_blocks(uint32_t f, const uint8_t *src, uint8_t *dst, size_t dst_pitch, uint32_t w, uint32_t h) {
+    int bw, bh, bpb = nvn_fmt_bpb(f, &bw, &bh);
+    if (bw != 4 || bh != 4 || !bpb) return;
+    uint32_t bx = (w + 3) / 4, by = (h + 3) / 4;
+    if (f == 0x49 || f == 0x4a) {   // BC4: one channel; expand to RGBA8
+        size_t tp = (size_t)bx * 4; uint8_t *tmp = calloc(tp, (size_t)by * 4);
+        if (!tmp) return;
+        for (uint32_t y = 0; y < by; y++) for (uint32_t x = 0; x < bx; x++) bcdec_bc4(src + ((size_t)y * bx + x) * 8, tmp + (size_t)y * 4 * tp + (size_t)x * 4, (int)tp);
+        for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) { uint8_t v = tmp[(size_t)y * tp + x]; uint8_t *d = dst + y * dst_pitch + (size_t)x * 4; d[0] = v; d[1] = 0; d[2] = 0; d[3] = 255; }
+        free(tmp); return;
+    }
+    if (f == 0x4b || f == 0x4c) {   // BC5: two channels
+        size_t tp = (size_t)bx * 4 * 2; uint8_t *tmp = calloc(tp, (size_t)by * 4);
+        if (!tmp) return;
+        for (uint32_t y = 0; y < by; y++) for (uint32_t x = 0; x < bx; x++) bcdec_bc5(src + ((size_t)y * bx + x) * 16, tmp + (size_t)y * 4 * tp + (size_t)x * 4 * 2, (int)tp);
+        for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) { uint8_t *q = tmp + (size_t)y * tp + (size_t)x * 2; uint8_t *d = dst + y * dst_pitch + (size_t)x * 4; d[0] = q[0]; d[1] = q[1]; d[2] = 0; d[3] = 255; }
+        free(tmp); return;
+    }
+    for (uint32_t y = 0; y < by; y++) for (uint32_t x = 0; x < bx; x++) {
+        const uint8_t *q = src + ((size_t)y * bx + x) * bpb;
+        uint8_t *d = dst + (size_t)y * 4 * dst_pitch + (size_t)x * 4 * 4;
+        switch (f) {
+            case 0x41: case 0x45: bcdec_bc1(q, d, (int)dst_pitch); break;
+            case 0x42: case 0x46: bcdec_bc1(q, d, (int)dst_pitch); break;
+            case 0x43: case 0x47: bcdec_bc2(q, d, (int)dst_pitch); break;
+            case 0x44: case 0x48: bcdec_bc3(q, d, (int)dst_pitch); break;
+            case 0x4d: case 0x4e: bcdec_bc7(q, d, (int)dst_pitch); break;
+            default:   // BC6H not supported here: opaque black
+                for (int yy = 0; yy < 4; yy++) for (int xx = 0; xx < 4; xx++) { uint8_t *p = d + (size_t)yy * dst_pitch + (size_t)xx * 4; p[0] = p[1] = p[2] = 0; p[3] = 255; }
+                break;
+        }
+    }
+}
 static int fmt_depth(int f) { return f >= 0x31 && f <= 0x36; }
 typedef struct { MTLPixelFormat a, b; } pfv_pair;
 static const pfv_pair g_pfv_srgb[] = {
@@ -1269,9 +1319,63 @@ static uint64_t g_pfv_upgrades;
 // DM_NVN_DIRTYCHECK=1 (diagnostic, compared against ground truth): fully hash the pool content on every use; changed but not detected by dirty-page tracking = a missed detection
 static int dirtycheck(void) { static int v = -1; if (v < 0) v = getenv("DM_NVN_DIRTYCHECK") != NULL; return v; }
 static uint64_t full_hash(const uint8_t *m, uint64_t n) { uint64_t h = 1469598103934665603ull; for (uint64_t i = 0; i < n; i++) h = (h ^ m[i]) * 1099511628211ull; return h; }
+typedef struct { char magic[4]; uint32_t ver, levels, layers, w, h, fmt, srgb; } bc_astc_hdr;
+static uint64_t bc_tex_hash(const tex_t *t) {
+    uint64_t h = 1469598103934665603ull;
+    if (t->mem) for (uint64_t i = 0; i < t->L.size; i++) h = (h ^ t->mem[i]) * 1099511628211ull;
+    uint32_t d[8] = {(uint32_t)t->d.format, t->d.width, t->d.height, t->d.depth, t->d.levels, (uint32_t)t->d.target, (uint32_t)t->d.samples, (uint32_t)t->d.flags};
+    for (int i = 0; i < 8; i++) h = (h ^ d[i]) * 1099511628211ull;
+    return h;
+}
+static int bc_astc_open(const tex_t *t, bc_astc_hdr *h, FILE **out) {
+    const char *dir = getenv("DM_NVN_BC_ASTC");
+    if (!dir || !*dir || !t || !t->mem || t->d.target != 1 || t->d.levels > 15) return 0;
+    char path[1200]; snprintf(path, sizeof path, "%s/%016llx.astc", dir, (unsigned long long)bc_tex_hash(t));
+    FILE *f = fopen(path, "rb"); if (!f) return 0;
+    if (fread(h, 1, sizeof *h, f) != sizeof *h || memcmp(h->magic, "BCA1", 4) || h->ver != 1 ||
+        h->levels != (t->d.levels ? t->d.levels : 1) || h->layers != 1 || h->w != t->d.width || h->h != t->d.height || h->fmt != t->d.format) { fclose(f); return 0; }
+    *out = f; return 1;
+}
+static int bc_astc_hit(const tex_t *t, uint32_t *pf) {
+    bc_astc_hdr h; FILE *f = NULL;
+    if (!bc_astc_open(t, &h, &f)) return 0;
+    fclose(f);
+    *pf = h.srgb ? (uint32_t)MTLPixelFormatASTC_4x4_sRGB : (uint32_t)MTLPixelFormatASTC_4x4_LDR;
+    return 1;
+}
+static int bc_dump_srgb(uint32_t f) { return f == 0x45 || f == 0x46 || f == 0x47 || f == 0x48 || f == 0x4e; }
+static void bc_dump_tga(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    FILE *f = fopen(path, "wb"); if (!f) return;
+    uint8_t hd[18] = {0}; hd[2] = 2; hd[12] = (uint8_t)w; hd[13] = (uint8_t)(w >> 8); hd[14] = (uint8_t)h; hd[15] = (uint8_t)(h >> 8); hd[16] = 32; hd[17] = 0x28;
+    fwrite(hd, 1, sizeof hd, f);
+    for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) {
+        const uint8_t *q = rgba + ((size_t)y * w + x) * 4; uint8_t p[4] = {q[2], q[1], q[0], q[3]}; fwrite(p, 1, 4, f);
+    }
+    fclose(f);
+}
+static void bc_dump_texture(const tex_t *t, const uint8_t *rgba, uint32_t pw, uint32_t ph, unsigned level) {
+    const char *dir = getenv("DM_NVN_BC_DUMP"); if (!dir || !*dir || !rgba) return;
+    mkdir(dir, 0755);
+    uint64_t hash = bc_tex_hash(t);
+    static uint64_t seen[4096]; static int nseen;
+    int was = 0; for (int i = 0; i < nseen; i++) was |= seen[i] == hash;
+    if (!was) {
+        char mp[1200]; snprintf(mp, sizeof mp, "%s/dump.tsv", dir);
+        FILE *mf = fopen(mp, "a"); if (mf) {
+            fseek(mf, 0, SEEK_END); long sz = ftell(mf);
+            if (sz == 0) fprintf(mf, "# hash\tformat\tw\th\tlevels\tlayers\tsrgb\n");
+            fprintf(mf, "%016llx\t%#x\t%u\t%u\t%u\t1\t%d\n", (unsigned long long)hash, t->d.format, t->d.width, t->d.height, t->d.levels ? t->d.levels : 1, bc_dump_srgb((uint32_t)t->d.format));
+            fclose(mf);
+        }
+        if (nseen < 4096) seen[nseen++] = hash;
+    }
+    char path[1200]; snprintf(path, sizeof path, "%s/%016llx_l%u_a0.tga", dir, (unsigned long long)hash, level);
+    bc_dump_tga(path, rgba, pw, ph);
+}
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
+    if (bc_soft_fmt(t)) { uint32_t apf = 0; pf = bc_astc_hit(t, &apf) ? apf : bc_soft_pf(t->d.format); }   // A16: ASTC cache if available, else RGBA8 decode
     // Metal's limits: 16384 in 2D, 2048 in 3D, 2048 array layers; beyond them Metal aborts the process on an assertion, so they are caught here with a red line
     if (t->d.width > 16384 || t->d.height > 16384 || t->d.depth > 2048 || t->d.levels > 15) { RED_ONCE(71, "texture size exceeds Metal limits: %u×%u×%u levels %u format %#x target %d (first case ser=%llu)", t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
@@ -1501,6 +1605,20 @@ static void up_blit_add(id<MTLBuffer> src, size_t off, size_t row, size_t image,
     g_up_blits[g_nup_blits++] = (up_blit){src, off, row, image, size, dst, slice, level};
 }
 
+static int bc_astc_upload(const tex_t *t, id<MTLTexture> mt) {
+    bc_astc_hdr h; FILE *f = NULL;
+    if (!bc_astc_open(t, &h, &f)) return 0;
+    up_begin();
+    for (uint32_t l = 0; l < h.levels; l++) {
+        uint32_t w = MAX(t->d.width >> l, 1u), hh = MAX(t->d.height >> l, 1u);
+        uint32_t row = ((w + 3) / 4) * 16, rows = (hh + 3) / 4; size_t img = (size_t)row * rows;
+        id<MTLBuffer> b = [g_dev newBufferWithLength:img ? img : 16 options:MTLResourceStorageModeShared];
+        if (!b || fread(b.contents, 1, img, f) != img) { if (b) defer_obj_release(b); fclose(f); RED_ONCE(90, "ASTC cache read failed for ser=%llu level %u", (unsigned long long)t->serial, l); return 0; }
+        res_add(b); [g_up_keep addObject:b];
+        up_blit_add(b, 0, row, img, MTLSizeMake(w, hh, 1), mt, 0, l);
+    }
+    fclose(f); up_flush(); return 1;
+}
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse);
 int nvn_host_readable(uint64_t a, uint64_t n);   // hle_nvn.c: guest memory and sparse pools
 int nvn_sparse_pool(const void *pool); uint64_t nvn_sparse_gen(void); uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n);
@@ -1553,6 +1671,8 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     if (stamp) {   // no stamp: a one-time upload of content the CPU will not change (tex_init_fill), with no write tracking
         if (sparse) nvn_sparse_protect(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size); else nvn_dirty_protect(t->mem, t->L.size);
         *stamp = nvn_dirty_now(); }
+    int soft = bc_soft_fmt(t);
+    if (soft && bc_astc_upload(t, mt)) { [g_up_texs addObject:mt]; return mt; }
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;
     if (t->d.target == 9) layers *= 6;
@@ -1563,8 +1683,8 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     }
     g_bp_up_bytes += total;
     void *mb; uint64_t mo;
-    int use_gpu = !sparse && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);   // a sparse pool's texture is gathered through its page table on the CPU
-    if (g_nvn_deswz_gpu && !use_gpu && !sparse) RED_ONCE(40, "swizzled texture storage is not in a memory pool; falling back to the CPU");
+    int use_gpu = !sparse && g_nvn_deswz_gpu && !soft && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);   // a sparse pool's texture is gathered through its page table on the CPU
+    if (g_nvn_deswz_gpu && !use_gpu && !sparse && !soft) RED_ONCE(40, "swizzled texture storage is not in a memory pool; falling back to the CPU");
     if (use_gpu) {
         // The GPU reads the memory pool at execution time, which is closer to a real Switch than a snapshot at CPU upload time; the dirty-page stamp is still taken before encoding, and later writes still trigger a re-upload.
         up_begin();
@@ -1610,7 +1730,24 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
             if (zb && l < 16) { const uint64_t *q = (const uint64_t *)((const uint8_t *)stg.contents + off); size_t nb = pitch * rows * z / 16;
                 for (size_t i = 0; i < nb; i++) g_zb[l] += !(q[2 * i] | q[2 * i + 1]);
                 g_zb_tot[l] += (uint32_t)nb; }
-            up_blit_add(stg, off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);
+            if (soft) {   // linear BC blocks → padded RGBA8 → a shared staging buffer → the RGBA8 texture
+                uint32_t pw = (w + 3) & ~3u, ph = (h + 3) & ~3u; size_t dp = (size_t)pw * 4, db = dp * ph;
+                uint8_t *dec = malloc(db * z);
+                if (!dec) { RED_ONCE(88, "BC software decode allocation failed (%zu bytes)", db * z); break; }
+                uint64_t dt0 = now_ns();
+                for (unsigned zi = 0; zi < z; zi++)
+                    bc_decode_blocks(t->d.format, (const uint8_t *)stg.contents + off + (size_t)zi * pitch * rows, dec + (size_t)zi * db, dp, w, h);
+                if (getenv("DM_NVN_BC_DUMP") && t->d.target == 1) bc_dump_texture(t, dec, pw, ph, l);
+                static _Atomic uint64_t bsd_n, bsd_bytes, bsd_ns;
+                uint64_t dtt = now_ns() - dt0; uint64_t dn = atomic_fetch_add(&bsd_n, 1) + 1;
+                atomic_fetch_add(&bsd_bytes, (uint64_t)w * h * 4 * z); atomic_fetch_add(&bsd_ns, dtt);
+                if (dn <= 10 || dn % 30 == 0) MLOG("BC software decode: %llu uploads, %llu MB RGBA8, %.1f ms total", (unsigned long long)dn, (unsigned long long)(atomic_load(&bsd_bytes) >> 20), atomic_load(&bsd_ns) / 1e6);
+                id<MTLBuffer> ds = [g_dev newBufferWithLength:db * z options:MTLResourceStorageModeShared];
+                if (!ds) { free(dec); RED_ONCE(89, "BC software decode staging allocation failed (%zu bytes)", db * z); break; }
+                res_add(ds); [g_up_keep addObject:ds]; memcpy(ds.contents, dec, db * z); free(dec);
+                up_blit_add(ds, 0, dp, db, MTLSizeMake(w, h, z), mt, y, l);
+            } else
+                up_blit_add(stg, off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);
             off += pitch * rows * z;
         }
     }
@@ -3040,6 +3177,7 @@ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
         if (!r.has_v) memset(&r.v, 0, sizeof r.v);
         uint32_t pf = (uint32_t)base.pixelFormat; uint8_t swz[4];
         if (r.v.set_format && !(nvn_fmt_to_mtl(r.v.format, &pf, swz) && pf)) pf = (uint32_t)base.pixelFormat;
+        if (r.v.set_format && bc_soft_fmt(&rp->t) && nvn_fmt_bc(r.v.format)) pf = (uint32_t)base.pixelFormat;   // A16: the base is already decoded (ASTC or RGBA8); a BC-format view of it is not castable, and sampling gives the same colours
         if (stv) pf = MTLPixelFormatX32_Stencil8;
         if (r.v.set_format && nvn_fmt_bc(rp->t.d.format) && !nvn_fmt_bc(r.v.format)) {   // the raw blocks of a BC texture through an uncompressed view (see rt_view_fmt): Metal has no such view
             RED_ONCE(86, "Metal cannot create the raw-block view of a compressed texture (NVN format %#x → view %#x): treated as an empty slot", rp->t.d.format, r.v.format);
@@ -7386,8 +7524,49 @@ static void present_pipeline(MTLPixelFormat format) {
             "#include <metal_stdlib>\nusing namespace metal;\n"
             "struct V { float4 p [[position]]; float2 uv; };\n"
             "vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
-            "struct Crop { float4 rect; float4 edge; };\n"
-            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) { return t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw)); }\n";
+            "struct Present { float4 src; float4 edge; float4 game; float4 param; };\n"
+            "static inline float3 sample_at(texture2d<float> t, sampler s, constant Present& c, float2 g) { return t.sample(s, clamp(g * c.src.zw + c.src.xy, c.edge.xy, c.edge.zw)).rgb; }\n"
+            "static inline float hash12(float2 p) { float3 p3 = fract(float3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }\n"
+            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Present& c [[buffer(0)]]) {\n"
+            "    float2 g = (in.uv - c.game.xy) / c.game.zw;\n"
+            "    if (g.x >= 0.0 && g.x <= 1.0 && g.y >= 0.0 && g.y <= 1.0) return float4(sample_at(t, s, c, g), 1.0);\n"
+            "    float strength = c.param.x;\n"
+            "    if (strength <= 0.0) return float4(0.0, 0.0, 0.0, 1.0);\n"
+            "    float ox = max(max(-g.x, g.x - 1.0), 0.0);\n"
+            "    float oy = max(max(-g.y, g.y - 1.0), 0.0);\n"
+            "    bool side = ox >= oy;\n"
+            "    // A diffuse frosted-glass glow from the outer 1.2% edge band: 17 taps along the edge, with a\n"
+            "    // per-pixel jitter so the taps do not form repeated horizontal bands. A little cool-white haze and\n"
+            "    // fixed fine grain give the translucent, etched surface.\n"
+            "    float2 p;\n"
+            "    float jitter = (hash12(in.uv * float2(1280.0, 720.0)) - 0.5) * 0.018;\n"
+            "    float3 edge_col = float3(0.0); float edge_w = 0.0;\n"
+            "    for (int j = 0; j < 17; j++) {\n"
+            "        float u = (float(j) + 0.5) / 17.0 - 0.5;\n"
+            "        float off = u * 0.28 + jitter;   // ±14% along the picture edge\n"
+            "        float q = off / 0.085;\n"
+            "        float w = exp(-0.5 * q * q);\n"
+            "        if (side) {\n"
+            "            float ex = (g.x < 0.0) ? 0.012 : 0.988;\n"
+            "            p = float2(ex, clamp(g.y + off, 0.0, 1.0));\n"
+            "        } else {\n"
+            "            float ey = (g.y < 0.0) ? 0.012 : 0.988;\n"
+            "            p = float2(clamp(g.x + off, 0.0, 1.0), ey);\n"
+            "        }\n"
+            "        edge_col += sample_at(t, s, c, p) * w; edge_w += w;\n"
+            "    }\n"
+            "    float3 col = edge_col / edge_w;\n"
+            "    float lum = dot(col, float3(0.299, 0.587, 0.114));\n"
+            "    col = mix(float3(lum), col, 1.32) * 1.10;\n"
+            "    col = pow(max(col, float3(0.0)), float3(0.95));\n"
+            "    float grain = hash12(in.uv * float2(1741.0, 977.0) + 19.0) - 0.5;   // fixed per pixel: frost, not flicker\n"
+            "    col = mix(col, float3(0.90, 0.94, 1.0), 0.06) + grain * 0.03;\n"
+            "    float2 d = max(max(c.game.xy - in.uv, in.uv - (c.game.xy + c.game.zw)), 0.0);\n"
+            "    float fall = smoothstep(0.0, 0.18, length(d));\n"
+            "    float vertical = smoothstep(0.0, 0.08, min(in.uv.y, 1.0 - in.uv.y));\n"
+            "    col *= mix(1.0, 0.12, pow(fall, 0.85)) * mix(0.82, 1.0, vertical) * strength;\n"
+            "    return float4(clamp(col, 0.0, 1.0), 1.0);\n"
+            "}\n";
         NSError *e = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src_msl) options:nil error:&e];
         if (!lib) MDIE("present shader compile failed %s", e.localizedDescription.UTF8String);
@@ -7417,6 +7596,28 @@ static id<MTLTexture> present_raw_src(id<MTLTexture> src) {
     if (!v) { RED_ONCE(69, "present: cannot create a non-sRGB view of the sRGB swapchain texture (format %lu); presenting the decoded values", (unsigned long)src.pixelFormat); return src; }
     return v;
 }
+static float present_ambient_strength(void) {   // DM_AMBIENT=0 = black bars; DM_AMBIENT_STRENGTH=0..1.5 tunes the glow; DM_EDGE_EXTEND=0 stays as the old alias
+    static int done; static float s = DM_GAME_PAD_RHYTHM ? 1.0f : 0.0f;   // the rhythm pad's game gets it by default; other profiles opt in with DM_AMBIENT=1
+    if (!done) {
+        done = 1;
+        const char *e = getenv("DM_AMBIENT"), *v = getenv("DM_AMBIENT_STRENGTH"), *old = getenv("DM_EDGE_EXTEND");
+        if (e && !strcmp(e, "0")) s = 0;
+        else {
+            if (e && !strcmp(e, "1")) s = 1;
+            if (v && *v) s = (float)atof(v);
+            else if (old && !strcmp(old, "0")) s = 0;
+        }
+        if (s < 0) s = 0; if (s > 1.5f) s = 1.5f;
+        MLOG("present ambient: strength %.2f%s", s, s <= 0 ? " (black bars)" : "");
+    }
+    return s;
+}
+static void present_game_rect(const MTLViewport *vp, double dw, double dh, float out[4]) {
+    out[0] = (float)(vp->originX / dw);
+    out[1] = (float)(1.0 - (vp->originY + vp->height) / dh);   // the shader's uv starts at the top
+    out[2] = (float)(vp->width / dw);
+    out[3] = (float)(vp->height / dh);
+}
 static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4]) {
     NSUInteger cx = 0, cy = 0, cw = src.width, ch = src.height;
     if (crop && (crop[2] || crop[3])) {
@@ -7437,18 +7638,20 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     double dw = dst.width, dh = dst.height, s = fmin(dw / cw, dh / ch);
     MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
     if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
-    int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
     static double last_vp[4];   // Log one line when the viewport changes (used by the real-device screen-level acceptance screen_check.py to check the aspect ratio)
     if (memcmp(last_vp, &vp, sizeof last_vp)) { memcpy(last_vp, &vp, sizeof last_vp);
         MLOG("present viewport %.0f,%.0f %.0fx%.0f / canvas %.0fx%.0f (game image %lux%lu)", vp.originX, vp.originY, vp.width, vp.height, dw, dh, (unsigned long)src.width, (unsigned long)src.height); }
-    rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
+    rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;   // the full-screen shader writes the picture and its ambient bars
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
-    [en setViewport:vp];
+    [en setViewport:(MTLViewport){0, 0, dw, dh, 0, 1}];
     [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
-    float uv[8] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
-                   (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
+    float game[4]; present_game_rect(&vp, dw, dh, game);
+    float uv[16] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
+                    (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height,
+                    game[0], game[1], game[2], game[3],
+                    present_ambient_strength(), 0, 0, 0};
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [en setFragmentBytes:uv length:sizeof uv atIndex:0];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -7468,10 +7671,9 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     double dw = dst.width, dh = dst.height, s = fmin(dw / cw, dh / ch);
     MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
     if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
-    int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = dst;
-    rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
     id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
@@ -7481,11 +7683,14 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     [g_present_args setTexture:present_raw_src(src).gpuResourceID atIndex:0];
     [g_present_args setSamplerState:g_blit_samp.gpuResourceID atIndex:0];
     float *uv = g_present_uv[uv_i].contents;
+    float game[4]; present_game_rect(&vp, dw, dh, game);
     uv[0] = (float)cx / src.width; uv[1] = (float)cy / src.height; uv[2] = (float)cw / src.width; uv[3] = (float)ch / src.height;
     uv[4] = (cx + 0.5f) / src.width; uv[5] = (cy + 0.5f) / src.height; uv[6] = (cx + cw - 0.5f) / src.width; uv[7] = (cy + ch - 0.5f) / src.height;
+    uv[8] = game[0]; uv[9] = game[1]; uv[10] = game[2]; uv[11] = game[3];
+    uv[12] = present_ambient_strength(); uv[13] = uv[14] = uv[15] = 0;
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [g_present_args setAddress:g_present_uv[uv_i].gpuAddress atIndex:0];
-    [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
+    [en setViewport:(MTLViewport){0, 0, dw, dh, 0, 1}]; [en setRenderPipelineState:g_blit_pso];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     m4_end(en);
     return 1;

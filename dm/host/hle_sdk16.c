@@ -117,9 +117,17 @@ HLE_FORCE("_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE", "shared font siz
 typedef struct { uint32_t type, pad; const void *address; size_t size; } pl_font_data_t;
 HLE_FORCE("_ZN2nn2pl13GetSharedFontEPiPNS0_14SharedFontDataEiNS_8settings12LanguageCodeE", "every shared font: the stand-in TTFs (past the BFTTF header), types 0-5 in order", unsigned, h_pl_GetSharedFont, int *count, pl_font_data_t *out, int max, uint64_t lang) {
     (void)lang; int n = 0;
-    for (int t = 0; t < 6; t++) {
-        font_t f = font_get(t); if (!f.p) continue;
-        if (n < max) out[n] = (pl_font_data_t){ (uint32_t)t, 0, f.p + 8, f.n - 8 };
+    // A memory-tight A16 build can ask for fewer slots (DM_SHARED_FONT_LIMIT=3, set by build_ipa.sh A16=1): the
+    // stand-ins for types 0-4 are one font, so the first slots are cheap; the last slot is the Nintendo extension
+    // font (button icons). The game receives the same type numbers and still gets the extension last.
+    int slots = 6;
+    const char *limit = getenv("DM_SHARED_FONT_LIMIT");
+    if (!(limit && *limit)) limit = getenv("DM_LEGACY");   // older A16 env files used DM_LEGACY=1 for the same three slots
+    if (limit && *limit) { int v = atoi(limit); if (v >= 1 && v <= 6) slots = v; else LOG("[RED] DM_SHARED_FONT_LIMIT=%s (expected 1-6): using 6", limit); }
+    for (int t = 0; t < slots; t++) {
+        int ft = (slots < 6 && t == slots - 1) ? 5 : t;
+        font_t f = font_get(ft); if (!f.p) continue;
+        if (n < max) out[n] = (pl_font_data_t){ (uint32_t)ft, 0, f.p + 8, f.n - 8 };
         n++;
     }
     *count = n; return n > 0;

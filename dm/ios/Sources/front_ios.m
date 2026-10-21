@@ -1,4 +1,5 @@
-// iOS front end (the iOS implementation of front.h): a centered 16:9 Metal view (black bars on both sides) + a full-screen virtual gamepad layer (DmGamepad.m, controls drawn over the picture).
+// iOS front end (the iOS implementation of front.h): a full-screen Metal view; the present pass centers the 16:9 picture and
+// paints the side bars with a dynamic ambient glow + a full-screen virtual gamepad layer (DmGamepad.m / DmRhythmPad.m).
 // The host runs on the big-stack thread started by main.m; front_run runs the guest directly on the calling thread.
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -11,6 +12,8 @@
 
 UIView *dm_gamepad_view(CGRect frame);
 void dm_gamepad_reset(void);
+UIView *dm_rhythm_pad_view(CGRect frame);
+void dm_rhythm_pad_reset(void);
 void front_ios_boot(void);
 int front_ios_boot_ok(void);
 
@@ -57,10 +60,17 @@ static UILabel *front_ios_fps_label(void);
         [self.view addSubview:lb]; return;
     }
     front_ios_audio_watch();
+    // Full-screen Metal layer: the present pass keeps the game at 16:9 in the centre and fills the rest with the ambient side
+    // bars (nvn_mtl.m: jittered edge blur, cool-white haze, fine frost grain, saturation/falloff). DM_AMBIENT=0 gives black bars back.
     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
     [self.view addSubview:self.game];
     g_layer = (CAMetalLayer *)self.game.layer;
+#if DM_GAME_PAD_RHYTHM
+    const char *full = getenv("DM_RHYTHM_FULL");   // fallback: the generic gamepad, for a minigame whose left key is not in the table yet
+    self.pad = (full && *full && strcmp(full, "0")) ? dm_gamepad_view(self.view.bounds) : dm_rhythm_pad_view(self.view.bounds);
+#else
     self.pad = dm_gamepad_view(self.view.bounds);
+#endif
     self.pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.pad];
     self.fps = front_ios_fps_label();   // above the pad, which hides while a controller is connected
@@ -69,9 +79,7 @@ static UILabel *front_ios_fps_label(void);
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     CGRect b = self.view.bounds; if (!self.game) return;
-    CGFloat w = b.size.width, h = b.size.height;   // Fit 16:9 into the whole screen
-    if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
-    self.game.frame = CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
+    self.game.frame = b;   // full screen: the present pass draws the 16:9 picture and its ambient bars inside this layer
     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
         CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
         self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
@@ -208,7 +216,7 @@ static void front_ios_audio_watch(void) {
 void front_ios_focus_event(int ev) {
     if (!g_layer) return;
     switch (ev) {
-        case 0: dm_gamepad_reset(); dm_focus_set(2); break;
+        case 0: dm_gamepad_reset(); dm_rhythm_pad_reset(); dm_focus_set(2); break;
         case 1: UIApplication.sharedApplication.idleTimerDisabled = NO; dm_focus_set(3); g_audio_bg = 1; front_ios_audio_apply(); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); break;
         case 2: dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); front_ios_audio_session(); g_audio_bg = 0; front_ios_audio_apply(); dm_focus_set(2); break;
         case 3:   // Becoming active again also ends an interruption whose "ended" never came (not every one sends it), and retries a session that would not activate on the way back

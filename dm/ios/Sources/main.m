@@ -1,11 +1,12 @@
 // iOS App entry: set the environment (game files, saves, shader libraries), write the host log to Documents/log.txt, create the window (front_ios.m), then run the host's dm_main on a big-stack thread.
-// The game files (RomFS) ship inside the App at <App>/romfs; Documents/romfs placed through the Files app is also accepted (lets you swap them without reinstalling).
+// The game files (RomFS) ship inside the App at <App>/romfs, or in Documents/romfs placed through the Files app (the split IPA that A16=1 builds by default).
 #import <UIKit/UIKit.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <unistd.h>
 #include "game_profile.h"   // game profile constants (the RomFS marker path)
+#include "dm_touch_layout.h"
 
 int dm_main(int argc, char **argv);   // dm/host/main.c compiled in with -Dmain=dm_main
 void dm_host_preload_start(int argc, char **argv);
@@ -57,9 +58,14 @@ static int boot_env(void) {
     setenv("DM_NVN_SHMAP", [dm stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
     setenv("DM_MSL_DIR", [res stringByAppendingPathComponent:@"msl"].fileSystemRepresentation, 0);
     setenv("DM_FONT_DIR", [dm stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
+    setenv("DM_NVN_BC_ASTC", [dm stringByAppendingPathComponent:@"bc_astc"].fileSystemRepresentation, 0);   // optional offline BC → ASTC cache for A16 / older GPUs (build_ipa.sh A16=1)
     NSString *aoc = [res stringByAppendingPathComponent:@"aoc"];   // add-on content: build_ipa.sh puts the RomFS extracted from the player's DLC NSPs at <App>/aoc/<index>/
     if ([fm fileExistsAtPath:aoc]) setenv("DM_AOC_DIR", aoc.fileSystemRepresentation, 0);
     chdir(doc.fileSystemRepresentation);
+#if DM_GAME_PAD_RHYTHM
+    NSString *tl = [doc stringByAppendingPathComponent:@"touch_layouts.tsv"];   // on-device table override (DmRhythmPad.m; edit in the Files app)
+    if ([fm fileExistsAtPath:tl]) dm_touch_layout_load(tl.fileSystemRepresentation);
+#endif
     g_argv[0] = strdup("dmhost"); g_argv[1] = strdup(dm.fileSystemRepresentation); g_argc = 2;
     dm_host_preload_start(g_argc, g_argv);   // Module tables / relocation / takeover run early in the background, in parallel with UIKit startup
     return 1;

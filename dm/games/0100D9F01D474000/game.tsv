@@ -13,6 +13,7 @@ program_id	0100D9F01D474000
 name	Rhythm Heaven Groove
 ipa	RhythmHeavenGroove.ipa
 app_category	public.app-category.games
+pad_layout	rhythm
 # Handheld with Boost: docked means a TV to the game, which then runs a latency calibration (press A on every fourth beat) until one passes; a phone is its own screen.
 #   Boost keeps the 1920x1080 draw size (handheld Normal draws 1280x720); the game takes it from the performance mode alone (hle_oe.c)
 op_mode	handheld

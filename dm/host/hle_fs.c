@@ -7,6 +7,7 @@
 #include "hle.h"
 #include <mach/mach.h>
 #include "front.h"
+#include "dm_touch_layout.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -510,6 +511,9 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     fslog_init();
     if (g_fslog && fd < 4096) { pthread_mutex_lock(&g_fslog_lock); free(g_fdpath[fd]); g_fdpath[fd] = strdup(path); pthread_mutex_unlock(&g_fslog_lock); }
     if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
+#if DM_GAME_PAD_RHYTHM
+    dm_touch_layout_path(path);   // rhythm pad: minigame / menu scene follows the game's own asset loads
+#endif
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) {

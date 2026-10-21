@@ -1,0 +1,14 @@
+# Touch layout for Rhythm Heaven Groove's rhythm pad (DmRhythmPad.m).
+# scene<TAB>left[<TAB>extra][<TAB>note]
+#   left  = the key the left half of the screen sends in that minigame (none, B, Left, Right, Down, Up)
+#   extra = optional comma-separated directions (Left, Right, Down, Up), drawn as small glass keys at the bottom left
+#   "*"   = the default row for any scene not listed (the A-only games use none; the whole picture sends A)
+# The scene name is the folder under graph/scene/; Beatspell uses graph/beatspell/.
+# The runtime file Documents/touch_layouts.tsv replaces this table on the device, so more rows can be filled without rebuilding.
+beatspell	B		Rhythm Toy Box / Beatspell (B spells)
+parasol	Down		Brolly Good Show (A opens the umbrella, Down closes it)
+clap	B		High-Five Fever (A and B for the two hands)
+hurdle	Down		Hop N Slide (A hops, Down slides)
+rolling	Down		Hop Stop N Roll (A hops, Down rolls)
+remix	B	Left,Right,Down,Up	Remixes: the left half is B, the small keys carry the directions
+*	none
