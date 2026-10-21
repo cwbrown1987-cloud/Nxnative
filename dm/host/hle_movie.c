@@ -107,6 +107,7 @@ static void md_syms(void) {
     G.size = msym("_ZNK5movie6Buffer4SizeEv");
     G.signal = msym("_ZN2nn2os11SignalEventEPNS0_9EventTypeE");
 }
+
 static mdec_t *md_of(void **self) { return self ? (mdec_t *)self[1] : NULL; }
 static void md_event(mdec_t *d, int i) { if (d->ev[i]) G.signal(d->ev[i]); }   // 0 input 1 output 2 format 3 error
 // Deferred events: "input available" after Start / Flush. The SDK's decoder signals it asynchronously from its own codec thread; Metroid Dread calls InitializeMultiWaitHolder before RegisterClientEvents
@@ -417,7 +418,7 @@ static void md_pump(mdec_t *d) {
         pthread_mutex_unlock(&d->mu);
         int got = 0, avc = d->type == MD_TYPE_AVC;
         int eos = (pk.flags & 4) != 0;   // MediaCodec BUFFER_FLAG_END_OF_STREAM
-        if (eos && pk.pts < 0) pk.size = 0;   // Monster Hunter Rise ends a stream with time -1 and the whole input buffer (4 MB) as its length: no data (decoding it gave VideoToolbox -12909 and AudioToolbox -50)
+        if (eos && (pk.pts < 0 || (uint32_t)pk.size >= MD_INCAP)) pk.size = 0;   // Monster Hunter Rise ends a stream with time -1 and the whole input buffer (4 MB) as its length: no data (decoding it gave VideoToolbox -12909 and AudioToolbox -50)
         if ((pk.size > 0 && (d->type == MD_TYPE_VP9 || MD_AUDIO(d) || avc)) || (avc && eos)) {
             d->jp = d->in[pk.in] + pk.off; d->jn = pk.size; d->jslot = slot; d->jpts = pk.pts; d->jflush = 0; md_job(d, MDJ_DECODE); got = d->jgot; }
         int more = avc && eos && d->avc && mavc_queued(d->avc) > 0;   // H.264 pictures still queued: they follow this output, the last of them carries the end-of-stream flag
@@ -651,14 +652,16 @@ HLE_FORCE("_ZN5movie7Decoder15GetOutputBufferEiPNS_6BufferE", "movie decoder: ge
     if (!buf || i < 0 || i >= MD_NOUT) return 0x100b;
     if (d->mode == MD_MODE_TEX) return md_out_tex(d, i, buf);
     if (MD_AUDIO(d)) {   // PCM16 interleaved; an output without samples (end of stream) is empty
+        G.set_range(buf, 0, 0);   // the client may have advanced the buffer's read offset; the data pointer follows it, so write from the start of the buffer (else the copy ran past its end and corrupted the guest heap)
         size_t n = d->out[i].pic ? d->out[i].bytes : 0, cap = G.cap(buf); uint8_t *p = G.data(buf);
         if (!p || cap < n) { LOG("[RED] movie: client audio output buffer is %zu bytes, this packet needs %zu", cap, n); G.set_range(buf, 0, 0); return 0x100b; }
         if (n) memcpy(p, d->out[i].frm, n);
         G.set_range(buf, 0, (int)n);
-        MD_TRACE(d, 12, "GetOutputBuffer index %d → PCM %zu bytes", i, n);
+        MD_TRACE(d, 12, "GetOutputBuffer index %d → PCM %zu bytes (client buffer %zu)", i, n, cap);
         return 0;
     }
     int w, h, stride, slice; md_dims(d, &w, &h, &stride, &slice);
+    G.set_range(buf, 0, 0);   // same: write from the start of the buffer
     size_t need = (size_t)stride * slice * 3 / 2, cap = G.cap(buf);
     uint8_t *p = G.data(buf);
     if (!p || cap < need) { LOG("[RED] movie: client output buffer is %zu bytes, a frame needs %zu", cap, need); G.set_range(buf, 0, 0); return 0x100b; }

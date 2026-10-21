@@ -141,3 +141,27 @@ HLE_FORCE("_ZN2nn5album22SaveAndShareScreenshotEPKvmNS0_9ImageSizeENS0_16ImageOr
 HLE_FORCE("_ZN2nn5album14ShowAlbumFilesEv", "album applet: not shown", Result, h_album_Show, void) { return RES_FAIL; }
 // Pokémon Legends: Z-A (SDK 19): a screenshot of the current frame, taken by the capture service
 HLE_FORCE("_ZN2nn5album21SaveCurrentScreenshotENS0_17AlbumReportOptionE", "screenshot of the current frame (capsrv): no album, fails", Result, h_album_SaveCur, int report) { (void)report; LOG("album::SaveCurrentScreenshot (no album)"); return RES_FAIL; }
+
+// ---------- bluetooth: BLE / GATT (Pokémon Let's Go Poké Ball Plus and Pokémon GO) ----------
+HLE_FORCE("_ZN2nn9bluetooth13InitializeBleEv", "bluetooth BLE init: returns success", Result, h_bt_InitBle, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth19AcquireBleScanEventEPNS_2os15SystemEventTypeE", "bluetooth scan event: bound, never fires", Result, h_bt_ScanEv, void *ev) { hle_bind_system_event(ev, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth37AcquireBleConnectionStateChangedEventEPNS_2os15SystemEventTypeE", "bluetooth connection state event: bound, never fires", Result, h_bt_ConnEv, void *ev) { hle_bind_system_event(ev, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth31AcquireBleServiceDiscoveryEventEPNS_2os15SystemEventTypeE", "bluetooth service discovery event: bound, never fires", Result, h_bt_ServEv, void *ev) { hle_bind_system_event(ev, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth24AcquireBleMtuConfigEventEPNS_2os15SystemEventTypeE", "bluetooth mtu config event: bound, never fires", Result, h_bt_MtuEv, void *ev) { hle_bind_system_event(ev, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth28AcquireBleGattOperationEventEPNS_2os15SystemEventTypeE", "bluetooth gatt operation event: bound, never fires", Result, h_bt_GattEv, void *ev) { hle_bind_system_event(ev, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth23StartBleScanSmartDeviceERKNS0_17GattAttributeUuidE", "bluetooth scan: no devices", Result, h_bt_StartScan, const void *uuid) { (void)uuid; return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth22StopBleScanSmartDeviceEv", "bluetooth stop scan", Result, h_bt_StopScan, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth16GetBleScanResultEPNS0_13BleScanResultEi", "bluetooth scan results: 0", int, h_bt_GetScanResult, void *res, int max) { (void)res; (void)max; return 0; }
+HLE_FORCE("_ZN2nn9bluetooth19GetBleScanParameterEPNS0_17GattAttributeUuidEi", "bluetooth scan params: 0", int, h_bt_GetScanParam, void *p, int max) { (void)p; (void)max; return 0; }
+HLE_FORCE("_ZN2nn9bluetooth24GetBleConnectionInfoListEPNS0_17BleConnectionInfoEi", "bluetooth conn list: 0", int, h_bt_GetConnList, void *list, int max) { (void)list; (void)max; return 0; }
+HLE_FORCE("_ZN2nn9bluetooth19ConnectToGattServerERKNS0_7AddressE", "bluetooth connect: not connected", Result, h_bt_ConnectGatt, const void *addr) { (void)addr; return 0x20ca; }
+HLE_FORCE("_ZN2nn9bluetooth24DisconnectFromGattServerEj", "bluetooth disconnect", Result, h_bt_DisconnectGatt, uint32_t handle) { (void)handle; return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth15ConfigureBleMtuEjt", "bluetooth configure mtu", Result, h_bt_ConfigMtu, uint32_t handle, uint16_t mtu) { (void)handle; (void)mtu; return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth33RegisterGattOperationNotificationERKNS0_17GattAttributeUuidE", "bluetooth register gatt notif", Result, h_bt_RegGattNotif, const void *uuid) { (void)uuid; return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth35UnregisterGattOperationNotificationERKNS0_17GattAttributeUuidE", "bluetooth unregister gatt notif", Result, h_bt_UnregGattNotif, const void *uuid) { (void)uuid; return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth22GetGattOperationResultEPNS0_26BleClientGattOperationInfoE", "bluetooth gatt op result", Result, h_bt_GetGattOpRes, void *info) { (void)info; return 0x20ca; }
+HLE_FORCE("_ZN2nn9bluetooth15GetGattServicesEPNS0_11GattServiceEij", "bluetooth get gatt services: 0", int, h_bt_GetGattServices, void *srv, int max, uint32_t handle) { (void)srv; (void)max; (void)handle; return 0; }
+HLE_FORCE("_ZN2nn9bluetooth22ReadGattCharacteristicERKNS0_18GattCharacteristicE", "bluetooth read characteristic", Result, h_bt_ReadChar, const void *ch) { (void)ch; return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth23WriteGattCharacteristicERKNS0_18GattCharacteristicE", "bluetooth write characteristic", Result, h_bt_WriteChar, const void *ch) { (void)ch; return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth19WriteGattDescriptorERKNS0_14GattDescriptorE", "bluetooth write descriptor", Result, h_bt_WriteDesc, const void *desc) { (void)desc; return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth36EnableGattCharacteristicNotificationERKNS0_18GattCharacteristicEb", "bluetooth enable char notif", Result, h_bt_EnableCharNotif, const void *ch, unsigned int en) { (void)ch; (void)en; return RES_OK; }

@@ -155,7 +155,15 @@ static OSStatus au_create(aout *a) {
     if (st) { AudioComponentInstanceDispose(a->au); a->au = NULL; }
     return st;
 }
-static void au_open(aout *a) { OSStatus st = au_create(a); if (st) die("AudioUnit setup failed (status %d)", (int)st); }
+// AudioComponentInstanceNew dlopens the component bundle and needs far more stack than a guest thread has (it overflowed the guest stack at startup), so it runs on a host thread with a 1 MiB stack
+static void *au_create_th(void *p) { aout *a = p; return (void *)(intptr_t)au_create(a); }
+static void au_open(aout *a) {
+    pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 1 << 20);
+    pthread_t t; void *r = NULL;
+    if (pthread_create(&t, &at, au_create_th, a)) die("AudioUnit setup thread");
+    pthread_join(t, &r); pthread_attr_destroy(&at);
+    OSStatus st = (OSStatus)(intptr_t)r; if (st) die("AudioUnit setup failed (status %d)", (int)st);
+}
 // Silent sink: consumes in real time at 48 kHz every 5 ms. When more than 100 ms behind (iOS suspended the whole process in the background, SIGSTOP on the Mac), restart the count from now and do not make up the missed time --
 // making it up would pull hundreds of times in one go (seconds' worth), releasing all of the game's buffers and logging hundreds of underruns; a suspended console does not play that stretch either
 static void *null_sink(void *p) {
@@ -270,7 +278,7 @@ static Result au_start_at(void *g, void *lr) {
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE", "start playback", Result, h_au_Start, void *g) { return au_start_at(g, __builtin_return_address(0)); }
-static void au_stop_at(void *g, void *lr) {   // lr NULL: the stop inside Close, not logged separately
+static void au_stop_at(void *g, void *lr) {
     aout *a = ao(g);
     pthread_mutex_lock(&g_aos_lock);
     int was = atomic_exchange_explicit(&a->state, STATE_STOPPED, memory_order_acq_rel);
@@ -312,13 +320,13 @@ HLE_FORCE("_ZN2nn5audio21SetAudioOutBufferInfoEPNS0_14AudioOutBufferEPvmm", "buf
 HLE_FORCE("_ZN2nn5audio28GetAudioOutBufferDataPointerEPKNS0_14AudioOutBufferE", "buffer data pointer", void *, h_au_BufPtr, const gbuf *b) { return b->ptr; }
 HLE_FORCE("_ZN2nn5audio25GetAudioOutBufferDataSizeEPKNS0_14AudioOutBufferE", "buffer data size", uint64_t, h_au_BufSize, const gbuf *b) { return b->size; }
 HLE_FORCE("_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE", "append a buffer to play", unsigned, h_au_Append, void *g, gbuf *b) {
-    aout *a = ao(g);
     // Diagnostic switch DM_AUDIO_DUMP=<file>: every PCM block the game appends is written out as is (16-bit, 48 kHz, channel count per the OpenAudioOut log, usually 6). Used to judge "did a given sound play or not":
     // cross-correlate the original game's audio against it (this is how the tier-one drop sound was verified). The file is opened only when the variable is set; when unset this costs only one extra cached check
     { static FILE *df; static int on = -1; if (on < 0) { const char *e = getenv("DM_AUDIO_DUMP"); on = e != NULL; if (on && !(df = fopen(e, "wb"))) LOG("[RED] DM_AUDIO_DUMP cannot open %s", e); }
       if (df && b && b->ptr && b->size) fwrite(b->ptr, 1, (size_t)b->size, df); }
+    aout *a = ao(g);
     pthread_mutex_lock(&a->m);
-    uint32_t qt = atomic_load_explicit(&a->q_tail, memory_order_relaxed);
+    uint32_t qt =atomic_load_explicit(&a->q_tail, memory_order_relaxed);
     uint32_t qh = atomic_load_explicit(&a->q_head, memory_order_acquire);
     int ok = qt - qh < QMAX;
     if (ok) { a->q[qt & (QMAX - 1)] = b; atomic_store_explicit(&a->q_tail, qt + 1, memory_order_release); }

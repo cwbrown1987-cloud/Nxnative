@@ -2570,6 +2570,7 @@ static NSString *exe_rel(const char *rel) {
     return [NSString stringWithFormat:@"%s/%s", dir, rel];
 }
 // Shader mapping table (output of tools/shader_map.py): at runtime only 'Switch control section key → stage' is used; shaders are always translations of the Switch originals (tools/dmsh_build.py produces <key>_b.metallib + reflection offline)
+static NSMutableDictionary *g_shalt;   // alt key → (map key, stage)
 static void shmap_load(void) {
     if (g_shmap) return;
     const char *e = getenv("DM_NVN_SHMAP");
@@ -2583,6 +2584,9 @@ static void shmap_load(void) {
         if (c.count > 3) g_shmap[c[3]] = c[2];
     }
     g_shmap_path = path;
+    NSString *at = [NSString stringWithContentsOfFile:[[path stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"shader_map_alt.tsv"] encoding:NSUTF8StringEncoding error:nil];
+    if (at) { g_shalt = [NSMutableDictionary dictionary];
+        for (NSString *ln in [at componentsSeparatedByString:@"\n"]) { if (!ln.length || [ln hasPrefix:@"#"]) continue; NSArray *c = [ln componentsSeparatedByString:@"\t"]; if (c.count > 2) g_shalt[c[0]] = @[c[1], c[2]]; } }
     const char *m = getenv("DM_MSL_DIR");
     // Library directory = <DM_MSL_DIR or default cache>/b-<translation chain version>: the version comes from the game profile's dmsh_chain.h (tools/dmsh_chain.py); a host built from an old source tree only accepts libraries of the old version
     g_msl_dir = [NSString stringWithFormat:@"%@/b-%s", m ? @(m) : [NSString stringWithFormat:@"%s%s/build/cache/metal_shader_cache", getenv("DM_ROOT") ?: getenv("HOME"), getenv("DM_ROOT") ? "" : "/dm-work"], DMSH_CHAIN];
@@ -2857,9 +2861,13 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only
     NvProg *o = [NvProg new];
     for (unsigned i = 0; i < p->nstage; i++) {
         // Key = sha256(first 0x880 bytes of the control section + code area): many of Mario's shaders share a control section but differ in code (dm/gfx/tools/shader_split.py). It was computed at SetShaders (hle_nvn.c): by now the game may have freed the control section
-        uint8_t md[8]; prog_key(p, i, md);
+        uint8_t md[8], am[8]; prog_key2(p, i, md, am);
         NSString *k = [NSString stringWithFormat:@"%02x%02x%02x%02x%02x%02x%02x%02x", md[0], md[1], md[2], md[3], md[4], md[5], md[6], md[7]];
         NSString *stage = g_shmap[k];
+        if (!stage && g_shalt) {   // the key with the load-time control bytes zeroed (shader_map_alt.tsv): the map key and stage of the same program
+            NSArray *a = g_shalt[[NSString stringWithFormat:@"%02x%02x%02x%02x%02x%02x%02x%02x", am[0], am[1], am[2], am[3], am[4], am[5], am[6], am[7]]];
+            if (a) { k = a[0]; stage = a[1]; }
+        }
         if (!stage) {   // Not in the package: look up the compute kernels embedded in the main body (nvn_builtin.h)
             NvShader *b = builtin_get(k.UTF8String);
             if (b) { o->sh[5] = b; continue; }

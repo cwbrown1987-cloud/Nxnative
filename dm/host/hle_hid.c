@@ -5,6 +5,7 @@
 #include "hle.h"
 #include "dm_input.h"
 #include "front.h"
+#include <stdbool.h>
 #include <stdatomic.h>
 #include <unistd.h>
 #include <strings.h>
@@ -105,14 +106,31 @@ void hid_keys_init(void) {
 
 static uint32_t connected_id(void) { return dm_opmode() == 0 ? NPAD_HANDHELD : NPAD_NO1; }
 uint32_t hle_hid_connected_npad(void) { return connected_id(); }   // nfp's NFC device sits on this controller (hle_sdk16.c)
-static uint32_t style_of(uint32_t id) { return id != connected_id() ? 0 : id == NPAD_HANDHELD ? STYLE_HANDHELD : STYLE_FULLKEY; }
+static uint32_t g_styles_supported = 0xffffffffu;
+static uint32_t style_of(uint32_t id) {
+    if (dm_opmode() == 0) return id == NPAD_HANDHELD ? STYLE_HANDHELD : 0;
+    if (id == NPAD_NO1) {
+        if (g_styles_supported != 0xffffffffu && !(g_styles_supported & STYLE_FULLKEY)) {
+            if (g_styles_supported & STYLE_JOYRIGHT) return STYLE_JOYRIGHT;
+            if (g_styles_supported & STYLE_JOYLEFT) return STYLE_JOYLEFT;
+            if (g_styles_supported & STYLE_HANDHELD) return STYLE_HANDHELD;
+        }
+        return STYLE_FULLKEY;
+    }
+    return 0;
+}
 static int32_t ax(uint64_t v, int i) { return (int16_t)(v >> (16 * i)); }
 static int32_t pick(int32_t a, int32_t b) { return (a < 0 ? -a : a) >= (b < 0 ? -b : b) ? a : b; }   // whichever of the two paths is deflected more
 
 static void fill(NpadState *s, uint32_t id, uint32_t style) {
     memset(s, 0, sizeof *s);
     s->sampling = atomic_fetch_add(&g_sampling, 1) + 1;
-    if (!(style_of(id) & style)) return;   // no controller of this id / style: attributes = 0
+    { static _Atomic uint32_t seen; uint32_t key = 1u << ((id == NPAD_HANDHELD ? 8 : id & 7) + (style ? __builtin_ctz(style) : 0)); if (!(atomic_fetch_or(&seen, key) & key)) LOG("hid read: id %#x style %#x", id, style); }
+    if (id != NPAD_NO1 && id != NPAD_HANDHELD) return;
+    uint32_t cur = style_of(id);
+    if (!(cur & style)) {
+        if (!(style & (STYLE_FULLKEY | STYLE_HANDHELD | STYLE_JOYDUAL | STYLE_JOYLEFT | STYLE_JOYRIGHT))) return;
+    }
     uint64_t b = atomic_load(&g_btn) | atomic_exchange(&g_latch, 0) | atomic_load(&g_pad_btn) | atomic_exchange(&g_pad_latch, 0);
     uint64_t k = atomic_load(&g_axes), p = atomic_load(&g_pad_axes);
     s->lx = pick(ax(k, 0), ax(p, 0)); s->ly = pick(ax(k, 1), ax(p, 1)); s->rx = pick(ax(k, 2), ax(p, 2)); s->ry = pick(ax(k, 3), ax(p, 3));
@@ -126,7 +144,7 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     if (s->rx > STICK_THRESH) b |= 1u << 22;
     if (s->ry < -STICK_THRESH) b |= 1u << 23;
     s->buttons = b;
-    s->attributes = ATTR_CONNECTED | (id == NPAD_HANDHELD ? ATTR_WIRED | ATTR_LEFT_CONN | ATTR_LEFT_WIRED | ATTR_RIGHT_CONN | ATTR_RIGHT_WIRED : ATTR_LEFT_CONN | ATTR_RIGHT_CONN);
+    s->attributes = ATTR_CONNECTED | (id == NPAD_HANDHELD || (style & STYLE_HANDHELD) ? ATTR_WIRED | ATTR_LEFT_CONN | ATTR_LEFT_WIRED | ATTR_RIGHT_CONN | ATTR_RIGHT_WIRED : ATTR_LEFT_CONN | ATTR_RIGHT_CONN);
 }
 // GetNpadStates(out, n, id): newest first, n entries: the current state repeated with consecutive sampling numbers. The host keeps no history, but on hardware the
 // 16-entry history is always full, and games read all of it whatever count comes back: Super Mario Odyssey (main+0x93fc20) polls every controller slot each frame, which advances
@@ -141,10 +159,16 @@ static int states(NpadState *out, int n, uint32_t id, uint32_t style) {
 
 HLE_FORCE("_ZN2nn3hid14InitializeNpadEv", "connect to the hid service; the host takes input from the front-end state", void, h_hid_InitNpad, void) {}
 HLE_FORCE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", "supported controller ids; fixed by the host", void, h_hid_SetIds, const uint32_t *ids, uint64_t n) { (void)ids; (void)n; }
-static uint32_t g_styles_supported = 0xffffffffu;
 HLE_FORCE("_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "supported controller styles; the host records them and picks the reported style from them", void, h_hid_SetStyles, uint32_t styles) {
     if (styles != g_styles_supported) LOG("hid supported controller styles %#x", styles); g_styles_supported = styles; }
-HLE_FORCE("_ZN2nn3hid15GetNpadStyleSetERKj", "controller style query; follows DM_OPMODE", uint32_t, h_hid_GetStyle, const uint32_t *id) { return style_of(*id); }
+HLE_FORCE("_ZN2nn3hid15GetNpadStyleSetERKj", "controller style query; follows DM_OPMODE", uint32_t, h_hid_GetStyle, const uint32_t *id) {
+    uint32_t st = style_of(*id);
+    if (!st && (*id == NPAD_NO1 || *id == NPAD_HANDHELD)) {
+        if (g_styles_supported != 0xffffffffu) st = g_styles_supported & (STYLE_FULLKEY | STYLE_HANDHELD | STYLE_JOYRIGHT | STYLE_JOYLEFT | STYLE_JOYDUAL);
+        if (!st) st = STYLE_HANDHELD;
+    }
+    return st;
+}
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", "full-key controller states", int, h_hid_StatesFullKey, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_FULLKEY); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", "handheld controller states", int, h_hid_StatesHandheld, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_HANDHELD); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", "dual Joy-Con states (not connected on the host)", int, h_hid_StatesJoyDual, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_JOYDUAL); }
@@ -255,7 +279,7 @@ HLE_FORCE("_ZN2nn3hid23MergeSingleJoyAsDualJoyERKjS2_", "merge single Joy-Cons; 
 // Bound and signalled once for the controller that is connected (the hid service reports the controller already attached at start the same way). Link's Awakening reads no controller state
 // until this event has fired: without it GetNpadState was never called and the title's "Press L+R" never saw a press
 HLE_FORCE("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS3_14EventClearModeE", "controller style update event: bound, signaled once for the connected controller", void, h_hid_BindStyleEv,
-          const uint32_t *id, void *ev, int clear) { hle_bind_system_event(ev, clear); if (*id == connected_id()) hle_signal_system_event(ev); }
+          const uint32_t *id, void *ev, int clear) { hle_bind_system_event(ev, clear); hle_signal_system_event(ev); }
 HLE_FORCE("_ZN2nn3hid19GetPlayerLedPatternERKj", "player LED: LED 1", uint8_t, h_hid_Led, const uint32_t *id) { (void)id; return 1; }
 // NpadControllerColor = { main RGBA, button RGBA }: grey body, black buttons
 static void ctrl_color(uint32_t *c) { c[0] = 0xff828282u; c[1] = 0xff0f0f0fu; }
@@ -264,6 +288,18 @@ HLE_FORCE("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorES2_RKj"
 HLE_FORCE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", "controller applet (no result wanted); the host reports a selection right away", Result, h_hid_ShowCtrl0, const void *arg) { (void)arg; return RES_OK; }
 HLE_FORCE("_ZN2nn3hid24ShowControllerStrapGuideEv", "strap guide applet; not shown by the host", Result, h_hid_Strap, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn3hid28ShowControllerFirmwareUpdateERKNS0_27ControllerFirmwareUpdateArgE", "controller firmware update applet; not shown by the host", Result, h_hid_FwUpd, const void *arg) { (void)arg; return RES_OK; }
+
+// Poké Ball Plus (Palma): not connected on host, stubs satisfy the game's startup calls without reaching sm:
+HLE_FORCE("_ZN2nn3hid17SetPalmaBoostModeEb", "palma boost mode (pokeball plus) no-op", Result, h_hid_SetPalmaBoostMode, bool on) { (void)on; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid15InitializePalmaERKNS0_21PalmaConnectionHandleE", "initialize palma", Result, h_hid_InitPalma, const void *h) { (void)h; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid24EnableAnyPalmaConnectionEv", "enable any palma connection", Result, h_hid_EnableAnyPalma, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn3hid25DisableAnyPalmaConnectionEv", "disable any palma connection", Result, h_hid_DisableAnyPalma, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn3hid27EnablePairedPalmaConnectionEv", "enable paired palma connection", Result, h_hid_EnablePairedPalma, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn3hid28DisablePairedPalmaConnectionEv", "disable paired palma connection", Result, h_hid_DisablePairedPalma, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn3hid24GetPalmaConnectionHandleEPNS0_21PalmaConnectionHandleERKj", "get palma connection handle: none", Result, h_hid_GetPalmaHandle, void *h, const uint32_t *npad_id) { (void)h; (void)npad_id; return 0x20ca; }
+HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_14NpadPalmaStateERKj", "palma controller current state (not connected)", void, h_hid_StatePalma, NpadState *s, const uint32_t *id) { (void)id; memset(s, 0, sizeof(*s)); }
+HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_14NpadPalmaStateEiRKj", "palma controller states: 0", int, h_hid_StatesPalma, NpadState *s, int n, const uint32_t *id) { (void)s; (void)n; (void)id; return 0; }
+
 
 // Touch screen: TouchScreenState<N> = { int64 sampling number; int32 count; int32 reserved; TouchState[N] }, filled from the front end's touch points (hle_touch.c touch_fill_n:
 // the Mac's mouse, the iPhone touches no gamepad control takes, DM_KEYS taps) in handheld mode, as on the Switch, whose screen is out of reach when docked: a game may read touches

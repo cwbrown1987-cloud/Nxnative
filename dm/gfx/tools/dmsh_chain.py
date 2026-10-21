@@ -11,6 +11,7 @@
 # Environment: XLATE_DEBUG / XLATE_REDUCED (same meaning as in dmsh_build.py, default 1 / 1; non-default options yield a different V, which the host will not load)
 import os, sys, hashlib, subprocess
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
+os.environ.setdefault('DOTNET_ROOT', '/opt/homebrew/opt/dotnet/libexec')
 HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE); HOME = os.path.expanduser('~')
 sys.path.insert(0, os.path.join(GFX, '../games')); import game as _game   # game profiles
 GAME = _game.load()

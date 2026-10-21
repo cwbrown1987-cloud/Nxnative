@@ -590,6 +590,16 @@ def scan_file(args):
     if head[:4] == SPKG or head[:4] == b'\0\0\1\0' and path.endswith('.gz'):   # Three Houses' loose shader packages and chunked zlib files (kt_shaders)
         kt_shaders(open(path, 'rb').read(), '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:8] == b'GFLXPACK':   # Game Freak pack (Pokémon: Let's Go): member = {u16 level, u16 compression (0 none, 2 LZ4 block), u32 size, u32 packed size, u32, u64 offset}; each member is scanned as its own blob
+        import lz4.block
+        d = open(path, 'rb').read(); n = struct.unpack_from('<I', d, 0x10)[0]; o = struct.unpack_from('<Q', d, 0x18)[0]
+        for i in range(n):
+            _, comp, size, psize, _, off = struct.unpack_from('<HHIIIQ', d, o + 0x18 * i)
+            raw = d[off:off + psize]
+            if comp == 2: raw = lz4.block.decompress(raw, uncompressed_size=size)
+            elif comp != 0: continue
+            if b'BNSH\0\0\0\0' in raw or raw[:4] in (b'SARC', b'Yaz0', b'BAHS', b'MSHD'): scan_blob(raw, f'/{rel}#{i}', found)
+        return rel, uniq_keys(found), var_pairs(found), trees
     d = unzs(path) if path.endswith('.zs') else open(path, 'rb').read()
     if d[:4] == b'Yaz0': d = yaz0(d)
     if d[:8] == b'UnityFS\0' or (d[8:11] == b'\0\0\0' and __import__('unityfs').is_serialized(d)):

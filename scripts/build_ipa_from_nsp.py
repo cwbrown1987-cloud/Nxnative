@@ -39,6 +39,8 @@ HEAP_CHECK_NNMAIN_SECS = 5
 PROGRESS = 'auto'                       # stage lines on the console: 'bar' (one line per stage, redrawn in place), 'lines' (a plain line every BEAT seconds), 'off' (only each stage's start and end); 'auto' = bar in a terminal or Spyder, lines when the output goes to a file
 BEAT = 30                               # seconds between progress lines in 'lines' mode
 TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/local/share/dotnet', os.path.expanduser('~/.dotnet')]   # GUI apps such as Spyder do not get the shell's PATH
+os.environ.setdefault('DOTNET_ROOT', '/opt/homebrew/opt/dotnet/libexec')
+
 
 
 class BuildError(Exception):

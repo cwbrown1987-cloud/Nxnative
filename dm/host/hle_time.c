@@ -88,6 +88,8 @@ HLE_FORCE("_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_", "sna
     tzset(); strlcpy((char *)s + 0xa8, tzname[0] && *tzname[0] ? tzname[0] : "UTC", 0x24);
     return RES_OK;
 }
+// How far the user changed the user clock between two snapshots (Pokémon Let's Go: asked at the first save; the SDK's IPC to the time service aborts without it). The host never has the clock set by the user: 0 (a TimeSpan, returned in x0)
+HLE_FORCE("_ZN2nn4time48CalculateStandardUserSystemClockDifferenceByUserERKNS0_13ClockSnapshotES3_", "user clock adjustment between two snapshots: none", int64_t, h_time_UserDiff, const void *a, const void *b) { (void)a; (void)b; return 0; }
 // The reverse: local calendar → absolute seconds (13 Sentinels). Around a daylight-saving switch one local time maps to 0 or 2 absolute seconds; the host's mktime gives one
 HLE_FORCE("_ZN2nn4time11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeE",
           "time zone rules of the time service; uses the host mktime instead", Result, h_time_ToPosixTime, int *count, int64_t *out, int n, const CalendarTime *ct) {

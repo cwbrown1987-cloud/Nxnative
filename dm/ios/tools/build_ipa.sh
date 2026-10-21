@@ -73,7 +73,23 @@ xcodebuild -project DmIOS.xcodeproj -scheme DmIOS -configuration Release -destin
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= build > "$O/build.log" 2>&1 \
   || { grep -E 'error:' "$O/build.log" | head -20; die "xcodebuild, log $O/build.log"; }
 # When Xcode's Locations setting is a custom location, products ignore -derivedDataPath: take the actual path from this build's log
-APP=$DD/Build/Products/Release-iphoneos/DmIOS.app; [ -d "$APP" ] || APP=$(grep -o '/[^ ]*/Release-iphoneos/DmIOS\.app' "$O/build.log" | tail -1)
+APP=$DD/Build/Products/Release-iphoneos/DmIOS.app
+if [ ! -d "$APP" ]; then
+  APP=$(python3 -c '
+import os, re, sys
+found = ""
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.replace("\\ ", " ")
+        m = re.search(r"(/[^:\n\r\t]+?/Release-iphoneos/DmIOS\.app)", line)
+        if m:
+            p = m.group(1).strip()
+            if os.path.isdir(p):
+                found = p
+if found:
+    print(found)
+' "$O/build.log")
+fi
 [ -n "$APP" ] && [ -d "$APP" ] || die "no built app"; t "app: $APP"
 
 # Straight from the sources: the app without its signature, and without the folders an app built before pack_ipa.py still has (DerivedData keeps resources that left the project;

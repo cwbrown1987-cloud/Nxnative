@@ -43,12 +43,13 @@ All of these are tested on an iPhone and playable:
 | Unicorn&nbsp;Overlord | ~4&nbsp;GB | |
 | Rhythm&nbsp;Heaven&nbsp;Groove | ~3&nbsp;GB | |
 | Octopath&nbsp;Traveler&nbsp;0 | ~4&nbsp;GB | Upgraded to 60 fps (30 fps on Switch); the upgrade needs update 1.0.5, it does not work with other versions |
-| Pokémon&nbsp;Legends:&nbsp;Z-A | ~6&nbsp;GB | |
+| Pokémon&nbsp;Legends:&nbsp;Z-A | ~6&nbsp;GB | Tested on a Mac (.app) only, not yet on an iPhone; the Mega Dimension DLC runs from its licence in the app's `aoc` folder |
 | Cuphead | ~5&nbsp;GB | |
 | Super&nbsp;Mario&nbsp;Galaxy&nbsp;2 | ~3&nbsp;GB | |
 | FINAL&nbsp;FANTASY&nbsp;TACTICS&nbsp;-&nbsp;The&nbsp;Ivalice&nbsp;Chronicles | ~11&nbsp;GB | |
 | Absolum | ~2&nbsp;GB | |
 | Captain&nbsp;Toad:&nbsp;Treasure&nbsp;Tracker | ~2&nbsp;GB | |
+| Pokémon&nbsp;Let's&nbsp;Go,&nbsp;Pikachu! | | Tested on a Mac (.app) only, not yet on an iPhone |
 
 | | |
 |:---:|:---:|
