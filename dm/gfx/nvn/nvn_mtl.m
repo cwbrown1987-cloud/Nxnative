@@ -3556,7 +3556,8 @@ static struct { uint64_t addr, size, serial, v0, nv; uint32_t fmt, off, stride; 
 // of the other sign, about 360 ranges a frame that the CPU converted (5 ms of the submit thread, more when the camera turns and the ranges are new)
 static MTLVertexFormat vfmt(int f);
 static int vnat_type(int f) {   // NVN_CT_* of the input a native fetch of NVN format f fills; -1 = Metal has no such fetch (converted on the CPU)
-    int ib, is; if (vconv_i2f(f, &ib, &is) || vfmt(f) == MTLVertexFormatInvalid) return -1;
+    static int off = -1; if (off < 0) off = getenv("DM_NVN_VNAT_OFF") != NULL;   // diagnostic: every such input converted on the CPU, as before the variants
+    int ib, is; if (off || vconv_i2f(f, &ib, &is) || vfmt(f) == MTLVertexFormatInvalid) return -1;
     if (vconv_int(f, &ib, &is)) return is ? NVN_CT_INT : NVN_CT_UINT;
     return vconv_ncomp(f) ? NVN_CT_FLOAT : -1;
 }
