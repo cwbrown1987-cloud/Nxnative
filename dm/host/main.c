@@ -1,3 +1,7 @@
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX
+#include <CoreGraphics/CoreGraphics.h>
+#endif
 // Bootstrap: after loading the modules, initialize the SDK runtime in the real order of nn::init::Start (sdk+0x2b0470) in the SDK, then enter nnMain.
 #include "dm.h"
 #include "front.h"
@@ -121,6 +125,12 @@ void dm_host_preload_start(int argc, char **argv) {
     if (pthread_create(&g_pre.th, &a, preload_thread, NULL)) die("dm_host_preload_start: cannot start the thread");
 }
 int main(int argc, char **argv) {
+#if TARGET_OS_OSX
+    if (argc == 2 && !strcmp(argv[1], "--display-hz")) {   // for launchers: the main display's refresh rate (a 120 fps game build is only worth starting on a display that shows it)
+        CGDisplayModeRef m = CGDisplayCopyDisplayMode(CGMainDisplayID()); double hz = m ? CGDisplayModeGetRefreshRate(m) : 0; if (m) CGDisplayModeRelease(m);
+        printf("%d\n", (int)(hz + 0.5)); return 0;
+    }
+#endif
     if (getenv("DM_PRELOAD")) dm_host_preload_start(argc, argv);   // Exercise the early-start path on Mac (on iOS it is called from the App's main())
     if (atomic_load(&g_pre.started)) {
         pthread_join(g_pre.th, NULL);
