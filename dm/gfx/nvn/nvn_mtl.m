@@ -7656,8 +7656,13 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     //   before, every tick took the newest frame, so that frame, carrying the extra time step the game advanced for it, was shown for only 16.7 ms and the game looked like it jumped ahead
     if (g_link_hold_until > 0 && update.targetPresentationTimestamp < g_link_hold_until - tol) { g_link_held++; pthread_mutex_unlock(&g_pq_mu); return; }
     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
-    pq_item it = g_pq[(g_pq_in - 1) % PQ]; g_link_it_tin = it.t_in;
-    g_pq_read = g_pq_in;
+    // FIFO: one frame per tick, the oldest, at most one behind the newest (DM_PRESENT_FIFO=0: the newest, as before). Taking the newest dropped the one before whenever two frames
+    // landed in the same refresh: a 60 fps game whose frames take 16-17.5 ms showed a frame twice (33 ms) right after dropping one. Dark Souls Remastered, Darkroot Garden with
+    // camera turns: presents within 14.7-18.7 ms 98.2 -> 99.98 %, for about 2 ms more from enqueue to display
+    static int fifo = -1; if (fifo < 0) { const char *e = getenv("DM_PRESENT_FIFO"); fifo = !(e && !strcmp(e, "0")); if (fifo) MLOG("present: FIFO, one frame per display-link tick, at most one behind"); }
+    if (fifo && ticket > first) ticket = ticket - first >= 2 ? g_pq_in - 1 : first;
+    pq_item it = g_pq[(ticket - 1) % PQ]; g_link_it_tin = it.t_in;
+    g_pq_read = ticket;
     if (ticket > first) { g_link_dropped += ticket - first; for (uint64_t k = first; k < ticket; k++) g_pres[k % PRING] = (pres_ent){k, -1}; }   // Old frames merged and dropped are recorded as "not presented", so the present statistics honestly count them as dropped frames
     if (ticket > 1 && g_pq_done < ticket - 1) g_pq_done = ticket - 1;
     pthread_cond_broadcast(&g_pq_cv);
