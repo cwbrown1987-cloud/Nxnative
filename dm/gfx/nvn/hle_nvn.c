@@ -1227,6 +1227,7 @@ static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // Accumulated display-link wait 
 static uint64_t g_fs_start, g_fs_wait;   // frame step (fstep_tick): when the first acquire after a present returned (the frame's start, 0 = none yet), and its pacing wait
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // Host process start point (main.c; same base as the UIMSG timestamps)
+static int vstep_on(void);   // the variable frame step is in use (vstep_tick)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     win_t *o = (win_t *)w;
     *idx = o->ntex ? o->next++ % o->ntex : 0;
@@ -1237,7 +1238,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (rtp && rt_period != rtp) { rt_period = rtp; set_time_constraint(rtp); }
         rt_comp_tick(rtp);
         uint64_t p0 = now_ns();
-        if (mtl_link_active()) { if (!mtl_link_wait_tick(present_itv(o), period ? 2 * period : 33333333ull) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK: pacing fully follows the display link (wait for the present interval's display-link ticks when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
+        if (mtl_link_active()) { if (!mtl_link_wait_tick(vstep_on() ? 0 : present_itv(o), period ? 2 * period : 33333333ull) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK: pacing fully follows the display link (wait for the present interval's display-link ticks when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else if (wait) sleep_until_ns(at);
         pace_ns = now_ns() - p0;
     } else {   // DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
@@ -1576,6 +1577,7 @@ static int fstep_hold(void) {
 }
 // Once per present, before this frame's period is taken: the time since the previous frame's start (shown) and the frame's cost decide this frame's hold and the next frame's step.
 // Cost = max(CPU: the time between the frames' starts without the pacing wait, GPU: the latest finished frame's GPU time), in vsyncs
+static int vstep_on(void) { return fps_var_cap() && fps_step_cap() == 60 && !__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED); }
 static void vstep_tick(const win_t *o) {
     static uint64_t prev, t0, frames; static double game; int cap = fps_var_cap();
     uint64_t st = g_fs_start ? g_fs_start : now_ns(); g_fs_start = g_fs_wait = 0;
@@ -1636,7 +1638,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
     dm_fps_lock_tick();
     if (dm_fps_state) { static int was; int c = fps_step_cap(); if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? " (prerendered movie)" : ""); was = c; } }
-    if (fstep_on()) { if (fps_var_cap() && fps_step_cap() == 60 && !__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED)) vstep_tick(o); else { if (fps_var_cap()) memset(dm_fps_state + 0x28, 0, 4); fstep_tick(o); } }
+    if (fstep_on()) { if (vstep_on()) vstep_tick(o); else { if (fps_var_cap()) memset(dm_fps_state + 0x28, 0, 4); fstep_tick(o); } }
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     present_cfg(o);
     {

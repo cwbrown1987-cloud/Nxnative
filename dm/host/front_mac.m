@@ -12,6 +12,7 @@
 #include "front.h"
 #include "hle.h"
 #include <signal.h>
+#include <math.h>
 
 static CAMetalLayer *g_layer;
 static uint64_t g_btn;
@@ -89,6 +90,30 @@ static void *guest_tramp(void *p) {
     ((guest_arg *)p)->fn(); LOG("guest thread finished"); exit(0);
 }
 
+// A frame rate above 60 (DM_FPS_TARGET, Breath of the Wild's variable frame step) on a screen whose refresh rate is not a multiple of it: the screen switches to a mode of that rate at
+// the same size while the game runs, if it has one (macOS switches it back when the host quits: the change is made for this app only). The display link can only fire on refreshes:
+// asked for 120 Hz, a 144 Hz screen gave every other refresh, 72 Hz, and the game was shown at 72 fps whatever it rendered
+static void screen_match_rate(NSScreen *screen) {
+    const char *e = getenv("DM_FPS_TARGET"); int want = e ? atoi(e) : 0;
+    if (want <= 60 || !screen) return;
+    CGDirectDisplayID id = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+    CGDisplayModeRef cur = CGDisplayCopyDisplayMode(id); if (!cur) return;
+    double hz = CGDisplayModeGetRefreshRate(cur);
+    size_t w = CGDisplayModeGetWidth(cur), h = CGDisplayModeGetHeight(cur), pw = CGDisplayModeGetPixelWidth(cur), ph = CGDisplayModeGetPixelHeight(cur);
+    CGDisplayModeRelease(cur);
+    if (hz <= 0 || fabs(hz / want - round(hz / want)) < 0.01) return;   // already a multiple (or the built-in ProMotion screen, which reports 0)
+    CFArrayRef modes = CGDisplayCopyAllDisplayModes(id, NULL); if (!modes) return;
+    CGDisplayModeRef pick = NULL;
+    for (CFIndex i = 0; i < CFArrayGetCount(modes) && !pick; i++) { CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+        if (CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h && CGDisplayModeGetPixelWidth(m) == pw && CGDisplayModeGetPixelHeight(m) == ph && fabs(CGDisplayModeGetRefreshRate(m) - want) < 0.5) pick = m; }
+    CGDisplayConfigRef cfg;
+    if (pick && CGBeginDisplayConfiguration(&cfg) == kCGErrorSuccess) {
+        CGConfigureDisplayWithDisplayMode(cfg, id, pick, NULL);
+        CGError r = CGCompleteDisplayConfiguration(cfg, kCGConfigureForAppOnly);
+        LOG("screen at %.0f Hz: %s %d Hz while the game runs", hz, r == kCGErrorSuccess ? "switched to" : "could not switch to", want);
+    } else if (!pick) LOG("screen at %.0f Hz has no %d Hz mode at this size: frames at %d fps will be shown unevenly", hz, want, want);
+    CFRelease(modes);
+}
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -115,6 +140,7 @@ void front_run(void (*guest)(void)) {
         v.layer = g_layer;
         [win center];
         [win makeKeyAndOrderFront:nil];
+        screen_match_rate(win.screen ?: NSScreen.mainScreen);
         g_screen_fps = (int)(win.screen ?: NSScreen.mainScreen).maximumFramesPerSecond;
         [NSApp activateIgnoringOtherApps:YES];
         // Main menu: AppKit runs ⌘ shortcuts only through menu items, so ⌘Q quits and ⌃⌘F toggles fullscreen from here (AppKit shows the item as Globe-F and keeps ⌃⌘F as a hidden twin)

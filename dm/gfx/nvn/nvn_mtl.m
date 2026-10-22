@@ -8354,8 +8354,8 @@ int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) {
     // How many display-link ticks one frame takes: the game's present interval (vsyncs, 60 Hz) times 1 with a 60 Hz display link, times 2 with a 120 Hz one, halved and rounded up at 30 Hz.
     // A frame presented with interval N blocks the game for N vsyncs on the Switch, as the display callback holds it N ticks: games that scale their time step by the interval (BotW's VFR: interval / 2)
     // ran at double speed while they produced interval-2 frames every 60 Hz tick (iPhone log: Link sprinting with B, the interval flapping 1 ↔ 2)
-    if (vsyncs < 1) vsyncs = 1;
-    const uint64_t step = g_link_mode == 3 ? (uint64_t)(vsyncs + 1) / 2 : (uint64_t)vsyncs * (g_link_mode == 2 ? 2 : 1);
+    // vsyncs 0: one tick of the link whatever its rate (a variable frame step shows each frame on the next refresh, hle_nvn.c vstep_tick; at mode 2 a whole vsync was two ticks, 60 fps)
+    const uint64_t step = vsyncs < 1 ? 1 : g_link_mode == 3 ? (uint64_t)(vsyncs + 1) / 2 : (uint64_t)vsyncs * (g_link_mode == 2 ? 2 : 1);
     pthread_mutex_lock(&g_link_mu);
     if (g_link_tick_n >= started_tick + step) { started_tick = g_link_tick_n; pthread_mutex_unlock(&g_link_mu); return 1; }
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
