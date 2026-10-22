@@ -65,6 +65,20 @@ static void pads_changed(void) {   // every connected pad reports (the last one 
     if (!any) dm_pad_set(0, 0, 0, 0, 0);
 }
 
+// Handle game touches in the content view so title-bar, window-button and resize events
+// continue to AppKit. A window-wide monitor returning nil prevents their normal delivery.
+@interface DmGameView : NSView @end
+@implementation DmGameView
+- (void)mouseDown:(NSEvent *)e { [self mouseDragged:e]; }
+- (void)mouseDragged:(NSEvent *)e {
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil]; NSSize sz = self.bounds.size;
+    if (sz.width <= 0 || sz.height <= 0) return;
+    dm_touch t = {0, (float)(p.x / sz.width), (float)(1.0 - p.y / sz.height)};
+    dm_touch_set(&t, 1);
+}
+- (void)mouseUp:(NSEvent *)e { (void)e; dm_touch_set(NULL, 0); }
+@end
+
 typedef struct { void (*fn)(void); } guest_arg;
 static void *guest_tramp(void *p) {
     static char alt[65536];                       // The signal alternate stack is per thread; crash printing must also work on the guest thread
@@ -85,7 +99,8 @@ void front_run(void (*guest)(void)) {
         // Fullscreen: without FullScreenPrimary the green button only zooms the window. The present path already scales
         // the game picture to fit the drawable with black bars around it, so fullscreen keeps the game's aspect ratio.
         win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
-        NSView *v = win.contentView;
+        DmGameView *v = [[DmGameView alloc] initWithFrame:r];
+        win.contentView = v;
         v.wantsLayer = YES;
         g_layer = [CAMetalLayer layer];
         g_layer.device = MTLCreateSystemDefaultDevice();
@@ -105,17 +120,9 @@ void front_run(void (*guest)(void)) {
         pads_changed();
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
+            if (e.modifierFlags & NSEventModifierFlagCommand) return e;
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
             return nil;   // Swallow it to avoid the system beep
-        }];
-        // Mouse as a single-point touchscreen (for testing touch on the local machine, front.h dm_touch_set): left button down / drag = finger 0 at the normalized coordinates, release = lifted
-        [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp handler:^NSEvent *(NSEvent *e) {
-            if (e.window != win) return e;
-            if (e.type == NSEventTypeLeftMouseUp) { dm_touch_set(NULL, 0); return nil; }
-            NSPoint p = [v convertPoint:e.locationInWindow fromView:nil]; NSSize sz = v.bounds.size;
-            if (sz.width <= 0 || sz.height <= 0) return e;
-            dm_touch t = {0, (float)(p.x / sz.width), (float)(1.0 - p.y / sz.height)};   // The AppKit view origin is at bottom left, the touchscreen origin is at top left
-            dm_touch_set(&t, 1); return nil;
         }];
         [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification object:win queue:nil
                                                       usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
