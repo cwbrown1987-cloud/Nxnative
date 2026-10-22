@@ -1160,7 +1160,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); mtl_init
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[109];
+static int g_red_once[110];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -3393,7 +3393,7 @@ static struct {
     uint64_t tex[6][NTEX], samp[6][128], img[6][32];
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; uint8_t vp_sw[16][4];   // vp_sw: viewport swizzles XOR the identity (p_vp_swizzle)
-    float blend_color[4]; int64_t copy_stride, copy_img_stride;
+    float blend_color[4], alpha_ref; int64_t copy_stride, copy_img_stride;
     p_tf_bind tf[4]; uint64_t tf_off[4]; int tf_on, rast_discard;   // transform feedback buffers, bytes written into each since Begin, capture active; rasterizer discard (tf_draw)
 } S;
 // Resolved guest streams are separate from the table cache: vconv_bind may overwrite a stream's table slot.
@@ -3814,9 +3814,47 @@ static nvn_hmap g_pso = {.klen = sizeof(pso_key)}, g_dss;
 static nvn_hmap g_pso_fail = {.klen = sizeof(pso_key)};   // pipelines that failed to build: remembered and never retried (previously every draw recompiled it, over 10,000 times in one iPhone session)
 static const char g_tf_mark;
 #define TF_MARK ((const void *)&g_tf_mark)   // pso_key.fsfn of a transform feedback capture pipeline (tf_pso)
+// NVN alpha test (ColorStateSetAlphaTest + SetAlphaRef): Metal has none, so the fragment shader gets a variant that discards when color 0's alpha fails the comparison
+// (Maxwell semantics: the test reads the alpha the shader writes to render target 0, before blending). The variant is the shader's own MSL source with the test inserted before each
+// return of the entry point, the function and reference written in as constants, compiled once per (shader, function, reference). Dark Souls Remastered draws its foliage, hair and fences this way
+static inline int atest_on(void) { return S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS; }
+static id<MTLFunction> atest_fn(NvShader *fs, uint32_t func, uint32_t ref) {
+    static NSMutableDictionary *cache; static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT; static int n;
+    static const char *const op[9] = {"", "false", "<", "==", "<=", ">", "!=", ">=", "true"};
+    if (func > 8) return nil;
+    NSString *ck = [NSString stringWithFormat:@"%s|%u|%08x", fs->key, func, ref];
+    os_unfair_lock_lock(&lk); if (!cache) cache = [NSMutableDictionary dictionary];
+    id f = cache[ck]; os_unfair_lock_unlock(&lk);
+    if (f) return f == NSNull.null ? nil : f;
+    NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithFormat:@"%@/%s.metal", g_msl_dir, fs->key] encoding:NSUTF8StringEncoding error:nil];
+    NSRange ent = src ? [src rangeOfString:@"fragment main0_out main0("] : (NSRange){NSNotFound, 0};
+    NSString *col = nil;
+    if (ent.location != NSNotFound) {   // the main0_out member bound to [[color(0)]]
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"struct main0_out\\s*\\{[^}]*?\\s(\\w+)\\s*\\[\\[color\\(0\\)\\]\\]" options:0 error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:src options:0 range:NSMakeRange(0, src.length)];
+        if (m) col = [src substringWithRange:[m rangeAtIndex:1]];
+    }
+    NSError *e = nil; id<MTLFunction> fn = nil;
+    if (col) {
+        NSString *test = [NSString stringWithFormat:@"{ if (!(float(out.%@.w) %s as_type<float>(0x%08xu))) discard_fragment(); return out; }", col, op[func], ref];
+        if (func == NVN_ALPHA_FUNC_NEVER) test = @"{ discard_fragment(); return out; }";
+        NSString *head = [src substringToIndex:ent.location], *body = [src substringFromIndex:ent.location];
+        body = [body stringByReplacingOccurrencesOfString:@"return out;" withString:test];
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        id<MTLLibrary> lib = [g_dev newLibraryWithSource:[head stringByAppendingString:body] options:nil error:&e];
+        fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
+        int k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
+        if (fn && (k <= 3 || k % 50 == 0)) MLOG("alpha test variant #%d: %s alpha %s %g (%.0f ms)", k, fs->key, op[func], *(float *)&ref, (CFAbsoluteTimeGetCurrent() - t0) * 1e3);
+    }
+    if (!fn) MLOG("[RED] alpha test variant of %s failed (%s): the shader draws without the test", fs->key, !src ? "no MSL source" : !col ? "no color 0 output" : e.localizedDescription.UTF8String);
+    os_unfair_lock_lock(&lk); cache[ck] = fn ?: (id)NSNull.null; os_unfair_lock_unlock(&lk);
+    return fn;
+}
 static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = vs->fn; d.fragmentFunction = fsfn ? fsfn : fs ? fs->fn : nil;
+    if (k->atest && fs) { id<MTLFunction> af = fsfn ? nil : atest_fn(fs, k->atest, k->aref); if (af) d.fragmentFunction = af;
+        else if (fsfn) RED_ONCE(109, "alpha test not applied to a specialized fragment (readable-tile merge or diagnostic) %s", fs->key); }
     // Diagnostic DM_NVN_HILITE=fragment shader key,...: these draws use a solid-color fragment instead (keys 1–6 in order magenta / green / cyan / yellow / blue / white), to see where the geometry lands
     // Pipelines are built on several threads at once: the keys and the library are set up once (a lazy setup raced, and a thread used a library another had just replaced: Hades II, 6 keys)
     if (fs) { static char keys[6][24]; static int nk; static id<MTLLibrary> hl; static dispatch_once_t once;
@@ -3894,6 +3932,7 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
     k->vs = (__bridge void *)vs; k->fs = (__bridge void *)fs;
     memcpy(k->cfmt, cfmt, sizeof k->cfmt); k->dfmt = dfmt; k->sfmt = sfmt; k->samples = samples;
     k->blend_en = S.color.blend_en; k->chmask = S.chmask.mask; k->a2c = S.ms.a2c;
+    if (fs && atest_on()) { k->atest = S.color.alpha_func; memcpy(&k->aref, &S.alpha_ref, 4); }
     for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) k->blend[i] = S.blend[i];
     const nvn_refl *rf = &vs->rf;
     for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 16 && a < S.nattr) { k->attr[a] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
@@ -3915,11 +3954,14 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // C
     if (at < 0 && slot >= 0) { g_pp[slot].k = *k; g_pp[slot].ps = nil; g_pp[slot].done = 0; g_pp[slot].used = 1; }
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
-    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+    pso_key kc = *k; g_pp_kicked++;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{   // the descriptor too: an alpha test or native vertex fetch variant compiles its shader from source in pso_desc (~0.4 s)
+        pso_key kd = kc; NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&kd, vs, fs, nil, 0) error:&e];
         pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
     });
+}
+static int pso_pend_state(const pso_key *k) {   // -1 not in the table, 0 still compiling, 1 done
+    pthread_mutex_lock(&g_pp_mu); int at = pso_pend_find(k), r = at < 0 ? -1 : g_pp[at].done; pthread_mutex_unlock(&g_pp_mu); return r;
 }
 static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // Called by the submit thread: if it is in the table, wait for it to finish compiling and take it; otherwise return nil
     pthread_mutex_lock(&g_pp_mu);
@@ -3953,6 +3995,12 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
     __unsafe_unretained id<MTLRenderPipelineState> cached = hm_get_id(&g_pso, &k);
     if (cached) return cached;
     if (hm_get_id(&g_pso_fail, &k)) return nil;
+    // Alpha-tested pipelines are not waited for: their fragment variant compiles from MSL source (0.2-0.45 s each, a freeze the first time a plant or fence is seen),
+    // so they are built in the background and their draws are skipped until ready - the foliage appears a few frames late, once per pipeline on a machine
+    if (k.atest && !g_pso_lmap && !ms_fn) {
+        int st = pso_pend_state(&k); if (st < 0) { pso_pend_kick(&k, vs, fs); st = pso_pend_state(&k); }
+        if (st == 0) { static uint64_t n; uint64_t m = ++n; if (!(m & (m - 1)) && m >= 16) MLOG("alpha test pipelines compiling in the background: %llu draws skipped so far", (unsigned long long)m); return nil; }
+    }
     id<MTLRenderPipelineState> ps;
     NSError *e = nil; uint64_t bt = bp_now();
     ps = g_pso_lmap || ms_fn ? nil : pso_pend_take(&k);
@@ -3997,6 +4045,7 @@ static void warm_worker(NSArray<NSString *> *paths) {
     @autoreleasepool {
         NSMutableDictionary<NSString *, NvShader *> *dict = [NSMutableDictionary dictionary];
         NSMutableSet<NSString *> *seen = [NSMutableSet set];
+        NSMutableArray *jobs = [NSMutableArray array];   // render pipelines, built in parallel once the lists are read (one at a time took minutes on a cold shader cache: 1,200 pipelines of 200-450 ms)
         for (NSString *path in paths) {
             NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
             if (!txt) { MLOG("[RED] cannot read prewarm list: %s", path.UTF8String); continue; }
@@ -4023,13 +4072,15 @@ static void warm_worker(NSArray<NSString *> *paths) {
                         if (sk.fz_desc.kind == 1 && fs) { int fx[32]; for (int i = 0; i < 32; i++) fx[i] = sk.fz_desc.fx[i]; fsfn = bf_fn(fs, fx, sk.fz_desc.fbmask, sk.k.lmap); }
                                                 if (!fsfn) { g_warm_skip_fz++; continue; }
                     }
-                    pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn;
-                    NSError *e = nil; id ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, sk.merged) error:&e];
-                    if (!ps && !vs->layer_out && [e.localizedDescription containsString:@"render_target_array_index"]) {   // a vertex shader that writes the layer (see pso_get_)
-                        vs->layer_out = 1; e = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, sk.merged) error:&e]; }
-                    if (!ps) { MLOG("[RED] background render pipeline creation failed: %s", e.localizedDescription.UTF8String); continue; }
-                    WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k; item->object = ps;
-                    warm_enqueue(item); g_warm_rps++;
+                    pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn; int merged = sk.merged;
+                    [jobs addObject:^{
+                        NSError *e = nil; id ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, merged) error:&e];
+                        if (!ps && !vs->layer_out && [e.localizedDescription containsString:@"render_target_array_index"]) {   // a vertex shader that writes the layer (see pso_get_)
+                            vs->layer_out = 1; e = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, merged) error:&e]; }
+                        if (!ps) { MLOG("[RED] background render pipeline creation failed: %s", e.localizedDescription.UTF8String); return; }
+                        WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k; item->object = ps;
+                        warm_enqueue(item); __atomic_add_fetch(&g_warm_rps, 1, __ATOMIC_RELAXED);
+                    }];
                 } else if ([c[0] isEqualToString:@"C"] && c.count >= 2) {
                     NSString *key = c[1]; if (!key.length) continue;
                     NvShader *cs = warm_shader(dict, key, 5);
@@ -4041,6 +4092,7 @@ static void warm_worker(NSArray<NSString *> *paths) {
                 }
             }
         }
+        dispatch_apply(jobs.count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) { @autoreleasepool { ((void (^)(void))jobs[i])(); } });
         MLOG("pipeline prewarm done: shaders %llu / render pipelines %llu (specialized fragment skipped %llu) / compute pipelines %llu, background time %.1f ms",
              g_warm_shaders, g_warm_rps, g_warm_skip_fz, g_warm_cps, (bp_now() - g_warm_t0) / 1e6);
     }
@@ -4588,7 +4640,7 @@ static int first_draw_covers(int i, id<MTLTexture> t, NSUInteger level) {
     int n = dw ? dw->count : di->count, prim = dw ? dw->prim : di->prim;
     __unsafe_unretained NvProg *pr = S.prog ? prog_get(S.prog) : nil; if (!pr) return g_fd_why = 1, 0;
     NvShader *vs = pr->sh[0], *fs = pr->sh[1];
-    if (!vs || !fs || vs->rf.pos_attr < 0 || fs->rf.may_discard || fs->rf.writes_smask || !(fs->rf.color_mask >> i & 1)) return g_fd_why = 2, 0;
+    if (!vs || !fs || vs->rf.pos_attr < 0 || fs->rf.may_discard || atest_on() || fs->rf.writes_smask || !(fs->rf.color_mask >> i & 1)) return g_fd_why = 2, 0;
     if (!t || t.sampleCount != 1 || t.textureType == MTLTextureType3D) return g_fd_why = 3, 0;
     if ((S.color.blend_en >> i & 1) || ((S.chmask.mask >> (4 * i)) & 0xf) != 0xf || S.ms.a2c || S.poly.mode != NVN_POLYGON_MODE_FILL) return g_fd_why = 4, 0;
     if (R.rt.depth && ((S.ds.dt && S.ds.df != NVN_DEPTH_FUNC_ALWAYS) || S.ds.st)) return g_fd_why = 5, 0;
@@ -4645,6 +4697,7 @@ static int state_op(uint32_t op, const void *a) {
         case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_depth_clamp *)a)->on; break;
         case OP_VP_SWIZZLE: { const p_vp_swizzle *b = a; memcpy(S.vp_sw[b->first], b->sw, 4 * (size_t)b->n); break; }
         case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
+        case OP_ALPHA_REF: { float r = ((const p_alpha_ref *)a)->ref; if (memcmp(&r, &S.alpha_ref, 4)) { S.alpha_ref = r; if (atest_on()) g_pso_dirty = 1; } break; }
         case OP_COPY_STRIDE: { const p_copy_stride *cs = a; if (cs->image) S.copy_img_stride = cs->stride; else S.copy_stride = cs->stride; break; }
         case OP_TF_BIND: { const p_tf_bind *b = a; if (b->index >= 0 && b->index < 4) S.tf[b->index] = *b; break; }
         case OP_TF_STATE: { const p_tf_state *b = a;   // Begin writes from the start of each buffer; Pause / Resume keep the offsets (the host keeps them itself, the game's control buffer is not used)
@@ -7280,7 +7333,7 @@ void mtl_exec(const uint8_t *p) {
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
             case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
-            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
+            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BLEND_COLOR: case OP_ALPHA_REF: case OP_COPY_STRIDE:
                 state_op(h.op, a); break;
             case OP_TF_BIND: { const p_tf_bind *b = a; PD("Y tf bind %d addr=%#llx size=%llu", b->index, (unsigned long long)b->addr, (unsigned long long)b->size); state_op(h.op, a); break; }
             case OP_TF_STATE: { const p_tf_state *b = a; static const char *const w[4] = {"begin", "end", "pause", "resume"}; PD("Y tf %s ctl=%#llx written %llu/%llu/%llu/%llu", w[b->what & 3], (unsigned long long)b->ctl,
