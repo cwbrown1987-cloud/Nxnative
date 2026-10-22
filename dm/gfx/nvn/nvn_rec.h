@@ -8,6 +8,55 @@
 // since the submit thread may be adding to the set at the same time.
 // A selector the stand-ins do not implement stops the host with its name (forwardingTargetForSelector), so a missing one cannot silently drop work.
 
+// ---------- Copy queue: large uniform shadows (ubp_get) are filled by a worker thread ----------
+// A shadow is the bytes of a uniform range as the GPU will read them at that point of the submission (nvn_mtl.m ubp_get): memory, or the previous shadow of the range, with the inline
+// updates queued since laid over it. Breath of the Wild makes about 440 a frame, 14 MB of copies, a tenth of the submit thread's time. The submit thread queues the copies in order and
+// goes on; one worker makes them in the same order (a shadow may start from the previous one). The GPU reads shadows only after its command buffer is committed, and every commit first
+// waits for the copies queued before it (ubc_wait, from the encode thread when Metal encoding is deferred); a CPU read of a shadow waits for its own copies. DM_NVN_UB_COPY_THREAD=0
+// copies on the submit thread as before
+typedef struct { void *d; const void *s; size_t n; } ubc_op;
+enum { UBC_N = 8192 };
+static ubc_op g_ubc[UBC_N];
+static _Atomic uint64_t g_ubc_head, g_ubc_done;   // ops queued / made (monotonic)
+static _Atomic int g_ubc_sleeping;
+static pthread_mutex_t g_ubc_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ubc_cv = PTHREAD_COND_INITIALIZER;
+static int ubc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_UB_COPY_THREAD"); v = !(e && !strcmp(e, "0")); } return v; }
+static void *ubc_thread(void *arg) {
+    (void)arg; pthread_setname_np("dm-ub-copy"); pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    for (uint64_t t = 0;;) {
+        uint64_t h = atomic_load_explicit(&g_ubc_head, memory_order_acquire);
+        if (t == h) {
+            for (int spin = 0; spin < 2000 && t == h; spin++) h = atomic_load_explicit(&g_ubc_head, memory_order_acquire);   // a submission queues copies in bursts: stay awake a moment
+            if (t == h) { pthread_mutex_lock(&g_ubc_mu); atomic_store(&g_ubc_sleeping, 1);
+                while ((h = atomic_load_explicit(&g_ubc_head, memory_order_acquire)) == t) pthread_cond_wait(&g_ubc_cv, &g_ubc_mu);
+                atomic_store(&g_ubc_sleeping, 0); pthread_mutex_unlock(&g_ubc_mu); }
+        }
+        for (; t < h; t++) { const ubc_op *o = &g_ubc[t % UBC_N]; memcpy(o->d, o->s, o->n); }
+        atomic_store_explicit(&g_ubc_done, t, memory_order_release);
+    }
+    return NULL;
+}
+// Wait until the first seq ops are made
+static void ubc_wait(uint64_t seq) {
+    if (atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= seq) return;
+    while (atomic_load_explicit(&g_ubc_done, memory_order_acquire) < seq) {
+        if (atomic_load(&g_ubc_sleeping)) { pthread_mutex_lock(&g_ubc_mu); pthread_cond_signal(&g_ubc_cv); pthread_mutex_unlock(&g_ubc_mu); }
+        __builtin_arm_yield();
+    }
+}
+static inline uint64_t ubc_head(void) { return atomic_load_explicit(&g_ubc_head, memory_order_relaxed); }
+// Queue a copy (submit thread only); returns the count of ops that must be made for it to be done
+static uint64_t ubc_push(void *d, const void *s, size_t n) {
+    static int started;
+    if (!started) { pthread_t th; if (pthread_create(&th, NULL, ubc_thread, NULL)) MDIE("cannot start the uniform copy thread"); pthread_detach(th); started = 1; }
+    uint64_t h = atomic_load_explicit(&g_ubc_head, memory_order_relaxed);
+    if (h - atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= UBC_N) ubc_wait(h - UBC_N + 1);
+    g_ubc[h % UBC_N] = (ubc_op){d, s, n};
+    atomic_store_explicit(&g_ubc_head, h + 1, memory_order_release);
+    if (atomic_load(&g_ubc_sleeping)) { pthread_mutex_lock(&g_ubc_mu); pthread_cond_signal(&g_ubc_cv); pthread_mutex_unlock(&g_ubc_mu); }
+    return h + 1;
+}
+
 enum {
     RO_CB_NEW, RO_CB_BEGIN, RO_CB_END, RO_COMMIT, RO_COMMIT_REAL, RO_SIGNAL,
     RO_RE_BEGIN, RO_CE_BEGIN, RO_END,
@@ -46,6 +95,7 @@ static void rec_exec(const rec_t *r) {
     case RO_CB_BEGIN: [(id<MTL4CommandBuffer>)g_rx_cb beginCommandBufferWithAllocator:rec_id(a[0])]; break;
     case RO_CB_END: [(id<MTL4CommandBuffer>)g_rx_cb endCommandBuffer]; break;
     case RO_COMMIT: case RO_COMMIT_REAL: {
+        if (r->op == RO_COMMIT) ubc_wait(a[2]);   // the uniform shadows this command buffer reads
         id<MTL4CommandBuffer> buffers[] = {r->op == RO_COMMIT ? g_rx_cb : rec_id(a[1])}; MTL4CommitOptions *o = rec_id(a[0]);
         pthread_mutex_lock(&g_res_mu);
         if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
@@ -222,9 +272,16 @@ static inline id rec_table_real(id t) { return [t isKindOfClass:[DmRecTable clas
 // The replay's entry points
 static id rec_cb_new(void) { if (!rec_on()) return [g_dev newCommandBuffer]; rec_put(RO_CB_NEW, 0); return [DmRecCB new]; }
 static id rec_table(id t) { if (!rec_on() || !t) return t; DmRecTable *s = [DmRecTable new]; s->real = t; return s; }
+// The replay's main command buffer: committed once the uniform shadows queued so far are made (ubc_wait)
 static void rec_commit(id cb, MTL4CommitOptions *o) {
-    if ([cb isKindOfClass:[DmRecCB class]]) { rec_t *r = rec_put(RO_COMMIT, 1); r->a[0] = rec_obj(o); return; }
-    if (rec_on() && g_rb_started) { rec_t *r = rec_put(RO_COMMIT_REAL, 2); r->a[0] = rec_obj(o); r->a[1] = rec_obj(cb); return; }   // an upload batch: its place in the queue is after what is recorded so far
+    if ([cb isKindOfClass:[DmRecCB class]]) { rec_t *r = rec_put(RO_COMMIT, 1); r->a[0] = rec_obj(o); r->a[2] = ubc_head(); return; }
+    ubc_wait(ubc_head());
+    id<MTL4CommandBuffer> buffers[] = {cb};
+    if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
+}
+// An upload batch: its place in the queue is after what is recorded so far (it reads no uniform shadow)
+static void rec_commit_upload(id cb, MTL4CommitOptions *o) {
+    if (rec_on() && g_rb_started) { rec_t *r = rec_put(RO_COMMIT_REAL, 2); r->a[0] = rec_obj(o); r->a[1] = rec_obj(cb); return; }
     id<MTL4CommandBuffer> buffers[] = {cb};
     if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
 }
