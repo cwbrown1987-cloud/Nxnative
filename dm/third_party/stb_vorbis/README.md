@@ -1,2 +1,4 @@
-Source: https://github.com/nothings/stb `stb_vorbis.c` at commit 1ee679c (version 1.22), unmodified. License in LICENSE (MIT or public domain, your choice; the same text ends the source file).
+Source: https://github.com/nothings/stb `stb_vorbis.c` at commit 1ee679c (version 1.22). License in LICENSE (MIT or public domain, your choice; the same text ends the source file).
 Use: the host decodes the Vorbis sound tracks of the games' WebM movies with it (`dm/host/hle_movie.c` includes the file with `STB_VORBIS_NO_STDIO`, `STB_VORBIS_NO_PULLDATA_API` and `STB_VORBIS_NO_INTEGER_CONVERSION`, and feeds each raw packet in as an Ogg page of its own). First needed by Link's Awakening.
+
+Local corrections: residue type 2 uses the actual submap channel count for its interleaved vector length. The caller-owned-buffer temporary-memory estimate uses the stream channel count as a conservative upper bound for each type-2 submap. Regression test: `make -C dm/host/tests build/t_vorbis build/t_vorbis_divides`, then run both binaries.
