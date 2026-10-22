@@ -1226,6 +1226,22 @@ if FS_STATE_OFF and BUILD_ID == 'cd57b23fa4bbad65803d9788c01821ee':
         emit(w)
     emit(B(here(), 0x151d3d4))
     fs_put(0x151d3d0, [B(0x151d3d0, start)], 'VFR::updateInterval: its own override published for the host (state page target fps; 0 = original)')
+    # Variable frame time (state +0x28, float, written by the host each frame when the cap is above 60, see hle_nvn.c vstep_tick; 0 = off): VFR::updateInterval turns the interval
+    # into the frame's step in 1/30 s units (interval / [+0x150], 2: 0.5 at 60 fps), keeps it at +0x30 and publishes it at +0x3c, which the per-core steps (main+0x151d7e8) and the
+    # game's systems read. The host's step (the time the last frame took, clamped) replaces it there, except while the game's own override is set (cutscenes keep their steps).
+    # x9, x10 and s2 are dead at main+0x151d484 (w8 holds the changed flag stored next)
+    fs_site(0x151d484, '2020201e')
+    start = here(); emit(ADRP(9, here(), FS_STATE_OFF))
+    for w in (0x3940a66a,   # ldrb w10,[x19,#0x29]   the VFR's override
+              0x350000aa,   # cbnz w10,orig (+5)
+              0xbd402922,   # ldr s2,[x9,#0x28]      the host's step (1/30 s units)
+              0x1e202048,   # fcmp s2,#0.0
+              0x5400004d,   # b.le orig (+2)         not set
+              0x1e204041,   # fmov s1,s2             published at +0x3c only: +0x30 keeps the interval's step for the game's override
+              0x1e202020):  # orig: fcmp s1,s0
+        emit(w)
+    emit(B(here(), 0x151d488))
+    fs_put(0x151d484, [B(0x151d484, start)], 'VFR::updateInterval: the frame step is the host\'s variable step (state page +0x28) when set, unless the game overrides its interval')
     # Render scale (state +0x10, float written by the loader: DM_RENDER_SCALE, 1.0 by default; independent of the frame step). The dynamic-resolution method (main+0x12666e4) keeps a
     # scale in 0.8–1.0 rounded to 0.05 steps (+0x1218, main+0x1266818), or the game's forced 0.75 / 0.5 (+0x284 & 0x1800), in s8; from main+0x1266880 it applies s8: each view's
     # scale (+0x28a0 / +0x28a4 = s8 × base width (+0x1214: 1600 docked, 1280 handheld) / output width), from which the scene buffers are sized each frame (main+0x106340c), the

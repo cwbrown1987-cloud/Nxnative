@@ -1497,6 +1497,14 @@ static int fps_step_cap(void) {
     return t <= 0 ? 0 : __atomic_load_n((uint32_t *)(dm_fps_state + 4), __ATOMIC_RELAXED) || t <= 30 ? 30 : 60;
 }
 static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides the steps in whole vsyncs
+// Variable frame time (a cap above 60, DM_FPS_TARGET=61 to 240; patch_nso.py, Breath of the Wild's VFR::updateInterval): each frame steps the game by the real time the previous one took,
+// in 1/30 s units at state +0x28, clamped to [30 / cap, 1.5] (BotW's own steps run 0.5 to 1.5), and the frame is shown as soon as it is ready (present interval 1 at DM_PRESENT_HZ).
+// The vsync step at +0x20 stays 1, so the game's swap interval asks for every vsync. A step the game fixes itself (its VFR override in cutscenes) is held as in the whole-vsync mode
+static int fps_var_cap(void) {
+    if (!dm_fps_state) return 0;
+    uint32_t b = __atomic_load_n((uint32_t *)dm_fps_state, __ATOMIC_RELAXED); float t; memcpy(&t, &b, sizeof t);
+    return t > 60 ? (int)t : 0;
+}
 static nvn_fstep g_fs;   // present thread only
 static nvn_fgpu g_fg;   // the GPU time at kmin and at the current hold (nvn_fstep_gpu_slowed)
 static _Atomic int g_fs_k;   // the hold presentation follows (0 = not decided yet)
@@ -1568,6 +1576,21 @@ static int fstep_hold(void) {
 }
 // Once per present, before this frame's period is taken: the time since the previous frame's start (shown) and the frame's cost decide this frame's hold and the next frame's step.
 // Cost = max(CPU: the time between the frames' starts without the pacing wait, GPU: the latest finished frame's GPU time), in vsyncs
+static void vstep_tick(const win_t *o) {
+    static uint64_t prev, t0, frames; static double game; int cap = fps_var_cap();
+    uint64_t st = g_fs_start ? g_fs_start : now_ns(); g_fs_start = g_fs_wait = 0;
+    double shown = prev ? (st - prev) / 1e9 : 0; prev = st;
+    float step = shown > 0 ? (float)(shown * 30) : 0.5f, lo = 30.0f / cap;
+    if (step < lo) step = lo; if (step > 1.5f) step = 1.5f;
+    memcpy(dm_fps_state + 0x28, &step, sizeof step);
+    __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), 1u, __ATOMIC_RELAXED); atomic_store(&g_fs_k, 1);
+    game += step / 30.0; frames++;
+    if (o->presents % 1800 == 0) {   // game time against real time: below 1 when frames take longer than 1.5 steps (20 fps), as on the Switch
+        uint64_t t = now_ns();
+        if (t0) LOG("[nvn] variable frame step: %.1f fps, game time %.2f s in %.2f s (%.3f of real time)", frames / ((t - t0) / 1e9), game, (t - t0) / 1e9, game / ((t - t0) / 1e9));
+        t0 = t; game = 0; frames = 0;
+    }
+}
 static void fstep_tick(const win_t *o) {
     static uint64_t prev, t0, v0, fixed_sum, held[FSTEP_MAX + 1]; static int nlog;
     const double v = 1e9 / 60;
@@ -1613,7 +1636,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
     dm_fps_lock_tick();
     if (dm_fps_state) { static int was; int c = fps_step_cap(); if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? " (prerendered movie)" : ""); was = c; } }
-    if (fstep_on()) fstep_tick(o);
+    if (fstep_on()) { if (fps_var_cap() && fps_step_cap() == 60 && !__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED)) vstep_tick(o); else { if (fps_var_cap()) memset(dm_fps_state + 0x28, 0, 4); fstep_tick(o); } }
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     present_cfg(o);
     {
