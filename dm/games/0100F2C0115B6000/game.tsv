@@ -44,6 +44,8 @@ tex_dirty_upload	on
 # 30 when 60 does not hold, game time = real time. DM_FPS_TARGET=30 (Documents/env.txt on the iPhone) saves power, 0 = the game's own step. Until the host has decided a step
 # (the first frames) the stub steps by the measured frame time
 fps_target	60
+# the 3D views can be fixed at a fraction of their size (DM_RENDER_SCALE 0.5 to 1.0; the iOS launcher offers it)
+render_scale	on
 
 # ---- Shader split (shader_split.py) ----
 shader_groups	/Shader/ApplicationPackage=layout /Shader/=shader /Effect/=effect /UI/=layout

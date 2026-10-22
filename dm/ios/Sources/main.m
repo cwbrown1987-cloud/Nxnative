@@ -65,7 +65,8 @@ static int boot_env(void) {
     if ([fm fileExistsAtPath:aoc]) setenv("DM_AOC_DIR", aoc.fileSystemRepresentation, 0);
     chdir(doc.fileSystemRepresentation);
     g_argv[0] = strdup("dmhost"); g_argv[1] = strdup(dm.fileSystemRepresentation); g_argc = 2;
-    dm_host_preload_start(g_argc, g_argv);   // Module tables / relocation / takeover run early in the background, in parallel with UIKit startup
+    // Module tables / relocation / takeover run early in the background, in parallel with UIKit startup; with the launcher only once it has set the switches the loading reads (front_ios.m startGame)
+    bool dm_launcher_enabled(void); if (!dm_launcher_enabled()) dm_host_preload_start(g_argc, g_argv);
     return 1;
 }
 static int g_boot_ok;
@@ -84,6 +85,7 @@ void front_ios_boot(void) {   // Called by front_ios.m once the window and Metal
     pthread_t t; pthread_create(&t, &a, boot_thread, NULL); pthread_detach(t);
 }
 int front_ios_boot_ok(void) { return g_boot_ok; }
+void front_ios_preload(void) { dm_host_preload_start(g_argc, g_argv); }   // idempotent: the host starts it only once
 
 @interface App : UIResponder <UIApplicationDelegate>
 @end

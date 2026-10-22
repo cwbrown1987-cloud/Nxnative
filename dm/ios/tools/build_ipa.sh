@@ -46,6 +46,7 @@ if [ "$PREPARE_XCODE" = YES ]; then
 
 else DM_SCHEME_NAME=DmIOS; fi
 export DM_SCHEME_NAME
+export DM_LANGS=${DM_LANGS:-$(python3 "$DM/tools/nacp.py" --languages "$VNACP" 2>/dev/null)}   # the launcher's language picker (DMLanguages in Info.plist); empty = no picker
 for f in $MODS; do [ -f "$PATCHED/$f.patched.bin" ] && [ -f "$PATCHED/$f.fixups.tsv" ] || die "no rewritten module $PATCHED/$f (run dm/tools/patch_nso.py first)"; done
 [ -e "$ROMFS/$MARKER" ] || die "no RomFS at $ROMFS (missing $MARKER)"
 V=$(sed -n 's/^#define DMSH_CHAIN "\(.*\)"/\1/p' "$GD/dmsh_chain.h")

@@ -8,11 +8,15 @@
 #include "front.h"
 #include "hle.h"
 #include "dm.h"
+#include "game_profile.h"   // the launcher's choices follow the profile (fps_target, render_scale, op_mode)
 
 UIView *dm_gamepad_view(CGRect frame);
 void dm_gamepad_reset(void);
 void front_ios_boot(void);
 int front_ios_boot_ok(void);
+void front_ios_preload(void);
+bool dm_launcher_enabled(void);   // Launcher.swift
+void dm_show_launcher(void *view_controller, int fps_target, bool render_scale, bool docked, void (*done)(void));
 
 static CAMetalLayer *g_layer;
 static void front_ios_power_watch(void);
@@ -43,7 +47,11 @@ static UILabel *front_ios_fps_label(void);
 @property (nonatomic, strong) DmGameView *game;
 @property (nonatomic, strong) UIView *pad;
 @property (nonatomic, strong) UILabel *fps;
+@property (nonatomic) BOOL launched;
+- (void)startGame;
 @end
+static DmRootVC *g_root;
+static void launcher_done(void) { [g_root startGame]; }
 @implementation DmRootVC
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -56,15 +64,24 @@ static UILabel *front_ios_fps_label(void);
         lb.text = @"Game files not found.\nPut the RomFS folder into this App's Documents as \"romfs\" (Files app), then restart.";
         [self.view addSubview:lb]; return;
     }
+}
+// The game view, the pad and the frame-rate counter are made only now: the launcher may have changed the switches they and the host read (DM_SHOW_FPS, DM_OPMODE, ...)
+- (void)startGame {
+    if (self.game) return;
+    front_ios_preload();   // the host's early loading reads DM_FPS_TARGET / DM_RENDER_SCALE: started once the launcher has set them (main.m starts it at launch when there is no launcher)
     front_ios_audio_watch();
     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
     [self.view addSubview:self.game];
     g_layer = (CAMetalLayer *)self.game.layer;
+    if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
     self.pad = dm_gamepad_view(self.view.bounds);
     self.pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.pad];
     self.fps = front_ios_fps_label();   // above the pad, which hides while a controller is connected
     if (self.fps) [self.view addSubview:self.fps];
+    [self.view setNeedsLayout]; [self.view layoutIfNeeded];
+    UIApplication.sharedApplication.idleTimerDisabled = YES;
+    front_ios_boot();
 }
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
@@ -77,7 +94,13 @@ static UILabel *front_ios_fps_label(void);
         self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
     }
 }
-- (void)viewDidAppear:(BOOL)a { [super viewDidAppear:a]; UIApplication.sharedApplication.idleTimerDisabled = YES; front_ios_boot(); }
+- (void)viewDidAppear:(BOOL)a {
+    [super viewDidAppear:a];
+    if (self.launched || !front_ios_boot_ok()) return;
+    self.launched = YES;
+    if (dm_launcher_enabled()) { g_root = self; dm_show_launcher((__bridge void *)self, DM_GAME_FPS_TARGET, DM_GAME_RENDER_SCALE, DM_GAME_OPMODE, launcher_done); }
+    else [self startGame];
+}
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }   // Edge gestures need two swipes, to avoid accidental exits
 - (BOOL)prefersStatusBarHidden { return YES; }

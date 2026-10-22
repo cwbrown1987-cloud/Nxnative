@@ -22,6 +22,8 @@ gpu_timestamps	segment
 # patch_nso.py FRAME_STEP); 30 when 60 does not hold, game time = real time. DM_FPS_TARGET=30 (Documents/env.txt on the iPhone) saves power; 0 runs the game's own
 # interval controller (with the 60 fps cuts, which also serve while the game's VFR override is set)
 fps_target	60
+# the 3D views can be fixed at a fraction of their size (DM_RENDER_SCALE 0.5 to 1.0; the iOS launcher offers it)
+render_scale	on
 
 # ---- Versions ----
 # only the merged 1.9.0 copy is extracted; the base game's own build IDs are added when needed
