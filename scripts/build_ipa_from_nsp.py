@@ -15,8 +15,8 @@
 #   the iOS shaders' inputs are the shader package's content and the chain's own tools, so a split that runs again and writes the same package leaves them reused.
 # The shader translator is the in-repo dm/gfx/tools/dmsh_xlate_bin (the build whose fingerprints match dmsh_chain.lock; a rebuilt dll has different fingerprints and dmsh_build refuses it).
 # The Python running this file needs lz4, capstone and fonttools (and backports.zstd before Python 3.14); also needed: Xcode, xcodegen, .NET SDK 10, zstd, spirv-cross. A first run takes 2 (Metroid Dread) to 10 minutes (Breath of the Wild: 5 of them the shader split), longer when shader libraries must be compiled; a repeat run with unchanged inputs takes about 20 s (Metroid Dread), mostly packing the IPA. Key values are never printed.
-# The console shows one line per stage ([k/n] stage, with a bar, done/total, percent, elapsed time and ETA where the work can be counted); the tools' own output goes only to logs/ (PROGRESS / --progress).
-import ast, collections, ctypes, getpass, hashlib, os, re, shlex, shutil, struct, subprocess, sys, tempfile, threading, time, types, zlib
+# The console shows one line per stage ([k/n] stage, with a bar, done/total, percent, elapsed time and ETA where the work can be counted); the tools' own output goes only to logs/ (PROGRESS / --progress). --progress json writes newline-delimited JSON events to stdout.
+import ast, collections, ctypes, getpass, hashlib, json, os, re, shlex, shutil, struct, subprocess, sys, tempfile, threading, time, types, zlib
 from pathlib import Path
 
 # ---- Settings ----
@@ -39,7 +39,7 @@ HEAP_CHECK = True                       # a provisional profile whose game has v
 HEAP_CHECK_SECS = 30                    # the longest heap check (it stops at the first heap request, or HEAP_CHECK_NNMAIN_SECS into nnMain without one)
 HEAP_CHECK_NNMAIN_SECS = 5
 
-PROGRESS = 'auto'                       # stage lines on the console: 'bar' (one line per stage, redrawn in place), 'lines' (a plain line every BEAT seconds), 'off' (only each stage's start and end); 'auto' = bar in a terminal or Spyder, lines when the output goes to a file
+PROGRESS = 'auto'                       # 'auto' = bar in a terminal or Spyder, lines in a pipe; 'bar', 'lines', 'off' = stage lines; 'json' = newline-delimited events
 BEAT = 30                               # seconds between progress lines in 'lines' mode
 TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/local/share/dotnet', os.path.expanduser('~/.dotnet')]   # GUI apps such as Spyder do not get the shell's PATH
 
@@ -76,11 +76,12 @@ class Progress:
     """The console view of the build: one line per stage, "[k/n] stage · step", with a bar, done/total, percent, elapsed time and ETA when the work can be counted, else a spinner and the elapsed time.
     Modes: bar = the line is redrawn in place (a terminal, Spyder's console) and replaced by a ✓ line when the stage ends; lines = a plain line when a stage or step starts, every BEAT seconds and at the end
     (for output piped to a file); off = only each stage's start and end lines. Counters come from set(), or from a poll function that runs in a thread of its own (it may walk a big folder) and returns set()'s arguments.
-    Messages go through say(), which prints them above the live line"""
-    SPIN, BLOCKS, POLL = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏', ' ▏▎▍▌▋▊▉', 1.0
+    Messages go through say(), which prints them above the live line. json emits newline-delimited events instead, without a drawing ticker"""
+    SPIN, BLOCKS, POLL, JSON_INTERVAL = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏', ' ▏▎▍▌▋▊▉', 1.0, 0.5
 
     def __init__(self, mode='off'):
         self.mode, self.lock, self.k, self.n, self.cur, self.shown, self.ticker = mode, threading.RLock(), 0, 0, None, 0, None
+        self.tstop = None
 
     def plan(self, n):   # the next n stages are numbered 1..n
         with self.lock: self.k, self.n = 0, n
@@ -93,12 +94,15 @@ class Progress:
         with self.lock:
             self.end()
             self.k += 1; now = time.time()
-            self.cur = types.SimpleNamespace(name=name, step=step, unit='', total=None, done=None, est=False, note='', t0=now, hist=collections.deque(), beat=now, pstop=None)
-            if self.mode != 'bar': self._out(f'[{clock()}] [{self.k}/{self.n}] {name}' + (f' · {step}' if step else '') + ' …')
+            self.cur = types.SimpleNamespace(name=name, step=step, unit='', total=None, done=None, est=False, note='', t0=now, hist=collections.deque(), beat=now, pstop=None, jlast=None, jstate=None)
+            if self.mode == 'json':
+                self._json({'ev': 'stage', 'k': self.k, 'n': self.n, 'name': name, 'step': step, 't': round(now, 3)})
+            elif self.mode != 'bar': self._out(f'[{clock()}] [{self.k}/{self.n}] {name}' + (f' · {step}' if step else '') + ' …')
             self.set(**kw)
+            if self.mode in ('bar', 'lines') and not self.ticker:
+                self.tstop = stop = threading.Event()
+                self.ticker = threading.Thread(target=self._tick, args=(stop,), daemon=True); self.ticker.start()
         if poll: self.watch(poll)
-        if self.mode != 'off' and not self.ticker:
-            self.ticker = threading.Thread(target=self._tick, daemon=True); self.ticker.start()
 
     def watch(self, poll):
         """Call poll() over and over until the stage ends or watch() is called again (None: stop); poll returns set()'s arguments, or None to leave the line as it is"""
@@ -115,9 +119,11 @@ class Progress:
         with self.lock:
             st = self.cur
             if not st: return
-            if step is not None and step != st.step:
+            changed_step = step is not None and step != st.step
+            if changed_step:
                 st.step, st.done, st.total, st.unit, st.est, st.note, st.beat = step, None, None, '', False, '', time.time(); st.hist.clear()
                 if self.mode == 'lines': self._out(f'[{clock()}] [{self.k}/{self.n}] {st.name} · {step} …')
+                if self.mode == 'json': self._json({'ev': 'step', 'k': self.k, 'name': st.name, 'step': step})
             if unit is not None: st.unit = unit
             if total is not None: st.total = total
             if est is not None: st.est = est
@@ -125,6 +131,22 @@ class Progress:
             if done is not None:
                 st.done = done; now = time.time(); st.hist.append((now, done))
                 while len(st.hist) > 2 and st.hist[1][0] < now - 60: st.hist.popleft()   # the ETA follows the rate of the last minute
+            if self.mode == 'json': self._json_progress(st, force=changed_step)
+
+    def _json_progress(self, st, force=False):   # the caller holds the lock; lifecycle/metadata changes bypass count throttling
+        state = (st.step, st.total, st.unit, st.est, st.note, st.done)
+        if state == st.jstate: return
+        now = time.monotonic()
+        if not force and st.jstate is not None and state[:-1] == st.jstate[:-1] and now - st.jlast < self.JSON_INTERVAL: return
+        st.jlast, st.jstate = now, state
+        self._json({'ev': 'progress', 'k': self.k, 'name': st.name, 'step': st.step, 'done': st.done, 'total': st.total,
+                    'unit': st.unit, 'est': st.est, 'note': st.note,
+                    'frac': min(st.done / st.total, 0.99) if st.total and st.done is not None else None,
+                    'eta': self._eta(st), 'elapsed': round(time.time() - st.t0, 3)})
+
+    def _json(self, obj):   # one flushed JSON object per physical stdout line, including messages with embedded newlines
+        obj.setdefault('t', round(time.time(), 3))
+        print(json.dumps(obj, ensure_ascii=False, allow_nan=False), flush=True)
 
     def end(self, summary='', ok=True):
         """End the current stage with a ✓ (or ✗) line: its elapsed time and a summary"""
@@ -132,13 +154,22 @@ class Progress:
             st, self.cur = self.cur, None
             if not st: return
             if st.pstop: st.pstop.set()
+            if self.mode == 'json':
+                self._json_progress(st, force=True)   # flush the latest count, even when the stage ended inside the throttle interval
+                self._json({'ev': 'stage_end', 'k': self.k, 'name': st.name, 'ok': ok, 'summary': summary, 'elapsed': round(time.time() - st.t0, 3)})
+                return
             self._out(f'[{clock()}] {"✓" if ok else "✗"} [{self.k}/{self.n}] {st.name} ({hms(time.time() - st.t0)})' + (f': {summary}' if summary else ''))
 
     def say(self, msg):
-        with self.lock: self._out(msg)
+        with self.lock:
+            if self.mode == 'json': self._json({'ev': 'say', 'msg': msg})
+            else: self._out(msg)
 
-    def close(self, ok=True):   # end the current stage and stop drawing
-        with self.lock: self.end(ok=ok); self.mode = 'off'
+    def close(self, ok=True):   # preserve the output mode so diagnostics after closing are still JSON
+        with self.lock:
+            self.end(ok=ok)
+            if self.tstop: self.tstop.set()
+            self.ticker = self.tstop = None
 
     def _count(self, st):   # "1.9/~5.0 GB", "1,203/19,592 shaders", "2,301 files" (no total); '' without a count
         if st.done is None: return ''
@@ -183,10 +214,10 @@ class Progress:
         sys.stdout.write('\r' + line + ' ' * max(self.shown - len(line), 0)); sys.stdout.flush()
         self.shown = len(line)
 
-    def _tick(self):
-        while self.mode != 'off':
-            time.sleep(0.25 if self.mode == 'bar' and not in_ipython() else 1)   # Spyder's console gets fewer redraws
+    def _tick(self, stop):
+        while not stop.wait(0.25 if self.mode == 'bar' and not in_ipython() else 1):   # Spyder's console gets fewer redraws
             with self.lock:
+                if stop.is_set(): return   # close() may have stopped this ticker while it waited for the lock
                 st = self.cur
                 if not st: continue
                 try:
@@ -210,8 +241,8 @@ PROG = Progress()
 
 
 def progress_mode(want):   # auto: redraw in a terminal or in Spyder (IPython handles \r), plain lines when the output goes to a file or a pipe
-    if want in ('bar', 'lines', 'off'): return want
-    if want != 'auto': raise BuildError(f'PROGRESS / --progress must be auto, bar, lines or off: {want}')
+    if want in ('bar', 'lines', 'off', 'json'): return want
+    if want != 'auto': raise BuildError(f'PROGRESS / --progress must be auto, bar, lines, json or off: {want}')
     return 'bar' if in_ipython() or (sys.stdout and sys.stdout.isatty()) else 'lines'
 
 
@@ -260,6 +291,7 @@ def language_list(codes):
 
 
 def ask(prompt, what):   # what: what is missing, for the error message
+    if PROG.mode == 'json': raise BuildError(f'{what} not given: JSON mode does not prompt; give it on the command line (-h for usage)')
     if not in_ipython() and not (sys.stdin and sys.stdin.isatty()):
         raise BuildError(f'{what} not given and there is no keyboard input to ask for it: give it on the command line (-h for usage)')
     s = input(prompt).strip().strip('"').strip("'").replace('\\ ', ' ')   # dragged-in paths come quoted or with escaped spaces
@@ -283,6 +315,8 @@ def run(cmd, log, env=None, cwd=None, on_line=None):
         p.wait()
     except KeyboardInterrupt:
         p.terminate(); p.wait(); raise
+    finally:
+        p.stdout.close()
     if p.returncode:
         PROG.end(ok=False)
         PROG.say(f'---- last lines of {log} ----\n' + ''.join(tail).rstrip('\n'))
@@ -1196,7 +1230,7 @@ def parse_args(argv):
     ap.add_argument('--profile-out', help='where the provisional profile goes (default: <NSP folder>/<title ID>_build/profile)')
     ap.add_argument('--provisional', action='store_true', help='build from a provisional profile even when dm/games has one for the game (tests the guesses)')
     ap.add_argument('--no-heap-check', action='store_true', help='a provisional profile: skip the heap check on the Mac (the alias / heap split stays a guess)')
-    ap.add_argument('--progress', choices=('auto', 'bar', 'lines', 'off'), help='stage lines on the console: bar = one line per stage, redrawn in place; lines = a plain line every BEAT seconds; off = only each stage\'s start and end '
+    ap.add_argument('--progress', choices=('auto', 'bar', 'lines', 'json', 'off'), help='stage lines on the console: bar = one line per stage, redrawn in place; lines = a plain line every BEAT seconds; json = newline-delimited JSON events (no prompts); off = only each stage\'s start and end '
                     '(default: the PROGRESS setting; auto = bar in a terminal or Spyder, lines when the output goes to a file or a pipe)')
     return ap.parse_args(argv)
 
@@ -1207,13 +1241,13 @@ def main(args=None):
     global ALLOW_DAMAGED; ALLOW_DAMAGED = args.allow_damaged or ALLOW_DAMAGED
     here = Path(globals().get('__file__') or sys.argv[0]).resolve()
     repo = find_repo(here)
-    sys.path.insert(0, str(repo / 'dm/games')); import game as gamemod   # game profiles
-    global pg; import profile_guess as pg   # dm/games: a provisional profile's keys from the game files and from the heap check
-    sys.path.insert(0, str(repo / 'dm/tools')); global nacp; import nacp   # the game name in the NSP's control data
     nsp_dir = Path(os.path.expanduser(args.nsp_dir or NSP_DIR or ask('NSP folder: ', 'the NSP folder'))).resolve()
     keys = Path(os.path.expanduser(args.keys or PROD_KEYS or ask('path of prod.keys: ', 'prod.keys (-k)'))).resolve()
     if not nsp_dir.is_dir(): raise BuildError(f'not a folder: {nsp_dir}')
     if not keys.is_file(): raise BuildError(f'no such file: {keys}')
+    sys.path.insert(0, str(repo / 'dm/games')); import game as gamemod   # game profiles
+    global pg; import profile_guess as pg   # dm/games: a provisional profile's keys from the game files and from the heap check
+    sys.path.insert(0, str(repo / 'dm/tools')); global nacp; import nacp   # the game name in the NSP's control data
     lang_in = args.language or LANGUAGE   # checked against the game's languages once its control data is extracted
     want_lang = language_code(lang_in) if lang_in else 'en-US'
     if not want_lang: raise BuildError(f'unknown game language {lang_in!r}; give one of {language_list([c for c, _ in nacp.LANGUAGES])}, by code or by name')
@@ -1349,9 +1383,13 @@ def cli(argv):   # returns the exit code: 0 done, 1 error, 130 interrupted
     try:
         main(parse_args(argv))
     except BuildError as e:
-        PROG.close(ok=False); print(f'[RED] {e}', flush=True); return 1
+        PROG.close(ok=False); PROG.say(f'[RED] {e}'); return 1
     except KeyboardInterrupt:
-        PROG.close(ok=False); print('[RED] interrupted', flush=True); return 130
+        PROG.close(ok=False); PROG.say('[RED] interrupted'); return 130
+    except Exception as e:
+        PROG.close(ok=False)
+        if PROG.mode == 'json': PROG.say(f'[RED] {type(e).__name__}: {e}')
+        raise
     finally:
         PROG.close(ok=False)   # an unexpected error: end the stage line before the traceback
     return 0
