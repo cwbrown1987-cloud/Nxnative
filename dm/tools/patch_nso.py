@@ -1037,12 +1037,12 @@ for off, oid, ow, why in obs:
 # State page = the page after the key page (zero in the file, read-write in both loaders): +0 float target fps written by the loader (fps_target, DM_FPS_TARGET; 0 = every stub
 # runs the original instructions), +4 TOTK movie flag, +8 double lead (TOTK, below), +0x10 float render scale (TOTK, below), +0x18 double game seconds (TOTK, below),
 # +0x20 u32 step in vsyncs (host; 0 = not decided yet), +0x24 u32 a step the game fixes itself (BotW's VFR override; 0 = none), +0x28 u32 AoC's vsyncs per update, marked by
-# its first stub (0 = off), +0x30 u64 vsyncs stepped (the stubs; logged by the host to check the game's speed). Stub bodies assembled with clang
+# its first stub (0 = off), +0x30 u64 vsyncs stepped (the stubs; logged by the host to check the game's speed). BotW's further fields are described at its stubs. Stub bodies assembled with clang
 FRAME_STEP = {'277178b7dba1b6d4949a84778d4abc58', 'cd57b23fa4bbad65803d9788c01821ee', 'c3cf52bf2b05d7310884971b50bcccb8', '0effe4af1dec3a7966b934d4a7c3d2bf'}
 FS_STATE_OFF = 0
 if BUILD_ID in FRAME_STEP and NAME == 'main':
     FS_STATE_OFF = KEY_PAGE_OFF + 0x4000
-    assert not FAR and FS_STATE_OFF % 0x1000 == 0 and FS_STATE_OFF + 0x40 <= PATCH_OFF and not any(IMG[FS_STATE_OFF:]), 'frame step state page'
+    assert not FAR and FS_STATE_OFF % 0x1000 == 0 and FS_STATE_OFF + 0x50 <= PATCH_OFF and not any(IMG[FS_STATE_OFF:]), 'frame step state page'
     def fs_site(off, orig):
         ob = bytes.fromhex(orig)
         assert IMG[off:off + len(ob)] == ob, f'frame step original bytes mismatch {off:#x}: {bytes(IMG[off:off + len(ob)]).hex()}'
@@ -1259,6 +1259,49 @@ if FS_STATE_OFF and BUILD_ID == 'cd57b23fa4bbad65803d9788c01821ee':
         emit(w)
     emit(B(here(), 0xc617c4))
     fs_put(0xc617c0, [B(0xc617c0, start)], 'RootHeap size = the host\'s (state page +0x8; 0 = the game\'s 0xc1000000)')
+    # Output size (state +0x40 u64 width | height << 32 and +0x48 float width, written by the loader at a render scale above 1.2; 0 = the game's 1920x1080). Docked, the game composes
+    # each frame into 1920x1080 display buffers whatever its 3D views render at, so a larger render scale was only supersampled down to 1080p. The size is a global (main+0x1e43dc0,
+    # set at three guarded inits, from which the window and its display buffers are made); the docked mode (main+0x12660bc) sets the output width (+0x1210, the divisor of the view
+    # scale above, so the 3D views stay at render scale x 1600), the system's render size (main+0x106dc70) and the window crop (main+0xe9af58). All four take the host's size; the
+    # handheld mode keeps 1280x720. Each stub only rewrites the register the site is setting (x4 at the crop holds the height, set just before)
+    for site in (0xc61ef4, 0xc61f28, 0x12618c4):
+        fs_site(site, '0987c0f2')
+        start = here(); emit(ADRP(9, here(), FS_STATE_OFF))
+        for w in (0xf9402129,   # ldr x9,[x9,#0x40]      the host's size
+                  0xb5000069,   # cbnz x9,+3
+                  0xd280f009,   # mov x9,#0x780          the game's 1920x1080
+                  0xf2c08709):  # movk x9,#0x438,lsl #32
+            emit(w)
+        emit(B(here(), site + 4))
+        fs_put(site, [B(site, start)], 'output size global = the host\'s (state page +0x40; 0 = 1920x1080)')
+    fs_site(0x12660cc, '680a09f9'); fs_site(0x12660d4, '0887c0f2'); fs_site(0x1266104, '03f08052')
+    start = here()
+    emit(0xf9090a68)            # str x8,[x19,#0x1210]   the game's widths (1920.0, base 1600.0)
+    emit(ADRP(8, here(), FS_STATE_OFF))
+    for w in (0xb9404908,       # ldr w8,[x8,#0x48]      the host's width (float)
+              0x34000048,       # cbz w8,+2
+              0xb9121268):      # str w8,[x19,#0x1210]
+        emit(w)
+    emit(B(here(), 0x12660d0))
+    fs_put(0x12660cc, [B(0x12660cc, start)], 'docked output width = the host\'s (state page +0x48; 0 = 1920.0)')
+    start = here(); emit(ADRP(8, here(), FS_STATE_OFF))
+    for w in (0xf9402108,       # ldr x8,[x8,#0x40]
+              0xb5000068,       # cbnz x8,+3
+              0xd280f008,       # mov x8,#0x780
+              0xf2c08708):      # movk x8,#0x438,lsl #32
+        emit(w)
+    emit(B(here(), 0x12660d8))
+    fs_put(0x12660d4, [B(0x12660d4, start)], 'docked render size = the host\'s output size')
+    start = here(); emit(ADRP(3, here(), FS_STATE_OFF))
+    for w in (0xf9402063,       # ldr x3,[x3,#0x40]
+              0xb4000083,       # cbz x3,+4
+              0xd360fc64,       # lsr x4,x3,#32          height
+              0x2a0303e3):      # mov w3,w3              width
+        emit(w)
+    emit(B(here(), 0x1266108))
+    emit(0x5280f003)            # mov w3,#0x780          the game's crop
+    emit(B(here(), 0x1266108))
+    fs_put(0x1266104, [B(0x1266104, start)], 'docked window crop = the host\'s output size')
     # Variable frame time (state +0x28, float, written by the host each frame when the cap is above 60, see hle_nvn.c vstep_tick; 0 = off): VFR::updateInterval turns the interval
     # into the frame's step in 1/30 s units (interval / [+0x150], 2: 0.5 at 60 fps), keeps it at +0x30 and publishes it at +0x3c, which the per-core steps (main+0x151d7e8) and the
     # game's systems read. The host's step (the time the last frame took, clamped) replaces it there, except while the game's own override is set (cutscenes keep their steps).

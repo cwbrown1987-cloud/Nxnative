@@ -203,7 +203,7 @@ static void read_layout(module_t *m, const char *dir) {
 // (hle_nvn.c fstep_tick)
 uint8_t *dm_fps_state;
 static void install_fps_state(module_t *m) {
-    if (m->fps_state_off + 0x40 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
+    if (m->fps_state_off + 0x50 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
     const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
     if (t != 0 && t != 30 && t != 60 && !(t > 60 && t <= 240)) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30, 60 or 61 to 240; using the game's own frame step", e); t = 0; }
     float f = (float)t; dm_fps_state = m->base + m->fps_state_off; memcpy(dm_fps_state, &f, sizeof f);
@@ -216,6 +216,11 @@ static void install_fps_state(module_t *m) {
     float sq = sc * sc; uint32_t pool = sc > 1.0f ? (uint32_t)sq + (sq > (float)(uint32_t)sq) : 0; memcpy(dm_fps_state + 0x2c, &pool, sizeof pool);
     uint64_t dm_mem_extra(void); uint64_t heap = pool ? 0xc3000000ull + dm_mem_extra() : 0, root = pool ? 0xc1000000ull + dm_mem_extra() : 0;
     memcpy(dm_fps_state + 0x38, &heap, sizeof heap); memcpy(dm_fps_state + 0x8, &root, sizeof root);   // nninitStartup's heap and the RootHeap in it (Breath of the Wild's stubs at main+0x71c and main+0xc617c0)
+    // Where the views outgrow the game's 1920x1080 output (base 1600 x the factor), the output takes their size, so the frame is composed and shown at it rather than scaled down
+    // (Breath of the Wild's stubs at main+0x1e43dc0's inits and its docked mode): +0x40 width | height << 32, +0x48 the width as a float
+    uint32_t ow = pool && sc * 1600.0f > 1920.5f ? ((uint32_t)(sc * 1600.0f + 0.5f) + 1) & ~1u : 0, oh = ow ? ((uint32_t)(sc * 900.0f + 0.5f) + 1) & ~1u : 0;
+    uint64_t osz = (uint64_t)oh << 32 | ow; float owf = (float)ow; memcpy(dm_fps_state + 0x40, &osz, sizeof osz); memcpy(dm_fps_state + 0x48, &owf, sizeof owf);
+    if (ow) LOG("%s: output %ux%u (DM_RENDER_SCALE %.2f)", m->name, ow, oh, sc);
     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
     LOG("%s: frame step %s%s (%s)", m->name, !t ? "as the game sets it" : t > 60 ? "variable, the time each frame took (the game's own interval logic is not used)" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
 }
