@@ -70,10 +70,17 @@ typedef struct { uint32_t op, nobj; uint64_t a[15]; } rec_t;   // the first nobj
 enum { REC_BLK = 256 };
 typedef struct rec_blk { struct rec_blk *next; int n; rec_t r[REC_BLK]; } rec_blk;
 
+// On by default on iOS: Breath of the Wild on an iPhone 17 Pro Max (handheld, the Great Plateau) took about 8 ms of submit thread per frame without it and 3.3–4.5 ms with it
 static int g_rec = -1;
 static inline int rec_on(void) {
     if (__builtin_expect(g_rec >= 0, 1)) return g_rec;
-    const char *e = getenv("DM_NVN_ENC_THREAD"); g_rec = e && atoi(e) > 0; if (g_rec) MLOG("DM_NVN_ENC_THREAD=1: Metal encoding runs on its own thread");
+    const char *e = getenv("DM_NVN_ENC_THREAD");
+#if TARGET_OS_IPHONE
+    g_rec = !e || atoi(e) > 0;
+#else
+    g_rec = e && atoi(e) > 0;
+#endif
+    if (g_rec) MLOG("Metal encoding runs on its own thread (DM_NVN_ENC_THREAD=0 turns it off)");
     return g_rec;
 }
 static pthread_mutex_t g_rb_mu = PTHREAD_MUTEX_INITIALIZER;
