@@ -208,10 +208,14 @@ static void install_fps_state(module_t *m) {
     if (t != 0 && t != 30 && t != 60 && !(t > 60 && t <= 240)) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30, 60 or 61 to 240; using the game's own frame step", e); t = 0; }
     float f = (float)t; dm_fps_state = m->base + m->fps_state_off; memcpy(dm_fps_state, &f, sizeof f);
     // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880): 1.0 keeps the game's own size and dynamic resolution;
-    // another factor fixes the size at that fraction (DM_RENDER_SCALE, 0.5 to 1.0). Independent of the frame step: written at target 0 too
+    // another factor fixes the size at that multiple (DM_RENDER_SCALE, 0.5 to 3.0; above 1.0 only for a profile with render_pool, whose pool and heaps the stubs grow: Breath of the Wild 1.6 = 2560×1440, 2.4 = 3840×2160). Independent of the frame step: written at target 0 too
     const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f;
-    if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= 1.0f)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to 1.0; keeping the game's size", rs); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", m->name, sc); }
+    if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= (DM_GAME_RENDER_POOL ? 3.0f : 1.0f))) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to 3.0 (above 1.0 with a render_pool profile); keeping the game's size", rs); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", m->name, sc); }
     memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
+    // Above 1.0 the game's render buffer pool grows by the factor's square, rounded up (Breath of the Wild's stub at main+0x106d328; its 115 MB held up to about 1.3)
+    float sq = sc * sc; uint32_t pool = sc > 1.0f ? (uint32_t)sq + (sq > (float)(uint32_t)sq) : 0; memcpy(dm_fps_state + 0x2c, &pool, sizeof pool);
+    uint64_t dm_mem_extra(void); uint64_t heap = pool ? 0xc3000000ull + dm_mem_extra() : 0, root = pool ? 0xc1000000ull + dm_mem_extra() : 0;
+    memcpy(dm_fps_state + 0x38, &heap, sizeof heap); memcpy(dm_fps_state + 0x8, &root, sizeof root);   // nninitStartup's heap and the RootHeap in it (Breath of the Wild's stubs at main+0x71c and main+0xc617c0)
     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
     LOG("%s: frame step %s%s (%s)", m->name, !t ? "as the game sets it" : t > 60 ? "variable, the time each frame took (the game's own interval logic is not used)" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
 }

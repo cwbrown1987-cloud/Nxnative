@@ -1226,6 +1226,39 @@ if FS_STATE_OFF and BUILD_ID == 'cd57b23fa4bbad65803d9788c01821ee':
         emit(w)
     emit(B(here(), 0x151d3d4))
     fs_put(0x151d3d0, [B(0x151d3d0, start)], 'VFR::updateInterval: its own override published for the host (state page target fps; 0 = original)')
+    # Render buffer pool (state +0x2c, u32 written by the loader: DM_RENDER_SCALE above 1.0 → ceil(scale²), 0 = as is). gsys's render buffers (the scene's colour, depth, G-buffer
+    # and reduced buffers, gsys::RenderBufferContext) come from two 115 MB pools the graphics system makes at start (main+0xed5e70: a compressible texture pool and a virtual range
+    # for it), sized by the system's config +0x28, read from [x19+0x4d8] at main+0x106d328. At a render scale above about 1.3 the buffers no longer fitted: an allocation came back
+    # empty and RenderBufferContext crashed (main+0xed7128). The size is multiplied by the factor. x10 and x11 are dead there (x8 and x9 are stored next)
+    fs_site(0x106d328, '686e42f9')
+    start = here(); emit(ADRP(10, here(), FS_STATE_OFF))
+    for w in (0xb9402d4b,   # ldr w11,[x10,#0x2c]    pool factor
+              0xf9426e68,   # ldr x8,[x19,#0x4d8]    the pool size
+              0x3400004b,   # cbz w11,+2             no factor
+              0x9b0b7d08):  # mul x8,x8,x11
+        emit(w)
+    emit(B(here(), 0x106d32c))
+    fs_put(0x106d328, [B(0x106d328, start)], 'render buffer pool size × the host factor (state page +0x2c; 0 = the game\'s 115 MB)')
+    # The heap the render buffer pool and the rest of the game share (state +0x38, u64 written by the loader with the larger pool, 0 = as is): nninitStartup sets a fixed 0xc3000000
+    # (3.05 GB, main+0x71c) whatever memory the system reports, so a larger pool (and the memory the host adds for it, hle_svc.c mem_extra) left PlacementMgr's 328 MB heap without room
+    fs_site(0x71c, '0060b852')
+    start = here(); emit(ADRP(16, here(), FS_STATE_OFF))
+    for w in (0xf9401e00,   # ldr x0,[x16,#0x38]     the host's heap size
+              0xb5000040,   # cbnz x0,+2
+              0x52b86000):  # mov w0,#0xc3000000     the game's
+        emit(w)
+    emit(B(here(), 0x720))
+    fs_put(0x71c, [B(0x71c, start)], 'nninitStartup heap size = the host\'s (state page +0x38; 0 = the game\'s 0xc3000000)')
+    # The RootHeap inside it is fixed too (0xc1000000, 32 MB less, made at main+0xc617c0): with the larger pool gsys::SystemTask and KingSystem grew inside a RootTask of the same
+    # size, and PlacementMgr found no room for its 328 MB. It grows by what the heap grows (state +0x8, u64 written by the loader; 0 = as is). x9 is dead there
+    fs_site(0xc617c0, '0820b852')
+    start = here(); emit(ADRP(9, here(), FS_STATE_OFF))
+    for w in (0xf9400528,   # ldr x8,[x9,#0x8]       the host's RootHeap size
+              0xb5000048,   # cbnz x8,+2
+              0x52b82008):  # mov w8,#0xc1000000     the game's
+        emit(w)
+    emit(B(here(), 0xc617c4))
+    fs_put(0xc617c0, [B(0xc617c0, start)], 'RootHeap size = the host\'s (state page +0x8; 0 = the game\'s 0xc1000000)')
     # Variable frame time (state +0x28, float, written by the host each frame when the cap is above 60, see hle_nvn.c vstep_tick; 0 = off): VFR::updateInterval turns the interval
     # into the frame's step in 1/30 s units (interval / [+0x150], 2: 0.5 at 60 fps), keeps it at +0x30 and publishes it at +0x3c, which the per-core steps (main+0x151d7e8) and the
     # game's systems read. The host's step (the time the last frame took, clamped) replaces it there, except while the game's own override is set (cutscenes keep their steps).
@@ -1248,7 +1281,7 @@ if FS_STATE_OFF and BUILD_ID == 'cd57b23fa4bbad65803d9788c01821ee':
     # shader ratio uking_dynamic_resolution_ratio and the other readers (main+0xc3c3f4, an LOD check at main+0x14126b4). Setting s8 there keeps them all consistent (a multiply in the
     # size function, TOTK's way, would leave the ratio and those readers at the old scale). The apply block runs only when the dynamic path has just recomputed the scale (+0x280 bit 4,
     # set at main+0x1266830) or in a forced mode, else main+0x126686c skips it; with a factor it is taken every frame, as in the dynamic mode, so the factor holds with dynamic
-    # resolution off too. Factors above 1.0 are refused by the loader: the per-frame texture pool's size is unknown. x8, s0, s1 and the flags are dead at both sites
+    # resolution off too. Factors above 1.0 grow the render buffer pool and the heaps around it (below). x8, s0, s1 and the flags are dead at both sites
     fs_site(0x1266880, '88ae40f9'); fs_site(0x126686c, struct.pack('<I', B(0x126686c, 0x1266950)).hex())
     apply = here(); emit(ADRP(8, here(), FS_STATE_OFF))
     for w in (0xbd401100,   # ldr s0,[x8,#0x10]      render scale

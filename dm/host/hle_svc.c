@@ -15,7 +15,8 @@
 // about 4.2 GB in total; on iOS without the "extended virtual addressing" entitlement a single reservation can be at most 6 GB
 // (read on a real device: 6 GB succeeds, 7 GB fails), so it cannot be made any wider --
 // with an 8 GB reservation, builds from developer accounts that cannot sign that entitlement (free accounts) would exit at this step.
-#define RESERVE DM_GAME_MEM_RESERVE   // SMBW: the heap needs only 1.47 GB, so the block stays at 5 GB (the total proven on a real device; a single 6 GB block can be reserved, but Metal etc. still need address space)
+static uint64_t g_mem_extra;   // memory added for a larger render buffer pool (mem_extra)
+#define RESERVE (DM_GAME_MEM_RESERVE + 2 * g_mem_extra)   // SMBW: the heap needs only 1.47 GB, so the block stays at 5 GB (the total proven on a real device; a single 6 GB block can be reserved, but Metal etc. still need address space)
 static uint8_t *g_as;              // ASLR region base = the whole block
 static uint8_t *g_heap; static size_t g_heap_cur, g_heap_cap;
 // The address range lies entirely within the currently opened (readable and writable) part of the guest heap: such reads need no kernel trap to check, memcpy directly (used where guest memory is read every tick, such as diag.c tk_rd)
@@ -27,8 +28,20 @@ static uint8_t *g_stack; static size_t g_stack_cap;
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < RESERVE; }
 
 static void *alias_windows_thread(void *arg);
+// A render scale above 1.0 (DM_RENDER_SCALE, profile render_scale / render_pool): the game's render buffer pool grows by the factor's square rounded up (Breath of the Wild's stub at
+// main+0x106d328), taken from the same application memory the rest of the game shares: Breath of the Wild's PlacementMgr then got no heap and crashed. The application pool, the alias region
+// (where its virtual buffer range lives) and the reserved address space grow by what the pool adds, plus 64 MB
+static uint64_t mem_extra(void) {
+    const char *e = getenv("DM_RENDER_SCALE"); if (!e || !DM_GAME_RENDER_POOL) return 0;
+    float s = strtof(e, NULL); if (!(s > 1.0f && s <= 3.0f)) return 0;
+    float sq = s * s; uint64_t f = (uint64_t)sq + (sq > (float)(uint64_t)sq);
+    return ((f - 1) * DM_GAME_RENDER_POOL + (64ull << 20) + 0x1fffff) & ~0x1fffffull;
+}
+uint64_t dm_mem_extra(void) { return mem_extra(); }   // loader.c: the larger heap the game is asked to make
 static void mem_init(void) {
     if (g_as) return;
+    g_mem_extra = mem_extra();
+    if (g_mem_extra) LOG("[mem] render scale %s: %.0f MB more application memory for the render buffer pool", getenv("DM_RENDER_SCALE"), g_mem_extra / 1048576.0);
     g_as = mmap(NULL, RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (g_as == MAP_FAILED) die("reserve guest AS");
     // Fixed partition (all inside the reserved block): alias 2.875 GB, stack 256 MB, heap the remaining 1.625 GB.
@@ -37,7 +50,7 @@ static void mem_init(void) {
     //   and resource loading then MapPhysicalMemory's into the alias region after the node area on demand. With a 1.25 GB alias region only about 256 MB was left there, and 3 MB-class layout archives (WipeCourseIn / WipeWarp)
     //   got no address, were skipped, and crashed on a null pointer when used (main +0x373e04). So alias = node area + 1.75 GB + slack; the heap needs only 1.47 GB, and 2.625 GB is plenty.
     // The alias and stack sizes come from the game profile (mem_alias / mem_stack), the heap takes the rest; Mario: alias 0xB8000000, stack 0x10000000 → stack at +0xC8000000, heap at +0xD8000000
-    g_alias = g_as + 0x10000000; g_alias_cap = DM_GAME_MEM_ALIAS;
+    g_alias = g_as + 0x10000000; g_alias_cap = DM_GAME_MEM_ALIAS + g_mem_extra;
     g_stack = g_alias + g_alias_cap; g_stack_cap = DM_GAME_MEM_STACK;
     g_heap  = g_stack + g_stack_cap; g_heap_cap  = RESERVE - (size_t)(g_heap - g_as);
     if (!(g_alias_bits = calloc((g_alias_cap >> 18) + 1, sizeof *g_alias_bits))) die("alias region page bitmap calloc");
@@ -50,7 +63,7 @@ static void mem_init(void) {
 // and hands the whole block to its own StandardAllocator (main+0x32137a0) -- so heap size = pool − image footprint, it has only as much as the host reports.
 // Previously 3 GB was reported here and SetHeapSize never failed: the heap was about 150 MB smaller than on the real device, at the run entry peak the main heap had only about 18 MB left, and under high local load a timing shift made a 128 KB request return null,
 // which the guest writes to without a null check (CRASH main+0x1b36138, re-verified after merge with inv_tap).
-#define APP_POOL DM_GAME_APP_POOL   // game profile app_pool (Mario 0xCD500000)
+#define APP_POOL (DM_GAME_APP_POOL + g_mem_extra)   // game profile app_pool (Mario 0xCD500000)
 static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) n += g_mod[i].size; return (n + 0x1fffff) & ~(size_t)0x1fffff; }
 // Giant bss (modules with the patch area before the base, patch_nso.py FAR): the image bytes beyond the file part. Used memory was reported as "heap + 64 MB", where the 64 MB covers ordinary modules' code and data (Mario's two modules are about 74 MB together,
 // and the heap it opens = pool − 64 MB − 1.75 GB virtual address memory − 1 MB = 0x5be00000, as on hardware); Metroid Dread's main has about 1.8 GB of bss, the engine's static heap, which the Switch counts as used;

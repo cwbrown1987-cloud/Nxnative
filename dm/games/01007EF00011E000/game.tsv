@@ -24,6 +24,7 @@ gpu_timestamps	segment
 fps_target	60
 # the 3D views can be fixed at a fraction of their size (DM_RENDER_SCALE 0.5 to 1.0; the iOS launcher offers it)
 render_scale	on
+render_pool	0x7300000
 
 # ---- Versions ----
 # only the merged 1.9.0 copy is extracted; the base game's own build IDs are added when needed

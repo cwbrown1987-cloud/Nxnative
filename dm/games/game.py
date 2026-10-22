@@ -142,6 +142,7 @@ def header(g):
          f'#define DM_GAME_MEM_ALIAS {g.int("mem_alias"):#x}ull',
          f'#define DM_GAME_MEM_STACK {g.int("mem_stack"):#x}ull',
          f'#define DM_GAME_APP_POOL {g.int("app_pool"):#x}ull',
+         f'#define DM_GAME_RENDER_POOL {int(g.get("render_pool", "0"), 0):#x}ull',   # the game's render buffer pool, which grows by the render scale squared above 1.0 (hle_svc.c mem_extra)
          f'#define DM_GAME_MEM_USED {int(g.get("mem_used", "0x4000000"), 0):#x}ull',   # used memory reported beside the heap (hle_svc.c GetInfo UsedMemorySize)
          f'#define DM_GAME_SYS_RESOURCE {int(g.get("sys_resource", "0x2000000"), 0):#x}ull',   # the NPDM's system resource size (hle_svc.c GetInfo TotalSystemResourceSize; 0 = no virtual address memory)
          f'#define DM_GAME_ARGS {q(g.get("game_args", ""))}',   # game arguments when the command line gives none (main.c; Octopath Traveler 0: Unreal's -SwitchVirtualAddressSpaceSize=)
