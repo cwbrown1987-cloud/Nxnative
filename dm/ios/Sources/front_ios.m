@@ -70,6 +70,7 @@ static void launcher_done(void) { [g_root startGame]; }
     if (self.game) return;
     front_ios_preload();   // the host's early loading reads DM_FPS_TARGET / DM_RENDER_SCALE: started once the launcher has set them (main.m starts it at launch when there is no launcher)
     front_ios_audio_watch();
+    if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) setenv("MTL_HUD_ENABLED", "1", 0);   // Metal reads it when the game view makes its device
     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
     [self.view addSubview:self.game];
     g_layer = (CAMetalLayer *)self.game.layer;
