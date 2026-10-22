@@ -261,6 +261,11 @@ Game Freak's Trinity engine on SDK 19 (NVN 55); every shader comes from the Oodl
 | `DM_NVN_GPU_TS=segment` / `submission` | What timestamp reports record, instead of the profile's `gpu_timestamps`: the GPU start / end of the segment holding each report, or one time for the whole submission |
 | `DM_NVN_DISPATCH_OWN=1` | Every compute dispatch in a compute encoder of its own with full barriers, as before (by default dispatches share the copy encoder, `dispatch_enc`) |
 | `DM_NVN_VCONV_CPU=1` | Integer vertex inputs fed formats of another class are converted on the CPU, as before (by default the shader's `<key>_bv` library takes them through shadow inputs, `vin_on`) |
+| `DM_NVN_GPUPROF=f` or `f1-f2` | GPU start and duration of every encoder of those frames, from Metal 4 counter heap timestamps (`[gpuprof]` lines: kind, size, attachments, draws, command-buffer segment; a `frame` line with render and compute / copy time and the span from first start to last end) |
+| `DM_NVN_ENC_THREAD=1` | Metal encoding on a thread of its own: the submit thread records the encoder calls and a worker replays them (`nvn_rec.h`); off by default |
+| `DM_NVN_UB_LAZY=n` | The most deferred inline uniform updates kept across a render pass end (default 160): they land before the next pass that can read them (a page filter of the updated blocks) instead of at every pass end; 0 lands them at every pass end, as before |
+| `DM_NVN_UB_COPY_THREAD=0` | Uniform shadows of 512 bytes or more are copied on the submit thread, as before (by default a worker copies them) |
+| `DM_GPU_KEEPALIVE=0` / `1` / `2` | GPU filler work that keeps macOS from lowering the GPU clock: off, only the gaps between submissions (at most `DM_GPU_KEEPALIVE_MS`, default 2), or all the time (the default on macOS; off on iOS). Apple's HUD counts the filler as the app's GPU time |
 | `MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=nslog` | Metal validation without aborting |
 
 A first-frame bring-up that worked for Mario: screenshot is black → `TEXDUMP` shows which targets have content → `PASSDUMP` the pass that writes the window → `HILITE` its fragment shader → `CBDUMP` its uniforms → read the translated `.metal` of its vertex shader.
