@@ -778,41 +778,60 @@ def patch_files(repo, exe_dir, mods):
     return [p for p in [repo / 'dm/tools/sdk_patches.py'] + sorted((repo / 'dm/games').glob('*/patches.py')) if any(i in p.read_text(errors='replace') for i in ids)]
 
 
+def collect_nros(py, repo, romfs, dst, env, logs):
+    """The NROs a game registers in NRR files (RomFS *.nrr) and loads at run time with nn::ro, found by their SHA-256 as loose files or inside the RomFS's archives (dm/tools/nro_collect.py):
+    {module name: NRO path}, {} for a game without NRRs. The host maps their rewritten copies at start and loads one when the game asks (loader.c "NRO modules"; Super Smash Bros. Ultimate:
+    98 in data.arc, about 3 minutes to find). Reused while the NRRs and the RomFS's file sizes are as at the last collection and nro_collect.py is unchanged"""
+    nrrs = sorted(p for p in romfs.rglob('*.nrr') if p.is_file())   # Super Smash Bros. Ultimate keeps them in a folder named .nrr
+    if not nrrs: return {}
+    kf = dst.with_name(dst.name + '.key')
+    key = fingerprint(('files', nrrs + [repo / 'dm/tools/nro_collect.py']), ('tree', romfs))
+    if not ((dst / 'nro.tsv').is_file() and reused(kf, key) is not None):
+        tmp = dst.with_name(dst.name + '.partial'); rmtree(tmp)
+        PROG.set(step=f'finding the NROs {len(nrrs)} NRR files register')
+        run([py, repo / 'dm/tools/nro_collect.py', romfs, tmp], logs / 'nro_collect.log', env=env)
+        rmtree(kf); swap_in(tmp, dst); kf.write_text(f'{key}\n')
+    return {l.split('\t')[0]: dst / (l.split('\t')[0] + '.nro') for l in (dst / 'nro.tsv').read_text().splitlines() if l and not l.startswith('#')}
+
+
 def rewrite(py, repo, exe_dir, out, env, logs, g):
-    """patch_nso.py on every code module at once (each writes its own <module>.* files, all the same build_src.sha256 line), each with its log.
-    Reused when the modules, patch_nso.py (with nso_code.py, nso_asm.py and the patch files of their builds), its switch and capstone are as at the last successful rewrite
-    (Monster Hunter Rise's main alone takes 5.5 min)"""
+    """patch_nso.py on every code module (each writes its own <module>.* files, all the same build_src.sha256 line), each with its log, as many at once as the Mac has cores.
+    The modules are the profile's and the NROs the game registers (collect_nros; nro.tsv beside them lists those). Reused when the modules, patch_nso.py (with nso_code.py, nso_asm.py
+    and the patch files of their builds), its switch and capstone are as at the last successful rewrite (Monster Hunter Rise's main alone takes 5.5 min)"""
     import capstone
     mods = g.words('modules')
     PROG.stage('rewrite', step='checking the inputs')
+    nros = collect_nros(py, repo, exe_dir.parent / 'RomFS', out.with_name(out.name.replace('patched_', 'nro_')), env, logs)
+    src = {m: exe_dir / m for m in mods} | nros
+    names = list(src)
     kf = out.with_name(out.name + '.key')
-    key = fingerprint(('files', [repo / 'dm/tools' / f for f in ('patch_nso.py', 'nso_code.py', 'nso_asm.py')] + patch_files(repo, exe_dir, mods) + [exe_dir / m for m in mods]), mods, capstone.__version__,
+    key = fingerprint(('files', [repo / 'dm/tools' / f for f in ('patch_nso.py', 'nso_code.py', 'nso_asm.py')] + patch_files(repo, exe_dir, mods) + list(src.values())), names, capstone.__version__,
                       {k: env.get(k) for k in ('DM_PATCH_FRONT',)})
-    if all((out / f'{m}.patched.bin').is_file() for m in mods) and reused(kf, key) is not None:
-        PROG.end(f'{", ".join(mods)}, reused (inputs unchanged)'); return
+    if all((out / f'{m}.patched.bin').is_file() for m in names) and reused(kf, key) is not None:
+        PROG.end(f'{", ".join(mods)}{f" and {len(nros)} NROs" if nros else ""}, reused (inputs unchanged)'); return
     tmp = out.with_name(out.name + '.partial'); rmtree(tmp); tmp.mkdir(parents=True); logs.mkdir(parents=True, exist_ok=True)
-    PROG.set(step=', '.join(mods), done=0, total=len(mods), unit='modules')
-    procs, logf = {}, {}
+    if nros: shutil.copyfile(next(iter(nros.values())).parent / 'nro.tsv', tmp / 'nro.tsv')
+    PROG.set(step=', '.join(mods) + (f' and {len(nros)} NROs' if nros else ''), done=0, total=len(names), unit='modules')
+    procs, logf, todo, cores = {}, {}, list(names), max(2, os.cpu_count() or 4)
     try:
-        for m in mods:
-            logf[m] = open(logs / f'rewrite_{m}.log', 'w')
-            procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(exe_dir / m), str(tmp), m], env=env, stdout=logf[m], stderr=subprocess.STDOUT)
-        left = list(mods)
-        while left:
-            for m in [m for m in left if procs[m].poll() is not None]:
-                left.remove(m); PROG.set(done=len(mods) - len(left))
-                if procs[m].returncode:
-                    log = logs / f'rewrite_{m}.log'; logf[m].close()
+        while todo or procs:
+            while todo and len(procs) < cores:
+                m = todo.pop(0); logf[m] = open(logs / f'rewrite_{m}.log', 'w')
+                procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(src[m]), str(tmp), m], env=env, stdout=logf[m], stderr=subprocess.STDOUT)
+            for m in [m for m in procs if procs[m].poll() is not None]:
+                p = procs.pop(m); logf[m].close(); PROG.set(done=len(names) - len(todo) - len(procs))
+                if p.returncode:
+                    log = logs / f'rewrite_{m}.log'
                     PROG.end(ok=False)
                     PROG.say(f'---- last lines of {log} ----\n' + ''.join(collections.deque(open(log, errors='replace'), maxlen=40)).rstrip('\n'))
-                    raise BuildError(f'patch_nso.py exit code {procs[m].returncode} on {m} (full output: {log})')
+                    raise BuildError(f'patch_nso.py exit code {p.returncode} on {m} (full output: {log})')
             time.sleep(0.2)
     finally:   # an error or an interrupt stops the other rewrites
         for p in procs.values():
             if p.poll() is None: p.terminate(); p.wait()
         for f in logf.values(): f.close()
     rmtree(kf); swap_in(tmp, out); kf.write_text(f'{key}\n')
-    PROG.end(', '.join(mods))
+    PROG.end(', '.join(mods) + (f' and {len(nros)} NROs' if nros else ''))
 
 
 GLSLC_SECS = 30   # the longest capture run: Three Houses compiles its 9 shaders within 1.2 s of boot, and the run stops as soon as every file the profile names is there
