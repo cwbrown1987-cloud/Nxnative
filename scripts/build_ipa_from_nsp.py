@@ -765,12 +765,12 @@ def build_mismatch(d, name, g):   # the modules of an extraction whose build ID 
 
 def rewrite(py, repo, exe_dir, out, env, logs, g):
     """patch_nso.py on every code module at once (each writes its own <module>.* files, all the same build_src.sha256 line), each with its log.
-    Reused when the modules, patch_nso.py (with nso_code.py), its switch and capstone are as at the last successful rewrite (Monster Hunter Rise's main alone takes 5.5 min)"""
+    Reused when the modules, patch_nso.py (with nso_code.py, nso_asm.py and the profiles' patches.py), its switch and capstone are as at the last successful rewrite (Monster Hunter Rise's main alone takes 5.5 min)"""
     import capstone
     mods = g.words('modules')
     PROG.stage('rewrite', step='checking the inputs')
     kf = out.with_name(out.name + '.key')
-    key = fingerprint(('files', [repo / 'dm/tools/patch_nso.py', repo / 'dm/tools/nso_code.py'] + [exe_dir / m for m in mods]), mods, capstone.__version__, {k: env.get(k) for k in ('DM_PATCH_FRONT',)})
+    key = fingerprint(('files', [repo / 'dm/tools/patch_nso.py', repo / 'dm/tools/nso_code.py', repo / 'dm/tools/nso_asm.py', repo / 'dm/games/sdk_patches.py'] + sorted((repo / 'dm/games').glob('*/patches.py')) + [exe_dir / m for m in mods]), mods, capstone.__version__, {k: env.get(k) for k in ('DM_PATCH_FRONT',)})
     if all((out / f'{m}.patched.bin').is_file() for m in mods) and reused(kf, key) is not None:
         PROG.end(f'{", ".join(mods)}, reused (inputs unchanged)'); return
     tmp = out.with_name(out.name + '.partial'); rmtree(tmp); tmp.mkdir(parents=True); logs.mkdir(parents=True, exist_ok=True)
