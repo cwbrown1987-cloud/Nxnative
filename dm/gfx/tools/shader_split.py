@@ -20,6 +20,7 @@
 #   · SPKG (the older KTGL of Fire Emblem: Three Houses): shader packages of G2S containers, loose and inside the LINKDATA archive DATA0.bin / DATA1.bin, see kt_shaders and linkdata_jobs
 #   · SDF (Capcom's RE Engine, Monster Hunter Rise): shader definitions inside the PAK archives (KPKA, entries zstd / deflate compressed), only the newest copy of each path, see kpka_jobs and sdf_shaders
 #   · Trinity packs (Game Freak, Pokémon Legends: Z-A): BNSH inside the files of arc/data.trpfs (Oodle Mermaid, decoded by the game's own decoder in the Mac host), see trpfs_jobs and trinity_shaders
+#   · data.arc (Super Smash Bros. Ultimate): GLSLC outputs in the .nushdb files and BNSH in the effects and layouts, inside the archive's zstd files, the current copy of each path, see smash_arc_files
 #   · SPK (Capcom's MT Framework, The Great Ace Attorney Chronicles): the shader package inside an ARC archive (zlib entries), code area + control section per shader, see mtarc_members and mtspk_shaders
 #   · BEA (NintendoWare Bezel Engine archives, Big Brain Academy: Brain vs. Brain): BNSH in the .bfsha entries of the archives (zstd entries), see bea_members
 #   · MGFX (MonoGame effects, Celeste): the effects in its XNB files and SpriteBatch's in main, each shader a control section and a code area, see mgfx_effect
@@ -347,6 +348,37 @@ def kpka_shaders(path, rel, ents, out):
     with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
         for e in ents:
             if e[3] >= 0x10 and kpka_data(d, e, 4) == b'SDF\0': out.extend(sdf_shaders(kpka_data(d, e), f'/{rel}#{e[0]:016x}'))
+
+import smash_arc
+SMASH_ARC = smash_arc.MAGIC
+def smash_arc_files(path): return smash_arc.files(path)   # the current file of each path (smash_arc.py)
+
+def smash_arc_jobs(files, parts=64):
+    """The current files of each data.arc (smash_arc_files) in ranges of about equal stored size, one scan job each. → ([(path, rel, (SMASH_ARC, entries)), …], the archive paths taken)"""
+    jobs, taken = [], set()
+    for p, r in files:
+        ents = smash_arc_files(p)
+        if ents is None: continue
+        taken.add(p); step, cur, size = sum(e[2] for e in ents) / parts, [], 0
+        for e in ents:
+            cur.append(e); size += e[2]
+            if size >= step: jobs.append((p, r, (SMASH_ARC, tuple(cur)))); cur, size = [], 0
+        if cur: jobs.append((p, r, (SMASH_ARC, tuple(cur))))
+    return jobs, taken
+
+def smash_arc_shaders(path, rel, ents, out):
+    """Every file of a range (smash_arc_jobs), inflated and scanned as a loose file would be: Super Smash Bros. Ultimate keeps its shaders as GLSLC outputs in the .nushdb files
+    (SSBH 'SHDR', 41 files), as BNSH in its effects (EFFN, 329 files) and in the layout SARCs"""
+    import mmap
+    with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+        for e in ents:
+            h, at = e[0], e[1]
+            try: d = smash_arc.read(m, e)
+            except Exception: red(f'{path}: the file at {at:#x} ({h:010x}) does not inflate')
+            if b'BNSH\0\0\0\0' not in d and b'\x91\x68\x86\x19' not in d and d[:4] != b'SARC': continue
+            label, n = f'/{rel}#{h:010x}', len(out)
+            scan_blob(d, label, out)
+            if len(out) == n and b'\x91\x68\x86\x19' in d: out.extend(glslc_shaders(d, label, need=False))
 
 MTARC, MTSPK = b'ARC\0', b'SPK\0'
 def mtarc_members(d, label):
@@ -1002,6 +1034,9 @@ def scan_file(args):
     if len(args) > 2 and head[:4] == KPKA:   # entries of an RE Engine PAK (kpka_jobs)
         kpka_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if len(args) > 2 and args[2][0] == SMASH_ARC:   # current files of Super Smash Bros. Ultimate's data.arc (smash_arc_jobs)
+        smash_arc_shaders(path, rel, args[2][1], found)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and head[:4] == b'BDF3':   # entries of a FromSoftware dvdbnd archive (bdt_jobs)
         bdt_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -1089,8 +1124,9 @@ def main():
     tr_jobs, trp = trpfs_jobs(files)   # Pokémon Legends: Z-A's Trinity packs (data.trpfs and its index data.trpfd), decoded by the game's own Oodle in the Mac host
     ue_jobs, uep = ue_legacy_jobs(files)   # DRAGON QUEST XI S's legacy Unreal paks, decoded by the game's own LZ5 in the Mac host
     bd_jobs, bdts = bdt_jobs(files)   # Dark Souls Remastered's dvdbnd archives: the entries of each .bdt by its .bhd5 index, in ranges
-    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs
-    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts]
+    sa_jobs, sarcs = smash_arc_jobs(files)   # Super Smash Bros. Ultimate's data.arc: the current file of each path, in ranges
+    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + sa_jobs
+    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in sarcs]
     with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, {}, zdicts)) as ex:
         results += list(ex.map(scan_file, big)) + list(ex.map(scan_file, files, chunksize=16))
     trees, defer = {}, []

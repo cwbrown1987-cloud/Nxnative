@@ -804,16 +804,18 @@ def rewrite(py, repo, exe_dir, out, env, logs, g):
     import capstone
     mods = g.words('modules')
     PROG.stage('rewrite', step='checking the inputs')
-    nros = collect_nros(py, repo, exe_dir.parent / 'RomFS', out.with_name(out.name.replace('patched_', 'nro_')), env, logs)
+    ndir = out.with_name(out.name.replace('patched_', 'nro_'))
+    nros = collect_nros(py, repo, exe_dir.parent / 'RomFS', ndir, env, logs)
+    tsv = [ndir / 'nro.tsv'] if (ndir / 'nro.tsv').is_file() and any(p.is_file() for p in (exe_dir.parent / 'RomFS').rglob('*.nrr')) else []   # also with every NRO refused (an online SDK): the host logs those
     src = {m: exe_dir / m for m in mods} | nros
     names = list(src)
     kf = out.with_name(out.name + '.key')
-    key = fingerprint(('files', [repo / 'dm/tools' / f for f in ('patch_nso.py', 'nso_code.py', 'nso_asm.py')] + patch_files(repo, exe_dir, mods) + list(src.values())), names, capstone.__version__,
+    key = fingerprint(('files', [repo / 'dm/tools' / f for f in ('patch_nso.py', 'nso_code.py', 'nso_asm.py')] + patch_files(repo, exe_dir, mods) + list(src.values()) + tsv), names, capstone.__version__,
                       {k: env.get(k) for k in ('DM_PATCH_FRONT',)})
     if all((out / f'{m}.patched.bin').is_file() for m in names) and reused(kf, key) is not None:
         PROG.end(f'{", ".join(mods)}{f" and {len(nros)} NROs" if nros else ""}, reused (inputs unchanged)'); return
     tmp = out.with_name(out.name + '.partial'); rmtree(tmp); tmp.mkdir(parents=True); logs.mkdir(parents=True, exist_ok=True)
-    if nros: shutil.copyfile(next(iter(nros.values())).parent / 'nro.tsv', tmp / 'nro.tsv')
+    if tsv: shutil.copyfile(tsv[0], tmp / 'nro.tsv')
     PROG.set(step=', '.join(mods) + (f' and {len(nros)} NROs' if nros else ''), done=0, total=len(names), unit='modules')
     procs, logf, todo, cores = {}, {}, list(names), max(2, os.cpu_count() or 4)
     try:

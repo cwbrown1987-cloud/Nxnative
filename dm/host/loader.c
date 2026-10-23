@@ -465,8 +465,22 @@ static void remap_at(module_t *m, vm_address_t to, const void *from, unsigned lo
 static void map_image(module_t *m, const char *dir) {
     (void)dir;
     char sx0[17], sx1[17], dm[17]; snprintf(sx0, sizeof sx0, "__dm%sx0", m->name); snprintf(sx1, sizeof sx1, "__dm%sx1", m->name); snprintf(dm, sizeof dm, "__DM%sW", m->name);
-    unsigned long z0, zw, z1;
-    const uint8_t *x0 = getsectiondata(IMAGE_MH, "__TEXT", sx0, &z0), *w = getsectiondata(IMAGE_MH, dm, "__img", &zw), *x1 = getsectiondata(IMAGE_MH, "__TEXT", sx1, &z1);
+    unsigned long z0 = 0, zw = 0, z1 = 0;
+    const uint8_t *x0 = NULL, *w = NULL, *x1 = NULL;
+    if (m->nro) {
+        // NROs share two sections (dm/ios/tools/gen_embed.py: an executable numbers at most 255 sections): code pieces in __TEXT,__dmnrox, W parts in __DMNRO,__img, found through the
+        // index at the start of __dmnrox: u32 'DMNR', u32 count, then {char name[16], u64 x0 offset, x0 length, W offset, W length, x1 offset, x1 length}
+        unsigned long zx, zn; const uint8_t *nx = getsectiondata(IMAGE_MH, "__TEXT", "__dmnrox", &zx), *nw = getsectiondata(IMAGE_MH, "__DMNRO", "__img", &zn);
+        if (!nx || !nw || memcmp(nx, "DMNR", 4)) die("%s: no embedded NRO sections (__TEXT,__dmnrox / __DMNRO,__img)", m->name);
+        uint32_t cnt = *(const uint32_t *)(nx + 4);
+        for (uint32_t i = 0; i < cnt && !x0; i++) {
+            const uint8_t *e = nx + 8 + 64 * i; uint64_t v[6]; memcpy(v, e + 16, sizeof v);
+            if (strncmp((const char *)e, m->name, 16)) continue;
+            if (v[0] + v[1] > zx || v[4] + v[5] > zx || v[2] + v[3] > zn) die("%s: embedded NRO index entry out of its sections", m->name);
+            x0 = nx + v[0]; z0 = v[1]; w = nw + v[2]; zw = v[3]; x1 = nx + v[4]; z1 = v[5];
+        }
+        if (!x0) die("%s: not in the embedded NRO index (%u entries)", m->name, cnt);
+    } else { x0 = getsectiondata(IMAGE_MH, "__TEXT", sx0, &z0); w = getsectiondata(IMAGE_MH, dm, "__img", &zw); x1 = getsectiondata(IMAGE_MH, "__TEXT", sx1, &z1); }
     if (!x0 || !w || !x1) die("embedded sections %s / %s / %s missing", sx0, dm, sx1);
     // Patch area before the base (patch_off < 0): W ends at the end of data (FILE_IMAGE_LEN); bss and the key page are zero pages from vm_allocate and are not in the executable
     int front = m->patch_off < 0;
@@ -480,7 +494,9 @@ static void map_image(module_t *m, const char *dir) {
     base += pre;
     remap_at(m, base, x0, z0, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
     remap_at(m, base + z0, w, zw, TRUE, VM_PROT_READ | VM_PROT_WRITE);
-    remap_at(m, base + m->patch_off, x1, z1, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    // A module with nothing to rewrite has an empty patch area (87 of Super Smash Bros. Ultimate's 98 NROs: no x18, SVC or TLS register use); vm_remap refuses 0 bytes
+    // (KERN_INVALID_ARGUMENT), which stopped the app at launch on an iPhone at the first such NRO
+    if (z1) remap_at(m, base + m->patch_off, x1, z1, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
     m->base = (uint8_t *)base; install_key_page(m);
 }
 #else

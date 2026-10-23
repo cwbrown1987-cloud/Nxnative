@@ -1,0 +1,49 @@
+# Game profile of Super Smash Bros. Ultimate (Switch, base game v0 + update 13.0.5 = v2031616). Not yet playable: prepared from the survey and a static analysis, bring-up not started
+# Format: see dm/games/README.md
+# Bandai Namco / Sora's engine (the nu library: nushdb, numatb, nus3audio; app:: / lua2cpp:: game code) on SDK 8.2.1, NVN; modules main + subsdk0 (NintendoSDK_movie) + sdk.
+# The sdk and movie builds are Catherine: Full Body's (0100BF00112C0000), so the SDK side of the host has run on exactly these builds.
+# RomFS: one 17.6 GB archive, data.arc (magic 0xABCDEF9876543210, every file zstd-compressed, superseded copies of updated files kept beside the current ones), and 14 NRRs in .nrr/.
+# Fighter code is not in ExeFS: main imports 1,045 lua2cpp::create_agent_* functions (global, not weak) that 98 NROs inside data.arc export (149 MB of text, registered by
+# .nrr/cross2_130004.nrr); the host loads no NRO yet (hle_ro.c). Shaders: GLSLC outputs in the nushdb files (SSBH "SHDR") and BNSH in the effects (EFFN) and layout SARCs,
+# all inside data.arc, which shader_split.py does not read yet; the tables below hold only the 77 shaders of main's 33 GLSLC outputs. Notes: docs/development.md, Game notes.
+
+# ---- Identity ----
+title_id	01006A800016E000
+program_id	01006A800016E000
+
+# ---- App ----
+# Game name: only a label for profile listings and the Mac window title; the iOS app name is the game name in the base NSP, and the bundle ID comes from the base game title ID (build_ipa.sh / NSP script)
+name	Super Smash Bros. Ultimate
+ipa	SuperSmashBrosUltimate.ipa
+# unsure: the provisional profile's generic category; a fighting game has no category of its own
+app_category	public.app-category.action-games
+
+# ---- Versions ----
+# only the merged 13.0.5 copy is extracted; the base game's own build IDs are added when needed
+build	v2031616	13.0.5	main=21450c647b8c5940ed5b68218ea128fd	subsdk0=60c6edbbfcebd4176cc301d5d9cb5a6f	sdk=5fd4f531c1195e9e5510c9e73f22cd39
+package	v2031616
+shader_versions	v2031616
+
+# ---- Files ----
+# load order as on Horizon: main, subsdk*, sdk (subsdk0 = NintendoSDK_movie). The 98 fighter / common NROs in data.arc are loaded by the game itself through nn::ro, not listed here
+modules	main subsdk0 sdk
+romfs_marker	data.arc
+zip_store	.arc:.metallib
+
+# ---- Memory ----
+# The NPDM declares 16 MB of system resource (virtual address memory) and main never sets a heap: it takes its memory with nn::os::AllocateAddressRegion /
+# AllocateMemoryPages itself, as Hollow Knight: Silksong. Engage's 5 GB block with a 4.375 GB alias region. main's virtual allocator (behind nu::VirtualAllocHook) reserves
+# 62 GB of address space in the static initialisers and aborts when that fails; patches.py cuts it to 3 GB (unsure: a starting point, not yet measured in play), and
+# dm/tools/sdk_patches.py cuts this sdk build's 1 GB node area and 1 GB alignment of large regions, without which even 3 GB did not fit. Boot of 13.0.5 on the Mac:
+# the region placed at alias +62 MB, the high-water mark +3.05 GB, 1.5 GB mapped 25 s in (the title not reached yet: no NRO loaded)
+mem_reserve	0x140000000
+mem_alias	0x118000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 16 MB of system resource
+sys_resource	0x1000000
+
+# ---- Shader split ----
+# data.arc (its current files: .nushdb GLSLC outputs, effect and layout BNSH) and main
+shader_groups	/data.arc=arc
+shader_note	Super Smash Bros. Ultimate shaders

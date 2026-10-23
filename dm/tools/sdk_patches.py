@@ -115,4 +115,14 @@ CUTS = {
     (0x1423fc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
     (0x142468, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
+  # Super Smash Bros. Ultimate 13.0.5 (v2031616) sdk (SDK 8.2.1, the same build as Catherine: Full Body 1.0.1a's, which has no virtual address memory and never allocates an address region):
+  # the node area cut, and regions of 1 GB and more aligned to 32 MB, as DRAGON QUEST XI S's. main's virtual allocator takes one region in its static initialisers (3 GB with the cut in the
+  # profile's patches.py), which after the 1 GB node area, 1 GB aligned, ended past the 4.375 GB alias region, and the game aborted (main+0x37c9bd0). The constructor is at sdk+0x336b40
+  # (the limit at +0x28 and the occupied length both from orr w9,wzr,#0x3fe00000); VammManager::AllocateAddressRegion's placement at sdk+0x336cf0 aligns a region by its size: 64 KB under
+  # 2 MB, 2 MB under 4 MB, 4 MB under 32 MB, 32 MB under 1 GB, else 1 GB (+0x336d5c)
+  '5fd4f531c1195e9e5510c9e73f22cd39': [
+    (0x336b50, 'e9230b32', '097ca052', 'AddressRegionManager constructor: node area limit orr w9,wzr,#0x3fe00000 → mov w9,#0x3e00000'),
+    (0x336bf0, 'e9230b32', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region orr w9,wzr,#0x3fe00000 → mov w9,#0x3e00000'),
+    (0x336d5c, 'ea030232', '0a40a052', 'AllocateAddressRegion: alignment of regions of 1 GB and more orr w10,wzr,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)'),
+  ],
 }

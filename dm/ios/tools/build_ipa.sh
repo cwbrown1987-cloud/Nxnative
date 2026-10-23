@@ -69,7 +69,12 @@ t "app: $DM_DISPLAY_NAME $DM_APP_VERSION ($DM_BUNDLE_ID), language $DM_LANG$([ $
 t "generate Gen/ (host sources, embedded modules, tables)"
 rm -rf Gen && mkdir -p Gen/dm || die "mkdir Gen"
 python3 tools/gen_build.py "$DM/host" Gen > Gen/dm.xcconfig || die "gen_build"
-F=$(python3 tools/gen_embed.py "$PATCHED" Gen/embed.S $MODS) || die "gen_embed"
+# The NROs the game loads at run time (nro.tsv beside the rewritten modules, written by the NSP script's rewrite step; loader.c "NRO modules") are embedded like the profile's modules:
+# iOS runs no code loaded at run time. Rows named "refused" are online SDKs that were never rewritten (dm/tools/nro_collect.py ONLINE_SDKS)
+NROS=; if [ -f "$PATCHED/nro.tsv" ]; then NROS=$(awk -F'\t' '!/^#/ && $1 != "refused" && $1 != "" {print $1}' "$PATCHED/nro.tsv" | tr '\n' ' ')
+  for f in $NROS; do [ -f "$PATCHED/$f.patched.bin" ] || die "no rewritten NRO $PATCHED/$f (nro.tsv lists it)"; done
+  cp "$PATCHED/nro.tsv" Gen/dm/ || die "copy nro.tsv"; t "NROs embedded: $(echo $NROS | wc -w | tr -d ' ')"; fi
+F=$(python3 tools/gen_embed.py "$PATCHED" Gen/embed.S $MODS ${NROS:+-- $NROS}) || die "gen_embed"
 echo "OTHER_LDFLAGS = \$(inherited) \$(DM_FRAMEWORKS) $F" >> Gen/dm.xcconfig
 cp "$PATCHED"/*.fixups.tsv "$PATCHED"/*.gates.tsv "$PATCHED"/*.cuts.tsv "$PATCHED"/*.obs.tsv Gen/dm/ || die "copy rewriter tables"
 if [ "$GFXAPI" = vulkan ] || [ "$GFXAPI" = gl ]; then cp "$GD/shader_map.tsv" "$GD/pso_manifest.tsv" Gen/dm/ || die "copy shader tables"   # empty NVN tables: the NVN layer draws nothing
@@ -124,6 +129,8 @@ xcodebuild -project DmIOS.xcodeproj -scheme DmIOS -configuration Release -destin
 # SYMROOT and OBJROOT above keep the unsigned build separate from the interactive Xcode app.
 APP=$DD/Build/Products/Release-iphoneos/DmIOS.app
 [ -n "$APP" ] && [ -d "$APP" ] || die "no built app"; t "app: $APP"
+# DM_NO_PACK=1: stop with the built app, without packing (to check a build when the drive cannot hold the IPA yet: Super Smash Bros. Ultimate's is about 21 GB)
+if [ "${DM_NO_PACK:-0}" = 1 ]; then t "done without packing (DM_NO_PACK=1): $APP, executable $(du -h "$APP/DmIOS" | cut -f1)"; exit 0; fi
 
 # Straight from the sources: the app without its signature, and without the folders an app built before pack_ipa.py still has (DerivedData keeps resources that left the project;
 # msl/ is also deleted there, it took 1.5 GB of the home disk), then the shader libraries, the add-on content (the RomFS extracted from the player's DLC NSPs, one folder per index:

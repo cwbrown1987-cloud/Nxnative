@@ -2049,6 +2049,9 @@ NVN(nvnDeviceRegisterFastClearColor, NVNboolean, NVNdevice *d, const float *c, N
 NVN(nvnDeviceRegisterFastClearDepth, NVNboolean, NVNdevice *d, float v) { (void)d; (void)v; return 1; }
 // The size of the driver's cache for shaders it compiles from intermediate code (The Great Ace Attorney Chronicles sets 10 at startup); the host compiles nothing at run time
 NVN(nvnDeviceSetIntermediateShaderCache, void, NVNdevice *d, int n) { (void)d; (void)n; }
+// An NVX extension of the SDK 8 driver: lets an external graphics debugger attach. Super Smash Bros. Ultimate 13.0.5 fetches it by name right after the bootstrap loader and calls it
+// without checking the pointer (a null one crashed at pc=0 from main+0x37fe930); the host has no such debugger
+NVN_NOPROTO(nvnSetExternalDebuggerEnabledNVX, void, uint32_t enable) { (void)enable; }
 
 // Window: number of active swapchain textures (the host rotates through the count given at creation; logged once)
 NVN_NOPROTO(nvnWindowBuilderSetNumActiveTextures, void, NVNwindowBuilder *b, int n) { (void)b; ONCE_LOG("WindowBuilderSetNumActiveTextures %d (the host rotates through the SetTextures count)", n); }
