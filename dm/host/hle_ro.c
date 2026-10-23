@@ -95,7 +95,12 @@ HLE_FORCE("_ZN2nn2ro12UnloadModuleEPNS0_6ModuleE", "unload an NRO: its fini, the
 HLE_FORCE("_ZN2nn2ro18RegisterModuleInfoEPNS0_16RegistrationInfoEPKv", "register an NRR: nothing to check, the host's NROs were collected by its hashes", Result, h_ro_RegisterModuleInfo, void *info, const void *nrr) {
     const uint8_t *r = nrr;
     if (!r || memcmp(r, "NRR0", 4)) return RO_FAIL;
-    static int n; if (n++ < 20) LOG("ro::RegisterModuleInfo: NRR with %u hashes", *(const uint32_t *)(r + 0x344));
+    uint32_t off = *(const uint32_t *)(r + 0x340), cnt = *(const uint32_t *)(r + 0x344), refused = 0;
+    for (uint32_t i = 0; i < cnt; i++) refused += nro_refused(r + off + 32 * i);
+    // An NRR that registers only online SDKs the host refuses (Hades and Hades II: game.nrr with the one EOS SDK hash) fails as every registration did before the host loaded NROs,
+    // so such a game takes the path it took then (it never asked for the module)
+    if (cnt && refused == cnt) { LOG("ro::RegisterModuleInfo: refused an NRR that registers only online SDKs (%u hashes), as before NROs were loaded; the game plays offline", cnt); return RO_FAIL; }
+    static int n; if (n++ < 20) LOG("ro::RegisterModuleInfo: NRR with %u hashes", cnt);
     (void)info;
     return 0;
 }
