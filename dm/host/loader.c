@@ -329,6 +329,11 @@ static void relocate(module_t *m) {
 // symbol relocations of the modules loaded before it that it defines and nothing loaded defined (Horizon: BindVariables, and functions bound lazily at their first call): main's lua2cpp
 // imports are stubs until then. Only data is written, so the same works with code embedded in the iOS executable. An unload binds every relocation that pointed into the NRO again
 static void map_image(module_t *m, const char *dir);
+static uint8_t g_refused[16][32]; static int g_nrefused;   // NROs the pack refused (online SDKs, nro.tsv rows named "refused")
+int nro_refused(const uint8_t sha256[32]) {
+    for (int i = 0; i < g_nrefused && i < 16; i++) if (!memcmp(g_refused[i], sha256, 32)) return 1;
+    return 0;
+}
 static void preload_nros(const char *dir) {
     char path[1024], line[512]; snprintf(path, sizeof path, "%s/nro.tsv", dir);
     const char *off = getenv("DM_NRO");
@@ -340,6 +345,10 @@ static void preload_nros(const char *dir) {
         if (line[0] == '#' || line[0] == '\n') continue;
         char name[16], hex[65]; unsigned size;
         if (sscanf(line, "%15s %64s %u", name, hex, &size) != 3 || strlen(hex) != 64) die("%s: bad row %s", path, line);
+        if (!strcmp(name, "refused")) {   // an online SDK the pack left out (dm/tools/nro_collect.py ONLINE_SDKS): LoadModule refuses its hash
+            if (g_nrefused < (int)(sizeof g_refused / sizeof *g_refused)) for (int k = 0; k < 32; k++) sscanf(hex + 2 * k, "%2hhx", &g_refused[g_nrefused][k]);
+            g_nrefused++; continue;
+        }
         if (g_nmod >= MAX_MOD) die("%s: more NROs than module slots (MAX_MOD %d)", path, MAX_MOD);
         module_t *m = &g_mod[g_nmod];
         strlcpy(m->name, name, sizeof m->name); m->nro = 1; m->nro_size = size;

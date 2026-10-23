@@ -791,7 +791,8 @@ def collect_nros(py, repo, romfs, dst, env, logs):
         PROG.set(step=f'finding the NROs {len(nrrs)} NRR files register')
         run([py, repo / 'dm/tools/nro_collect.py', romfs, tmp], logs / 'nro_collect.log', env=env)
         rmtree(kf); swap_in(tmp, dst); kf.write_text(f'{key}\n')
-    return {l.split('\t')[0]: dst / (l.split('\t')[0] + '.nro') for l in (dst / 'nro.tsv').read_text().splitlines() if l and not l.startswith('#')}
+    # rows named 'refused' are online SDKs the host never loads (Epic Online Services): listed for the host's log, not rewritten
+    return {l.split('\t')[0]: dst / (l.split('\t')[0] + '.nro') for l in (dst / 'nro.tsv').read_text().splitlines() if l and not l.startswith('#') and not l.startswith('refused\t')}
 
 
 def rewrite(py, repo, exe_dir, out, env, logs, g):
