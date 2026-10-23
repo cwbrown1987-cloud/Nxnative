@@ -50,6 +50,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Check:** `DM_TEST_PRESENT_LAG=90,30` (sleep 30 ms before every 90th present) makes Mario do this on the Mac; run it with `DM_WINDOW=1` to get the display link. `DM_NVN_TSV` writes each frame's interval as `@itv`.
 - **Note:** the windowless Mac host was never affected by the acquire: there the acquire sleeps until the interval's slot.
 
+### Present snapshots: the game's swapchain texture free at once
+
+- **Symptom:** frames miss the screen while the GPU stays at its lowest clock (444 MHz on an M2 Max); more work (a higher render scale) only makes the frames slower.
+- **Cause:** a game with two swapchain textures gets one back only when the display link has taken its previous present, so each frame's CPU work starts on a tick and the GPU idles from the end of one frame to the first work of the next. macOS reads that idle time as room and keeps the clock low.
+- **Fix:** present snapshots (`DM_PRESENT_SNAP=1`, Mac, off by default; `nvn_mtl.m` `snap_take`): each present is copied on the game's queue, right after the frame's work, into one of two host textures; the display link shows the copy, and the game's texture is free at once. The game runs up to a frame ahead of the screen, and a frame whose work runs long is absorbed instead of shown late. The wait for a free copy paces the game and does not count as a frame's cost (`mtl_snap_take_wait`).
+- **Note:** the cost is up to a frame more latency.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (Mac).
+
 ### Vulkan acquire and vsync event follow the display link
 
 - **Symptom:** a steady game whose frame-rate counter wanders between 50 and 60 on the iPhone only; the `display link up to tick` lines show about as many empty ticks as frames dropped by merging: frames arrive two in one tick and none in the next.
