@@ -55,6 +55,7 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Symptom:** frames miss the screen while the GPU stays at its lowest clock (444 MHz on an M2 Max); more work (a higher render scale) only makes the frames slower.
 - **Cause:** a game with two swapchain textures gets one back only when the display link has taken its previous present, so each frame's CPU work starts on a tick and the GPU idles from the end of one frame to the first work of the next. macOS reads that idle time as room and keeps the clock low.
 - **Fix:** present snapshots (`DM_PRESENT_SNAP=1`, Mac, off by default; `nvn_mtl.m` `snap_take`): each present is copied on the game's queue, right after the frame's work, into one of two host textures; the display link shows the copy, and the game's texture is free at once. The game runs up to a frame ahead of the screen, and a frame whose work runs long is absorbed instead of shown late. The wait for a free copy paces the game and does not count as a frame's cost (`mtl_snap_take_wait`).
+- **Fix:** the frame step judges lateness by what the screen shows while snapshots are on: the on-screen interval of the frame 8 presents back, against its hold (`fstep_tick`, `nvn_fstep.screen`). Judged by its cost, a frame whose CPU time holds the game's waits on its own GPU work (which now runs a frame later) looked late at a GPU time of 0.75 vsyncs.
 - **Note:** the cost is up to a frame more latency.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (Mac).
 
