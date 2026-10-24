@@ -1779,7 +1779,10 @@ NVN(nvnBufferBuilderSetStorage, void, NVNbufferBuilder *b, NVNmemoryPool *p, ptr
 NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buf, const NVNbufferBuilder *b) {
     const buf_builder_t *bb = (const buf_builder_t *)b;
     if (!bb->pool || !bb->pool->mem) { LOG("[RED] BufferInitialize: pool has no storage (pool %p flags %#x offset %#llx size %#llx)", (const void *)bb->pool, bb->pool ? bb->pool->flags : 0, (unsigned long long)bb->off, (unsigned long long)bb->size); return 0; }
-    if ((uint64_t)bb->off + bb->size > bb->pool->size) LOG("[RED] BufferInitialize: past the end of the pool (offset %#llx size %#llx pool %#llx)", (unsigned long long)bb->off, (unsigned long long)bb->size, (unsigned long long)bb->pool->size);
+    // The NVN driver does not check a buffer's range against its pool, and the host's own GPU access never goes by the buffer: it takes an address and a length from the command (mtl_addr resolves it
+    // in the pool's memory and reports a range that leaves the pool as its own red line). Breath of the Wild creates a 256 KB buffer over a 144 KB pool for a screen readback that feeds a
+    // compressing encoder (when the pause menu opens, and near a save commit): the buffer's one use is a texture-to-buffer copy of the picture's own extent, which lies inside the pool. Not an error by itself: one line.
+    if ((uint64_t)bb->off + bb->size > bb->pool->size) ONCE_LOG("BufferInitialize: a buffer reaches past the end of its pool (offset %#llx size %#llx pool %#llx); only an access that leaves the pool is an error, and it is reported where it happens", (unsigned long long)bb->off, (unsigned long long)bb->size, (unsigned long long)bb->pool->size);
     *(buf_t *)buf = (buf_t){MAGIC('B', 'U', 'F', 0), bb->pool, bb->off, bb->size};
     OLOG("BufferInitialize %p pool=%p off=%#llx size=%#llx", (void *)buf, (const void *)bb->pool, (unsigned long long)bb->off, (unsigned long long)bb->size);
     return 1;
