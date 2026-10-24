@@ -278,6 +278,10 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     __block int r = 0;
     __block NSString *text = nil;
     dispatch_sync(dispatch_get_main_queue(), ^{
+        // The box takes the keyboard and the mouse, so the game window never sees the key-up of the button or the touch-up of the click that opened it: nothing may stay pressed
+        // while it is up, or the game reads the stuck button / touch the moment the box closes (Stardew Valley's character creation re-opened the keyboard endlessly)
+        g_btn = 0; g_w = g_a = g_s = g_d = 0; push();
+        dm_touch_set(NULL, 0);
         NSAlert *a = [NSAlert new];
         a.messageText = title && *title ? @(title) : @"Input";
         NSString *info = [NSString stringWithFormat:@"%s%s%s", sub ? sub : "", sub && *sub && guide && *guide ? "\n" : "", guide ? guide : ""];
