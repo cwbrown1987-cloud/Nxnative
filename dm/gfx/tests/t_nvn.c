@@ -33,6 +33,12 @@ static void mem_cb(NVNcommandBuffer *c, NVNcommandBufferMemoryEvent ev, size_t m
     P(nvnCommandBufferAddCommandMemory)(c, &g_cmdpool, (ptrdiff_t)g_cmdoff, n); g_cmdoff += n;
 }
 
+// Model an exhausted callback without adding memory or changing the command buffer.
+static void ExhaustedMemoryCallback(NVNcommandBuffer *command, NVNcommandBufferMemoryEvent event, size_t minimumSize, void *data) {
+    (void)command; (void)event; (void)minimumSize;
+    (*(int *)data)++;
+}
+
 // Suspend unit test: do the submit on another thread
 static _Atomic int g_sstarted, g_sdone; static pthread_mutex_t g_smu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_scv = PTHREAD_COND_INITIALIZER;
 static NVNqueue *g_sq; static NVNcommandHandle g_sh; static NVNT_nvnQueueSubmitCommands g_sub;
@@ -266,7 +272,7 @@ int main(void) {
             for (int guard = 0; guard < 8; guard++) {
                 op_hdr h; memcpy(&h, p, sizeof h);
                 if (h.op == OP_JUMP) { const uint8_t *t; memcpy(&t, p + 8, 8); int in = t >= m && t < m + sizeof m;
-                    for (int i = 0; i < g_nhostseg; i++) in |= t >= g_hostseg[i].mem && t < g_hostseg[i].mem + HOSTSEG_SZ;
+                    for (int i = 0; i < g_nhostseg; i++) in |= t >= g_hostseg[i].mem && t < g_hostseg[i].mem + g_hostseg[i].capacity;
                     if (!in) { ok = 0; break; } jumped = 1; p = t; continue; }
                 if (k < 4) ops[k] = (int)h.op; k++;
                 if (h.op == OP_END) break;
@@ -280,6 +286,199 @@ int main(void) {
         EXPECT("slotted lists replay whole after the next slot is recorded", 0, broken);
         EXPECT("lists of 64..504 bytes stay in their 512 (no host segment)", (504 - 64) / 8 + 1, jumps_fit);
         P(nvnCommandBufferFinalize)(&c3); P(nvnMemoryPoolFinalize)(&mp);
+    }
+
+    {
+        static uint8_t grantMemory[4096] __attribute__((aligned(4096)));
+        NVNmemoryPoolBuilder memoryBuilder; NVNmemoryPool memoryPool;
+        P(nvnMemoryPoolBuilderSetDefaults)(&memoryBuilder);
+        P(nvnMemoryPoolBuilderSetStorage)(&memoryBuilder, grantMemory, sizeof grantMemory);
+        P(nvnMemoryPoolInitialize)(&memoryPool, &memoryBuilder);
+        NVNcommandBuffer directCommand;
+        P(nvnCommandBufferInitialize)(&directCommand, &dev);
+        const NVNmemoryPool *inputPools[] = {NULL, &memoryPool, &memoryPool};
+        size_t inputSizes[] = {0, 0, 32};
+        ptrdiff_t inputOffsets[] = {(ptrdiff_t)0x123456789ABull, 0, 32};
+        for (int inputIndex = 0; inputIndex < 3; inputIndex++) {
+            P(nvnCommandBufferAddCommandMemory)(&directCommand, inputPools[inputIndex], inputOffsets[inputIndex], inputSizes[inputIndex]);
+            EXPECT("empty/small grants retain the fixed segment size", HOSTSEG_SZ, CB(&directCommand)->end - CB(&directCommand)->cur);
+        }
+
+        NVNcommandBuffer fallbackCommand;
+        P(nvnCommandBufferInitialize)(&fallbackCommand, &dev);
+        P(nvnCommandBufferBeginRecording)(&fallbackCommand);
+        P(nvnCommandBufferEndRecording)(&fallbackCommand);
+        EXPECT("no-callback fallback retains an eight-byte END", 8, P(nvnCommandBufferGetCommandMemoryUsed)(&fallbackCommand));
+        P(nvnCommandBufferFinalize)(&fallbackCommand);
+
+        int callbackCalls = 0;
+        P(nvnCommandBufferInitialize)(&fallbackCommand, &dev);
+        P(nvnCommandBufferSetMemoryCallback)(&fallbackCommand, ExhaustedMemoryCallback);
+        P(nvnCommandBufferSetMemoryCallbackData)(&fallbackCommand, &callbackCalls);
+        P(nvnCommandBufferBeginRecording)(&fallbackCommand);
+        P(nvnCommandBufferEndRecording)(&fallbackCommand);
+        EXPECT("exhausted callback is still tried exactly twice", 2, callbackCalls);
+        EXPECT("exhausted callback fallback retains its END", 8, P(nvnCommandBufferGetCommandMemoryUsed)(&fallbackCommand));
+        P(nvnCommandBufferFinalize)(&fallbackCommand);
+
+        NVNcommandBuffer ownedCommand;
+        P(nvnCommandBufferInitialize)(&ownedCommand, &dev);
+        P(nvnCommandBufferAddCommandMemory)(&ownedCommand, &memoryPool, 0, 64);
+        P(nvnCommandBufferBeginRecording)(&ownedCommand);
+        NVNcommandHandle unsubmittedHandle = (NVNcommandHandle)grantMemory;
+        P(nvnCommandBufferCopyCommands)(&ownedCommand, 1, &unsubmittedHandle);
+        uint8_t uniformData[96] = {0};
+        P(nvnCommandBufferUpdateUniformBuffer)(&ownedCommand, 0x10000, 0x1000, 0, sizeof uniformData, uniformData);
+        uint8_t *ownedMemory = CB(&ownedCommand)->end - HOSTSEG_SZ;
+        int ownedIndex = -1;
+        for (int segmentIndex = 0; segmentIndex < g_nhostseg; segmentIndex++)
+            if (g_hostseg[segmentIndex].mem == ownedMemory) ownedIndex = segmentIndex;
+        EXPECT("overflow still borrows a tracked host segment", 1, ownedIndex >= 0);
+        if (ownedIndex >= 0) {
+            EXPECT("guest origin includes the CALL and its JUMP", 1,
+                g_hostseg[ownedIndex].org_lo == (uintptr_t)grantMemory && g_hostseg[ownedIndex].org_hi == (uintptr_t)(grantMemory + 32));
+            P(nvnCommandBufferEndRecording)(&ownedCommand);
+            P(nvnCommandBufferAddCommandMemory)(&ownedCommand, &memoryPool, 0, 64);
+            EXPECT("overlapping guest grant still releases its segment", 0, g_hostseg[ownedIndex].busy);
+            int segmentCount = g_nhostseg;
+            P(nvnCommandBufferAddCommandMemory)(&directCommand, NULL, 0, 0);
+            EXPECT("a free segment is reused without growing the pool", segmentCount, g_nhostseg);
+        }
+        EXPECT("segment allocation remains within its configured byte cap", 1, g_hostseg_bytes <= HOSTSEG_CAP);
+        P(nvnCommandBufferFinalize)(&ownedCommand);
+        P(nvnCommandBufferFinalize)(&directCommand);
+        P(nvnMemoryPoolFinalize)(&memoryPool);
+    }
+
+    {
+        NVNcommandBuffer smallCommand, spareCommand;
+        P(nvnCommandBufferInitialize)(&smallCommand, &dev);
+        size_t initialCapacity = DM_GAME_NVN_SMALL_HOST_SEGMENTS ? HOSTSEG_SMALL_SZ : HOSTSEG_SZ;
+        EXPECT("byte budget accepts the exact final small segment", 1,
+            HostsegFitsBudget(HOSTSEG_SMALL_SZ, HOSTSEG_CAP - HOSTSEG_SMALL_SZ));
+        EXPECT("byte budget rejects one byte beyond the cap", 0,
+            HostsegFitsBudget(HOSTSEG_SMALL_SZ, HOSTSEG_CAP - HOSTSEG_SMALL_SZ + 1));
+        EXPECT("byte budget does not wrap an already exceeded total", 0,
+            HostsegFitsBudget(HOSTSEG_SMALL_SZ, (uint64_t)HOSTSEG_CAP + 1));
+        EXPECT("small remaining budget does not fit a default segment", 0,
+            HostsegFitsBudget(HOSTSEG_SZ, HOSTSEG_CAP - HOSTSEG_SMALL_SZ));
+        EXPECT("profile selects the small null-pool request policy", initialCapacity,
+            HostsegRequestCapacity(CB(&smallCommand), HOSTSEG_NULL_POOL, 512));
+        EXPECT("zero-sized null-pool requests keep the original size", HOSTSEG_SZ,
+            HostsegRequestCapacity(CB(&smallCommand), HOSTSEG_NULL_POOL, 0));
+        EXPECT("larger null-pool requests keep the original size", HOSTSEG_SZ,
+            HostsegRequestCapacity(CB(&smallCommand), HOSTSEG_NULL_POOL, HOSTSEG_SMALL_SZ + 1));
+        EXPECT("non-null small grants keep the original size", HOSTSEG_SZ,
+            HostsegRequestCapacity(CB(&smallCommand), HOSTSEG_SMALL_GRANT, 32));
+        P(nvnCommandBufferBeginRecording)(&smallCommand);
+        EXPECT("in-recording requests keep the original size", HOSTSEG_SZ,
+            HostsegRequestCapacity(CB(&smallCommand), HOSTSEG_NULL_POOL, 512));
+        P(nvnCommandBufferEndRecording)(&smallCommand);
+        P(nvnCommandBufferFinalize)(&smallCommand);
+        P(nvnCommandBufferInitialize)(&smallCommand, &dev);
+
+        P(nvnCommandBufferInitialize)(&spareCommand, &dev);
+        P(nvnCommandBufferAddCommandMemory)(&spareCommand, NULL, 0, 0);
+        uint8_t *spareMemory = CB(&spareCommand)->cur;
+        pthread_mutex_lock(&g_hostseg_mu);
+        int spareIndex = -1;
+        for (int segmentIndex = 0; segmentIndex < g_nhostseg; segmentIndex++)
+            if (g_hostseg[segmentIndex].mem == spareMemory) spareIndex = segmentIndex;
+        if (spareIndex >= 0) g_hostseg[spareIndex].busy = 0;
+        uint64_t allocatedBefore = g_hostseg_bytes;
+        int segmentsBefore = g_nhostseg;
+        pthread_mutex_unlock(&g_hostseg_mu);
+        EXPECT("reusable default-sized segment exists", 1, spareIndex >= 0);
+        P(nvnCommandBufferAddCommandMemory)(&smallCommand, NULL, 0, 512);
+        uint8_t *initialMemory = CB(&smallCommand)->cur;
+        EXPECT("initial grant uses its actual profile-selected capacity", initialCapacity,
+            CB(&smallCommand)->end - initialMemory);
+        EXPECT("small requests do not consume a free default-sized segment", DM_GAME_NVN_SMALL_HOST_SEGMENTS,
+            initialMemory != spareMemory);
+        EXPECT("allocated byte accounting uses the actual new capacity",
+            segmentsBefore == g_nhostseg ? 0 : initialCapacity, g_hostseg_bytes - allocatedBefore);
+        static uint8_t destination[8192] __attribute__((aligned(4096)));
+        static uint8_t firstData[32], largeData[HOSTSEG_SMALL_SZ + 256];
+        memset(destination, 0, sizeof destination); memset(firstData, 0x35, sizeof firstData); memset(largeData, 0x6A, sizeof largeData);
+        NVNmemoryPoolBuilder destinationBuilder; NVNmemoryPool destinationPool;
+        P(nvnMemoryPoolBuilderSetDefaults)(&destinationBuilder);
+        P(nvnMemoryPoolBuilderSetStorage)(&destinationBuilder, destination, sizeof destination);
+        P(nvnMemoryPoolInitialize)(&destinationPool, &destinationBuilder);
+        P(nvnCommandBufferBeginRecording)(&smallCommand);
+        P(nvnCommandBufferUpdateUniformBuffer)(&smallCommand, (uintptr_t)destination, sizeof destination, 0, sizeof firstData, firstData);
+        P(nvnCommandBufferUpdateUniformBuffer)(&smallCommand, (uintptr_t)destination, sizeof destination, 64, sizeof largeData, largeData);
+        NVNcommandHandle stableHandle = P(nvnCommandBufferEndRecording)(&smallCommand);
+        EXPECT("expansion preserves the original handle address", (uintptr_t)initialMemory, stableHandle);
+        op_hdr firstHeader, nextHeader;
+        memcpy(&firstHeader, initialMemory, sizeof firstHeader);
+        memcpy(&nextHeader, initialMemory + firstHeader.size, sizeof nextHeader);
+        EXPECT("only the small-segment profile needs a JUMP here",
+            DM_GAME_NVN_SMALL_HOST_SEGMENTS ? OP_JUMP : OP_UPDATE_UB, nextHeader.op);
+        EXPECT("expanded recording keeps room for the complete large record", 1,
+            CB(&smallCommand)->end >= CB(&smallCommand)->cur && CB(&smallCommand)->end - CB(&smallCommand)->cur < HOSTSEG_SZ);
+        P(nvnCommandBufferFinalize)(&smallCommand);
+        P(nvnCommandBufferInitialize)(&smallCommand, &dev);
+        P(nvnQueueSubmitCommands)(&q, 1, &stableHandle);
+        P(nvnQueueFinish)(&q);
+        EXPECT("old handle replays its initial command after recorder reuse", 0, memcmp(destination, firstData, sizeof firstData));
+        EXPECT("old handle replays the complete large command after expansion", 0, memcmp(destination + 64, largeData, sizeof largeData));
+
+        if (DM_GAME_NVN_SMALL_HOST_SEGMENTS) {
+            P(nvnCommandBufferBeginRecording)(&smallCommand);
+            size_t largeRecordBytes = HOSTSEG_SZ + 64;
+            uint8_t *largeRecord = cmd_alloc(CB(&smallCommand), (uint32_t)largeRecordBytes);
+            EXPECT("oversized fallback has room for a complete record and reserve", 1,
+                CB(&smallCommand)->end - largeRecord >= largeRecordBytes + OP_RESERVE);
+            memset(largeRecord + sizeof(op_hdr), 0x72, largeRecordBytes - sizeof(op_hdr));
+            P(nvnCommandBufferEndRecording)(&smallCommand);
+        }
+        uint64_t countedBytes = 0;
+        for (int segmentIndex = 0; segmentIndex < g_nhostseg; segmentIndex++) countedBytes += g_hostseg[segmentIndex].capacity;
+        EXPECT("byte budget matches the sum of every allocated capacity", countedBytes, g_hostseg_bytes);
+        EXPECT("mixed-capacity allocation remains within one GiB", 1, g_hostseg_bytes <= HOSTSEG_CAP);
+        P(nvnCommandBufferFinalize)(&smallCommand);
+        P(nvnCommandBufferFinalize)(&spareCommand);
+        P(nvnMemoryPoolFinalize)(&destinationPool);
+    }
+
+    {
+        static uint8_t controlMemory[256], referenceMemory[1024] __attribute__((aligned(4096)));
+        NVNcommandBuffer recordedCommand, referencingCommand;
+        P(nvnCommandBufferInitialize)(&recordedCommand, &dev);
+        P(nvnCommandBufferAddControlMemory)(&recordedCommand, controlMemory, sizeof controlMemory);
+        P(nvnCommandBufferAddCommandMemory)(&recordedCommand, NULL, 0, 512);
+        P(nvnCommandBufferBeginRecording)(&recordedCommand);
+        NVNcommandHandle recordedHandle = P(nvnCommandBufferEndRecording)(&recordedCommand);
+        EXPECT("empty recording uses only its END", 8, P(nvnCommandBufferGetCommandMemoryUsed)(&recordedCommand));
+        EXPECT("control memory remains unused", 0, P(nvnCommandBufferGetControlMemoryUsed)(&recordedCommand));
+
+        NVNmemoryPoolBuilder referenceBuilder; NVNmemoryPool referencePool;
+        P(nvnMemoryPoolBuilderSetDefaults)(&referenceBuilder);
+        P(nvnMemoryPoolBuilderSetStorage)(&referenceBuilder, referenceMemory, sizeof referenceMemory);
+        P(nvnMemoryPoolInitialize)(&referencePool, &referenceBuilder);
+        P(nvnCommandBufferInitialize)(&referencingCommand, &dev);
+        P(nvnCommandBufferAddCommandMemory)(&referencingCommand, &referencePool, 0, sizeof referenceMemory);
+        P(nvnCommandBufferBeginRecording)(&referencingCommand);
+        P(nvnCommandBufferCallCommands)(&referencingCommand, 1, &recordedHandle);
+        NVNcommandHandle referencingHandle = P(nvnCommandBufferEndRecording)(&referencingCommand);
+        P(nvnQueueSubmitCommands)(&q, 1, &recordedHandle);
+        P(nvnQueueSubmitCommands)(&q, 1, &referencingHandle);
+        P(nvnQueueFinish)(&q);
+        P(nvnDeviceFinalizeCommandHandle)(&dev, recordedHandle);
+        int recordedSegment = -1;
+        for (int segmentIndex = 0; segmentIndex < g_nhostseg; segmentIndex++)
+            if (g_hostseg[segmentIndex].mem == (uint8_t *)(uintptr_t)recordedHandle) recordedSegment = segmentIndex;
+        EXPECT("handle finalisation does not reclaim storage", 1,
+            recordedSegment >= 0 && g_hostseg[recordedSegment].busy);
+        P(nvnCommandBufferFinalize)(&recordedCommand);
+        EXPECT("buffer finalisation does not reclaim storage", 1,
+            recordedSegment >= 0 && g_hostseg[recordedSegment].busy);
+        P(nvnCommandBufferInitialize)(&recordedCommand, &dev);
+        P(nvnQueueSubmitCommands)(&q, 1, &referencingHandle);
+        P(nvnQueueFinish)(&q);
+        P(nvnCommandBufferFinalize)(&recordedCommand);
+        P(nvnCommandBufferFinalize)(&referencingCommand);
+        P(nvnMemoryPoolFinalize)(&referencePool);
     }
 
     // 5b. Sync must hold the CPU back: first queue 24 copies of 64 MiB to keep the GPU busy, with the last one copying src to dst;

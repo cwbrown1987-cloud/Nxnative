@@ -26,6 +26,7 @@ mem_reserve	0x100000000
 mem_alias	0x10000000
 mem_stack	0x10000000
 app_pool	0xCD500000
+command_small_segments	on
 
 # ---- Layout captures ----
 # The HUD's counters (coin, regional coin) and other layout panes sample single-channel render targets mapped (R, 0, 0, 1) and use their alpha as the mask, as in Breath of the Wild:
