@@ -87,7 +87,7 @@ static void colour_case(const char *name,int lv,int sc,int clear_only,int slot,i
     else {h_nvnCommandBufferBindProgram(&r.cb,(const NVNprogram *)&colour_pg,3);h_nvnCommandBufferDrawArrays(&r.cb,NVN_DRAW_PRIMITIVE_TRIANGLES,0,3);}
     finish(&r);NSUInteger pre_w,pre_h;rt_dims(&pre_w,&pre_h);EXPECT("precheck: first target selected width upper bound",W[lv],pre_w);EXPECT("precheck: first target selected height upper bound",H[lv],pre_h);
     if(sc!=3||!clear_only){EXPECT("actual pass effective width",w,g_pass.tw);EXPECT("actual pass effective height",h,g_pass.th);}
-    colour_check(name,&t,lv,clear_only?(sc==3?0:1):2,w,h,sc==3);
+    colour_check(name,&t,lv,clear_only?1:2,w,h,sc==3);   // a scissored clear is drawn as a triangle (clear_color_tri) and fills exactly the scissor rectangle; it used to be rejected (nothing cleared)
     if(mrt)colour_check("MRT_unwritten_attachment",&other,-1,0,0,0,0);
 }
 static void plane_case(const char *name,int stencil,int clear_only) {
@@ -118,7 +118,7 @@ int main(int argc,char **argv){@autoreleasepool{
     else if(argc>1&&!strcmp(argv[1],"--oversized"))colour_case("oversized",1,2,0,0,0);
     else {for(int lv=0;lv<4;lv++){char name[64];snprintf(name,sizeof name,"bounded_L%d",lv);colour_case(name,lv,1,0,0,0);
             snprintf(name,sizeof name,"clear_L%d",lv);colour_case(name,lv,1,1,0,0);}
-        colour_case("partial_draw",1,3,0,0,0);colour_case("partial_clear_reject",1,3,1,0,0);colour_case("slot1_clear",1,1,1,1,0);
+        colour_case("partial_draw",1,3,0,0,0);colour_case("partial_clear",1,3,1,0,0);colour_case("slot1_clear",1,1,1,1,0);
         if(argc==1){colour_case("default",1,0,0,0,0);colour_case("oversized",1,2,0,0,0);colour_case("MRT_min",0,0,0,0,1);plane_case("depth",0,0);plane_case("stencil",1,0);plane_case("depth_clear",0,1);plane_case("stencil_clear",1,1);}}
     printf("== %d checks, %d failed ==\n",cases,failed);return failed!=0;
 }}
