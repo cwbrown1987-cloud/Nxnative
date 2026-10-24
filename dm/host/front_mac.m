@@ -95,6 +95,8 @@ static int key_bit(unsigned short code) {
     }
     return -1;
 }
+static int g_diag;   // DM_KBD_DIAG=1: temporary diagnostics for the re-opening software keyboard (key / click targets, box open / close)
+
 static void on_key(NSEvent *e, int down) {
     unsigned short c = e.keyCode;
     switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }
@@ -207,6 +209,7 @@ void front_run(void (*guest)(void)) {
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
     if (!getenv("DM_WINDOW")) { guest(); return; }
     @autoreleasepool {
+        g_diag = getenv("DM_KBD_DIAG") != NULL;
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         NSRect r = NSMakeRect(0, 0, 1280, 720);
@@ -246,6 +249,7 @@ void front_run(void (*guest)(void)) {
         dm_haptics_apple_init();
         pads_start();
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
+            if (g_diag && !e.isARepeat) { static int n; if (n++ < 500) LOG("kbd-diag: key %u %s → window %p%s", e.keyCode, e.type == NSEventTypeKeyDown ? "down" : "up", e.window, e.window == win ? " (game)" : ""); }
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (e.type == NSEventTypeKeyDown && (e.modifierFlags & NSEventModifierFlagCommand)) return e;   // ⌘ shortcuts go to the menu; a key released while ⌘ is held still reaches the game, or it would stay pressed
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
@@ -255,6 +259,10 @@ void front_run(void (*guest)(void)) {
                                                       usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1)
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+        [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown | NSEventMaskLeftMouseUp | NSEventMaskLeftMouseDragged handler:^NSEvent *(NSEvent *e) {
+            if (g_diag) { static int n; if (n++ < 500) LOG("kbd-diag: mouse %s at %.0f,%.0f → window %p%s", e.type == NSEventTypeLeftMouseDown ? "down" : e.type == NSEventTypeLeftMouseUp ? "up" : "drag", e.locationInWindow.x, e.locationInWindow.y, e.window, e.window == win ? " (game)" : ""); }
+            return e;
+        }];
         [nc addObserverForName:NSWindowDidChangeScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; if (win.screen) { g_screen_fps = (int)win.screen.maximumFramesPerSecond; g_layer.contentsScale = win.backingScaleFactor; } screen_match_apply(); }];
         // Entering and leaving fullscreen: the layer is layer-backed, so its frame (and with it the drawable) follows the
         // content view by itself; only the scale factor has to be carried over to the screen the window ended up on. The screen's rate is matched in fullscreen only (screen_match_apply)
@@ -283,6 +291,14 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
         // while it is up, or the game reads the stuck button / touch the moment the box closes (Stardew Valley's character creation re-opened the keyboard endlessly)
         g_btn = 0; g_w = g_a = g_s = g_d = 0; push();
         dm_touch_set(NULL, 0);
+        // A gamepad button held down is one press, but a Mac key held down repeats: holding Escape re-canceled every box the game
+        // re-opened (Stardew Valley's required name entry looked like an endless loop of dialogs), and holding Return re-confirmed
+        // each re-opened box with whatever was in it. Swallow repeats while the box is up, the way the applet would see one press.
+        id repeat_eater = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
+            return e.isARepeat ? nil : e;
+        }];
+        if (g_diag) LOG("kbd-diag: box open initial='%s' limit=%d", initial ?: "", max_chars);
+        double t0 = [NSDate date].timeIntervalSince1970;
         int min_chars = g_swkbd_min_chars > 0 ? g_swkbd_min_chars : 0;
         NSString *info = [NSString stringWithFormat:@"%s%s%s", sub ? sub : "", sub && *sub && guide && *guide ? "\n" : "", guide ? guide : ""];
         for (;;) {
@@ -294,15 +310,18 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
             f.stringValue = text ?: (initial ? @(initial) : @"");
             if (guide && *guide) f.placeholderString = @(guide);
             a.accessoryView = f; a.window.initialFirstResponder = f;
+            a.window.styleMask &= ~NSWindowStyleMaskClosable;   // The red close button would end the box like a cancel: a game that re-asks cancelled fields (required names) turned it into a trap
             r = [a runModal] == NSAlertFirstButtonReturn;
             text = f.stringValue;
+            if (g_diag) LOG("kbd-diag: box runModal → %s text='%s' after %.2f s", r ? "OK" : "cancel", text.UTF8String, [NSDate date].timeIntervalSince1970 - t0);
             if (!r || (int)text.length >= min_chars) break;
             // On hardware the applet would not have accepted the shorter text (OK stayed disabled); a game that rejects it re-opens the keyboard for ever, so the box comes back with the rule instead
             info = [info stringByAppendingFormat:@"\nAt least %d characters are needed here.", min_chars];
         }
+        [NSEvent removeMonitor:repeat_eater];
     });
+    snprintf(out, out_cap, "%s", text.UTF8String);   // also on cancel: the caller wants what was in the field (see front.h)
     if (!r) return 0;
     (void)max_chars;                              // Truncation is done uniformly in hle_swkbd.c in UTF-16 units
-    snprintf(out, out_cap, "%s", text.UTF8String);
     return 1;
 }

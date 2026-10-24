@@ -12,7 +12,8 @@ void front_screen_match(int fps);
 #include <stdint.h>
 // Text input box (for the software keyboard swkbd): the main thread shows a native input box and the calling thread blocks until the user confirms / cancels.
 // All text is UTF-8; max_chars is the maximum character count (0 = unlimited, only a hint for the front end; truncation is done uniformly by the caller hle_swkbd.c in UTF-16 units).
-// Confirm returns 1 and writes the result into out (including the terminating 0); cancel returns 0;
+// Confirm returns 1 and writes the result into out (including the terminating 0); cancel returns 0 and writes what was in the field when it was cancelled
+// (a game that re-asks a cancelled field, as required-field keyboards do, wants the text back as the box's initial text);
 // with no window (front_metal_layer() == NULL) nothing is shown and -1 is returned.
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap);
 

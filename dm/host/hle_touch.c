@@ -15,6 +15,10 @@ static pthread_mutex_t g_tl = PTHREAD_MUTEX_INITIALIZER;
 static int64_t g_tsamp; static uint64_t g_tlast_ns;
 
 void dm_touch_set(const dm_touch *t, int n) {
+    static int diag = -1; if (diag < 0) diag = getenv("DM_KBD_DIAG") != NULL;   // temporary re-opening-keyboard diagnostics
+    if (diag) { static int nl; if (nl++ < 400) { char b[128]; int m = snprintf(b, sizeof b, "kbd-diag: touch push n=%d", n);
+        for (int i = 0; i < n && m < (int)sizeof b - 32; i++) m += snprintf(b + m, sizeof b - m, " #%u %.3f,%.3f", t[i].id, t[i].x, t[i].y);
+        LOG("%s", b); } }
     pthread_mutex_lock(&g_tl);
     int seen[16] = {0};
     for (int i = 0; i < n; i++) {

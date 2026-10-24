@@ -9,11 +9,11 @@ int front_text_input(const char *t, const char *s, const char *g, const char *i,
 static int fails, checks;
 #define CHECK(c, ...) do { checks++; if (!(c)) { fails++; printf("  ✗ "); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
-// Input stub: record the arguments received and return as configured
+// Input stub: record the arguments received and return as configured (cancel included: the front end contract writes what was in the field, see front.h)
 static const char *g_reply; static int g_ret, g_called; static char g_title[256], g_init[256]; static int g_max;
 static int stub(const char *t, const char *s, const char *g, const char *i, int m, char *o, int c) {
     (void)s; (void)g; g_called++; snprintf(g_title, sizeof g_title, "%s", t); snprintf(g_init, sizeof g_init, "%s", i); g_max = m;
-    if (g_ret > 0) snprintf(o, c, "%s", g_reply);
+    if (g_ret >= 0) snprintf(o, c, "%s", g_reply);
     return g_ret;
 }
 
@@ -53,7 +53,7 @@ int main(void) {
     CHECK(g_max == 16, "limit %d expected 16", g_max);
 
     printf("2 cancel → 0x29F, buffer untouched\n");
-    mkarg(1, 16, hero, 4); g_ret = 0;
+    mkarg(1, 16, hero, 4); g_ret = 0; g_reply = "";   // the box was cancelled with an empty field: the front end writes that (front.h), so nothing is remembered for the next call on this arg
     r = swkbd_show(&str, arg, stub);
     CHECK(r == 0x29F, "Result %#x expected 0x29F", r);
     CHECK(sbuf[0] == 0xAA && sbuf[sizeof sbuf - 1] == 0xAA, "cancel changed the buffer");
