@@ -8,6 +8,7 @@ Update 1.0.38233 (v589824), SDK 9.3.0. Supergiant Games' engine on The Forge ren
 |---|---|---|
 | `modules main sdk` | [`game.tsv`](game.tsv) | `subsdk0` / `subsdk1` (Vulkan loader, NVIDIA driver) are replaced by the host's Vulkan layer and not loaded |
 | 4 GB layout: `mem_reserve 0x100000000`, `mem_alias 0x10000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | `game.tsv` | the NPDM declares no system resource (META +0x14 = 0), so the game uses `SetHeapSize`. Link's Awakening's partition, not measured for this game |
+| Output size stub (`OUTPUT_W` / `OUTPUT_H`) | [`patches.py`](patches.py) | any output size the host asks for (`DM_OUTPUT_SIZE`); see [Output size](#output-size) |
 | `pad_layout full` | `game.tsv` | the 3D gamepad layout: the right stick aims the cast |
 | Vulkan shaders through `vk_shaders.py` | NSP script | the game has no NVN shaders (`shader_note`); see [Files and shaders](#files-and-shaders) |
 
@@ -19,6 +20,10 @@ The layer was written for this game (Super Mario Galaxy extended it later: [0100
 - **Current:** command buffers are recorded and replayed into one Metal command buffer per submit on the layer's own queue. Swapchain images are shown through the NVN layer's present path once their frame's GPU work is done.
 - **Current:** names the game asks for through `vkGet*ProcAddr` are logged once each.
 - How the host tells the API apart: a `main` that imports Vulkan functions and not `nvnBootstrapLoader` renders with Vulkan. `profile_guess.py` leaves `vkGetInstanceProcAddr` (SDL's Vulkan loader in other games) out of its Vulkan count; Hades and both Galaxies import 99 or 100 Vulkan functions, `vkCreateInstance` among them.
+
+## Output size
+
+- The game sets its window size once at startup (1280x720, docked too; `main+0x2492b0`), and The Forge makes the swap chain and render targets from it, ignoring the Vulkan surface's extent. A stub in its [`patches.py`](patches.py) takes the host's size (`DM_OUTPUT_SIZE=1080p` / `1440p` / `4k` / `WxH`; the rewriter's table names it by `OUTPUT_W` / `OUTPUT_H`), and the whole frame renders at that size. The characters and enemies are prerendered sprites, and the Switch build ships only their 720p packages (`Content/Win/Packages/720p`), so they are scaled up while the UI, text and effects are drawn at the full size.
 
 ## Files and shaders
 
