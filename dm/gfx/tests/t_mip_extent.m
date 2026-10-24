@@ -42,7 +42,7 @@ static void finish(recording *r) {
     mtl_pool_del(r->mem);free(r->mem);
 }
 static void seed(const tex_t *t) {
-    id<MTLTexture> m=tex_mtl(t);id<MTLCommandBuffer> cb=[g_q commandBuffer];
+    id<MTLTexture> m=tex_mtl(t);id<MTLCommandBuffer> cb=q_cb();   // q_cb flushes the host's pending new-texture zeroing first and waits for it; a plain g_q command buffer ran before it, and the zeroing wiped the seed
     for(int l=0;l<t->d.levels;l++){MTLRenderPassDescriptor *p=[MTLRenderPassDescriptor renderPassDescriptor];
         if(t->d.format==NVN_FORMAT_RGBA8){p.colorAttachments[0].texture=m;p.colorAttachments[0].level=l;
             p.colorAttachments[0].loadAction=MTLLoadActionClear;p.colorAttachments[0].storeAction=MTLStoreActionStore;p.colorAttachments[0].clearColor=MTLClearColorMake(0,0,1,1);}
@@ -54,7 +54,7 @@ static void seed(const tex_t *t) {
 }
 static uint8_t *read_mip(const tex_t *t,int lv,int w,int h,int bpp) {
     NSUInteger row=(w*bpp+15)&~15u;id<MTLBuffer> buf=[g_dev newBufferWithLength:row*h options:MTLResourceStorageModeShared];
-    id<MTLCommandBuffer> cb=[g_q commandBuffer];id<MTLBlitCommandEncoder> b=[cb blitCommandEncoder];
+    id<MTLCommandBuffer> cb=q_cb();id<MTLBlitCommandEncoder> b=[cb blitCommandEncoder];
     id<MTLTexture> src=tex_mtl(t);MTLBlitOption opt=t->d.format==NVN_FORMAT_DEPTH32F_STENCIL8?(bpp==1?MTLBlitOptionStencilFromDepthStencil:MTLBlitOptionDepthFromDepthStencil):MTLBlitOptionNone;
     [b copyFromTexture:src sourceSlice:0 sourceLevel:lv sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(w,h,1)
       toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row*h options:opt];[b endEncoding];[cb commit];[cb waitUntilCompleted];EXPECT("per-texel readback done",4,cb.status);
