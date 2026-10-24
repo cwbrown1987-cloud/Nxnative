@@ -88,8 +88,10 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
     if (!buf || !cap) return RES_OK;                         // same as the SDK: if String has no buffer, the text is not read
     memset(buf, 0, cap);
     uint16_t u16[1003]; size_t n = swkbd_u8_to_u16(text, maxlen > 0 ? (size_t)maxlen : 1002, u16, 1003);   // truncate to the character limit (counted in UTF-16 units)
-    if (arg[ARG_UTF8]) swkbd_u16_to_u8(u16, n, (char *)buf, cap);
-    else memcpy(buf, u16, (n + 1) * 2 <= cap ? n * 2 : (cap / 2 - 1) * 2);
+    size_t area;   // the text area handed back: the string with its terminating 0. ReadCloseResultAndString copies it into String{+0 pointer, +8 byte count}, so +8 gets the area size, not the capacity the game passed in
+    if (arg[ARG_UTF8]) area = swkbd_u16_to_u8(u16, n, (char *)buf, cap) + 1;
+    else { size_t m = (n + 1) * 2 <= cap ? n : cap / 2 - 1; memcpy(buf, u16, m * 2); area = (m + 1) * 2; }
+    memcpy((uint8_t *)out + 8, &area, 8);
     { const char *lag = getenv("DM_TEST_SWKBD_LAG_MS"); if (lag) usleep((useconds_t)atoi(lag) * 1000); }   // test: slow down "keyboard handed back → the game's thread gets the result" to verify that auto-accept does not jump the gun   // front end path cleanup (dm_cursor.c): auto-accept after the name is typed on the naming page
     return RES_OK;
 }
