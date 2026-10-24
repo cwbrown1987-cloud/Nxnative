@@ -51,6 +51,9 @@ void dm_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t 
 }
 void dm_pad_set_player(int p, uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     if (p < 0 || p >= DM_PLAYERS) return;
+    static int diag = -1; if (diag < 0) diag = getenv("DM_KBD_DIAG") != NULL;   // temporary re-opening-keyboard diagnostics
+    if (diag) { uint64_t prev = atomic_load(&g_pad_btn[p]); static int nl;
+        if (prev != buttons && nl++ < 400) LOG("kbd-diag: pad p%d buttons %#llx → %#llx", p + 1, (unsigned long long)prev, (unsigned long long)buttons); }
     uint64_t old = atomic_exchange(&g_pad_btn[p], buttons); atomic_fetch_or(&g_pad_latch[p], buttons & ~old); atomic_store(&g_pad_axes[p], pack(lx, ly, rx, ry));
     if (!p) shake_note();
 }
@@ -222,6 +225,10 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
         uint64_t v = atomic_load(&g_pad_axes[p]); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(v, i));
     }
     s->lx = a[0]; s->ly = a[1]; s->rx = a[2]; s->ry = a[3];
+    static int diag = -1; if (diag < 0) diag = getenv("DM_KBD_DIAG") != NULL;   // temporary re-opening-keyboard diagnostics: what the game reads when the buttons change
+    if (diag && id <= 0x20) { static uint64_t last[0x21]; static int nl;
+        if (b != last[id] && nl++ < 400) LOG("kbd-diag: npad id %#x read buttons %#llx", id, (unsigned long long)b);
+        last[id] = b; }
     b &= 0xffffull;
     if (s->lx < -STICK_THRESH) b |= 1u << 16;
     if (s->ly > STICK_THRESH) b |= 1u << 17;

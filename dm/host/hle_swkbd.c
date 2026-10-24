@@ -66,8 +66,10 @@ typedef int (*swkbd_input_fn)(const char *title, const char *sub, const char *gu
 // (Stardew Valley's character creation: the game re-asks a cancelled or rejected field for ever, and each box came up blank).
 static struct { const void *arg; char text[501 * 3 + 1]; } g_swkbd_init;
 // What the player last submitted for this arg, whether the game took it or not. A required field that the game re-asks after a cancel or a rejection comes
-// back with the same arg: the box then starts from what was in it instead of blank (the applet's own prefill cannot be read everywhere, see g_swkbd_init)
-static struct { const void *arg; char text[1002 * 3 + 1]; } g_swkbd_last;
+// back with the same arg: the box then starts from what was in it instead of blank (the applet's own prefill cannot be read everywhere, see g_swkbd_init).
+// The game does not always re-use the arg: Stardew Valley rebuilt it for each re-ask (a fresh stack struct, only the initial-text fields moved), so the
+// first ARG_INIT_OFF bytes are kept too and a re-ask that carries initial text (ilen > 0) it cannot be read from is recognized by that config alone
+static struct { const void *arg; char text[1002 * 3 + 1]; uint8_t cfg[ARG_INIT_OFF]; int have; } g_swkbd_last;
 Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
     const uint8_t *arg = arg_;
     char title[HEADER_N * 3 + 1], sub[SUB_N * 3 + 1], guide[GUIDE_N * 3 + 1], init[501 * 3 + 1] = "", text[1002 * 3 + 1];
@@ -77,7 +79,8 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
     int32_t maxlen, minlen, ilen, ioff; memcpy(&maxlen, arg + ARG_MAXLEN, 4); memcpy(&minlen, arg + ARG_MINLEN, 4); memcpy(&ilen, arg + ARG_INIT_LEN, 4); memcpy(&ioff, arg + ARG_INIT_OFF, 4);
     const uint8_t *work; memcpy(&work, arg + ARG_WORKBUF, 8);
     if (ilen > 0 && work) swkbd_u16_to_u8((const uint16_t *)(work + ioff), (size_t)ilen, init, sizeof init);
-    if (g_swkbd_last.arg == arg_ && g_swkbd_last.text[0]) snprintf(init, sizeof init, "%s", g_swkbd_last.text);   // what the player last typed for this field
+    int same_field = g_swkbd_last.arg == arg_ || (ilen > 0 && g_swkbd_last.have && !memcmp(arg, g_swkbd_last.cfg, ARG_INIT_OFF));
+    if (same_field && g_swkbd_last.text[0]) snprintf(init, sizeof init, "%s", g_swkbd_last.text);   // what the player last typed for this field
     else if (g_swkbd_init.arg == arg_ && g_swkbd_init.text[0]) snprintf(init, sizeof init, "%s", g_swkbd_init.text);   // SetInitialTextUtf8: see g_swkbd_init
     {   // temporary re-opening-keyboard diagnostics (DM_KBD_DIAG): the arg's flag area around the known fields, to locate isCancelable and friends
         static int diag = -1; if (diag < 0) diag = getenv("DM_KBD_DIAG") != NULL;
@@ -95,7 +98,7 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
     static int hold = -1; if (hold < 0) { const char *h = getenv("DM_TEST_SWKBD_HOLD_MS"); hold = h ? atoi(h) : 0; }
     if (script && hold > 0) usleep((useconds_t)hold * 1000);
     int r = script ? (snprintf(text, sizeof text, "%s", script), 1) : (g_swkbd_min_chars = minlen > 0 ? minlen : -1, input(title, sub, guide, init, maxlen > 0 ? maxlen : 0, text, sizeof text));
-    if (r >= 0) { g_swkbd_last.arg = arg_; snprintf(g_swkbd_last.text, sizeof g_swkbd_last.text, "%s", text); }   // remember what was in the field, taken by the game or not
+    if (r >= 0) { g_swkbd_last.arg = arg_; memcpy(g_swkbd_last.cfg, arg, ARG_INIT_OFF); g_swkbd_last.have = 1; snprintf(g_swkbd_last.text, sizeof g_swkbd_last.text, "%s", text); }   // remember what was in the field, taken by the game or not
     g_swkbd_numeric_max = -1;   // the numeric box mark applies to this one time only (set by dm_textinput.c before bringing up the keyboard)
     g_swkbd_min_chars = -1;     // the minimum length applies to this one time only
     LOG("swkbd: title '%s' initial '%s' limit %d min %d → %s%s%s", title, init, maxlen, minlen,

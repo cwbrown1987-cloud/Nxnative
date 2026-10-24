@@ -128,6 +128,10 @@ static void pad_read(GCExtendedGamepad *g) {
     dm_pad_set_player(p, m, pad_axis(g.leftThumbstick.xAxis.value), pad_axis(g.leftThumbstick.yAxis.value), pad_axis(g.rightThumbstick.xAxis.value), pad_axis(g.rightThumbstick.yAxis.value));
 }
 static const char *pad_name(GCController *c) { return c.vendorName.UTF8String ?: "?"; }
+// Push every connected controller's current state (the value-changed handler alone freezes while a native box is up: see front_text_input)
+static void pads_poll(void) {
+    for (GCController *c in GCController.controllers) if (c.extendedGamepad) pad_read(c.extendedGamepad);
+}
 static void npad_name(int p, char *out, size_t cap) { uint32_t id = dm_player_npad(p); if (id == 0x20) snprintf(out, cap, "handheld"); else snprintf(out, cap, "%u", id); }
 // Called at start and on every connect / disconnect (gone: the controller that was just removed, nil on a connect)
 static void pads_changed(GCController *gone) {
@@ -297,6 +301,12 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
         id repeat_eater = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             return e.isARepeat ? nil : e;
         }];
+        // GameController delivers its button events on the main run loop in modes the modal panel does not run: while the box is up, a button
+        // released on the controller stays held for the game, whose other threads go on running and keep re-activating the field (a
+        // gamepad A held into Stardew Valley's required name box queued eight more ShowKeyboard calls behind the first, and every box
+        // the player dismissed fed the next). Poll the controllers in the modal mode, so the game sees the pads live as it does outside.
+        NSTimer *pad_timer = [NSTimer timerWithTimeInterval:1.0 / 30.0 repeats:YES block:^(NSTimer *t) { (void)t; pads_poll(); }];
+        [[NSRunLoop currentRunLoop] addTimer:pad_timer forMode:NSModalPanelRunLoopMode];
         if (g_diag) LOG("kbd-diag: box open initial='%s' limit=%d", initial ?: "", max_chars);
         double t0 = [NSDate date].timeIntervalSince1970;
         int min_chars = g_swkbd_min_chars > 0 ? g_swkbd_min_chars : 0;
@@ -318,6 +328,7 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
             // On hardware the applet would not have accepted the shorter text (OK stayed disabled); a game that rejects it re-opens the keyboard for ever, so the box comes back with the rule instead
             info = [info stringByAppendingFormat:@"\nAt least %d characters are needed here.", min_chars];
         }
+        [pad_timer invalidate];
         [NSEvent removeMonitor:repeat_eater];
     });
     snprintf(out, out_cap, "%s", text.UTF8String);   // also on cancel: the caller wants what was in the field (see front.h)
