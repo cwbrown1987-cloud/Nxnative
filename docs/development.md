@@ -335,6 +335,18 @@ The game's own work and its frame rate stay as they are; the host avoids work of
 
 Each game's notes are in its profile folder, `dm/games/<id>/README.md`: what the profile needs and why, what was found on the game, Mac routes and open items. The [games table](../dm/games/README.md#games) lists them.
 
+**The Legend of Zelda: Echoes of Wisdom (`01008CF01BAAC000`)**
+- **Status:** plays on the Mac; iPad not tested yet. Base game 1.0.0 (`v0`), no update. On the Mac: the boot, the title (Press Any Button), file select and about 4 minutes of play, at 60 fps with stretches where the game itself runs at 30 (33.3 ms frames), with sound; about 1.5 GB resident and flat while it runs. The only red lines are Core Haptics' on the Mac (no rumble motor) and one `texture type mismatch: shader declares a cube, texture is 2D (texture ID 271)`, for which the zero cube is bound (what that texture is was not looked into).
+- **Engine:** Grezzo's engine on NintendoWare (G3d / Ui2d / Vfx / Atk / Font), as Link's Awakening, on SDK 16.2.0 (Mario Wonder's) with NVN. Modules main + subsdk0 (GLSLC, which `main` imports `glslcCompilePreSpec` from) + subsdk1 (movie) + sdk. Its movies are WebM files in `region_common/movie`, played through the SDK's movie library.
+- **Files:** 10,963 RomFS files (7.48 GB), nearly all under `region_common/` (maps 2.78 GB, actors 1.19 GB, audio 1.29 GB, shared textures 0.99 GB), with the text of each language under `region<XX>/`.
+- **Shaders:** 9,799 BNSH programs (5,234 vertex, 4,528 pixel, 37 compute): the particle effects in `region_common/effect/*.ptcl` (5,944), the `.bfsha` archives in `region_common/shader` (3,576), the layouts' `bgsh` in `region_common/ui/*.arc` and 40 in `main`. The profile keeps the provisional `shader_groups` and `shader_note`, which are in every shader's cache key.
+- **Memory:** no system resource (`sys_resource 0`), so no virtual address memory: the game sets a 3.11 GB heap in the 4 GB layout. The rewritten modules exceed the default 64 MB of used memory (`mem_used 0x6600000`).
+- **Host changes:** none. The provisional profile the NSP script guessed booted and played the game as it is; the registered profile adds only the app's name and category.
+- **Cartridge dump:** the base game is an XCI with no ticket and no tags in its file name, so the NSP script could not tell its title ID or version; renamed with `[01008CF01BAAC000][v0]`, it is packed as any other.
+- **Stutter:** the first use of a Metal pipeline takes 40–450 ms; the prewarm list (576 lines, recorded on the Mac over the route above) removes most of it on later runs (29 long frames → 5). A few presents on the Mac stall 100–300 ms in the display link and come and go between runs (`DM_PRESENT_LINK=0` against `1`, two pairs of runs: inconclusive).
+- **Input:** the pad only (`main` imports no touch screen); the default 2D gamepad layout.
+- **Mac input:** the work folder's `run.sh <log> [secs] VAR=…` boots the Mac host from the NSP script's build folder, its log in `logs/`.
+
 ## Tools (`dm/tools`)
 
 | Tool | What it does |
