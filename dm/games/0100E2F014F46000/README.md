@@ -2,7 +2,9 @@
 
 Update 1.0.2 (v131072) over the base game, SDK 10.9.0. Team Ninja's engine on NVN. Modules `main`, `subsdk0` (NintendoSDK_movie) and `sdk`.
 
-On the Mac: reached Chapter 1 gameplay with movement and camera control, at about 60 fps on an Apple M5 Max. Not tested on the iPhone.
+On the iPhone: reached gameplay on an A18 Pro at about 59.5 fps (16.81 ms frame interval, 7.25 ms GPU time) at 2346x1320 on iOS 27.2. The in-game performance overlay reported 1.71 GB Metal memory and 1.08 GB app memory. The screenshot is [`ninja-gaiden-sigma-iphone.png`](../../../docs/images/ninja-gaiden-sigma-iphone.png).
+
+On the Mac: reached Chapter 1 gameplay with movement and camera control, at about 60 fps on an Apple M5 Max.
 
 ## What it needs
 
@@ -26,7 +28,7 @@ SDK 10.9.0 calls `nn::fs::ReadFile(FileHandle, offset, buffer, length, ReadOptio
 
 ## Mac route
 
-The route used for verification reached Chapter 1 gameplay, where Ryu, the environment and HUD were visible and the left/right stick controls were usable. The opening, later chapters, save creation/loading and iPhone gameplay remain unverified.
+The Mac route used for verification reached Chapter 1 gameplay, where Ryu, the environment and HUD were visible and the left/right stick controls were usable. On iPhone, the game reached gameplay and ran at about 59.5 fps on A18 Pro. The opening, later chapters and save creation/loading remain unverified.
 
 ## Found on this game
 
@@ -36,4 +38,4 @@ The route used for verification reached Chapter 1 gameplay, where Ryu, the envir
 ## Open
 
 - The `pso_manifest.tsv` is empty; it has not been recorded over a full play route.
-- Only Chapter 1 gameplay has been checked on the Mac. No iPhone, save/load or later-chapter testing has been done.
+- Only Chapter 1 gameplay has been checked on the Mac. On iPhone, gameplay and performance have been checked, but save/load and later chapters have not.
