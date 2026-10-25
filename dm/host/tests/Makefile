@@ -37,6 +37,7 @@ run: $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_fs_
 	$(B)/t_haptics_apple
 	$(B)/t_nro
 	$(B)/t_symbols
+	$(B)/t_pad_motion
 run: $(B)/t_nro
 run: $(B)/t_symbols
 $(B)/t_symbols: t_symbols.c ../hle.c ../loader.c ../hle.h ../dm.h $(GAME_H) | $(B)
@@ -188,3 +189,7 @@ notify-scheduler: $(B)/t_notify_sched
 	$(B)/t_notify_sched
 	$(B)/t_notify_sched --all-peers
 run: notify-scheduler
+
+run: $(B)/t_pad_motion
+$(B)/t_pad_motion: t_pad_motion.c ../pad_motion.h ../dm_input.h | $(B)
+	clang -O1 -Wall -Werror -o $@ t_pad_motion.c

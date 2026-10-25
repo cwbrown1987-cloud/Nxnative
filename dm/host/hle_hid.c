@@ -2,7 +2,7 @@
 // Generic, game-independent version: player 1 is always connected, as the handheld controller (Npad id 0x20) with DM_OPMODE=0 (handheld), otherwise as the 1P full-key controller (id 0);
 // players 2..8 are full-key controllers on No2..No8 (ids 1..7) while the front end reports a controller for them (dm_pad_players; the Mac gives each physical controller a player
 // of its own, front_mac.m). A player whose npad the game does not support (SetSupportedNpadIdType) is not reported: in a one-player game it feeds player 1, otherwise it is not used.
-// Six-axis sensor: one per connected controller (two for handheld), at rest lying flat, player 1's shaken side to side while the front end holds DM_BTN_SHAKE (see the six-axis section below).
+// Six-axis sensor: physical motion when supplied by the front end, otherwise at rest lying flat; DM_BTN_SHAKE provides the existing synthetic gesture (see below).
 // Vibration follows the player assignments through hle_haptics.c. Mouse and keyboard: not connected; the controller applet reports the connected players with player 1 selected.
 #include "hle.h"
 #include "hle_haptics.h"
@@ -312,6 +312,33 @@ HLE_FORCE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoE
 typedef struct { int64_t delta_ns, sampling; float acc[3], gyro[3], angle[3], dir[9]; uint32_t attributes, _pad; } SixAxisState;
 _Static_assert(sizeof(SixAxisState) == 0x60, "SixAxisState");
 enum { SIX_PERIOD_NS = 5000000 };
+enum { MOTION_HISTORY = 64 };
+static pthread_mutex_t motion_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { dm_motion data[MOTION_HISTORY]; uint64_t time[MOTION_HISTORY], count, last_host; } motion[DM_PLAYERS];
+void dm_pad_motion(int p, const dm_motion *s) {
+    if (p < 0 || p >= DM_PLAYERS) return;
+    pthread_mutex_lock(&motion_lock);
+    if (!s) memset(&motion[p],0,sizeof motion[p]);
+    else {
+        uint64_t host=now_ns();
+        if(motion[p].count && host-motion[p].last_host >= 250000000ull) motion[p].count=0;
+        unsigned i=motion[p].count++ % MOTION_HISTORY;
+        motion[p].data[i]=*s; motion[p].time[i]=guest_ns(); motion[p].last_host=host;
+    }
+    pthread_mutex_unlock(&motion_lock);
+}
+static int physical_motion(int p, uint64_t time, dm_motion *out) { // lock held
+    if (p < 0) return 0;
+    uint32_t candidates = 1u << p; if (!p) candidates |= merged_players();
+    for (int j=0;j<DM_PLAYERS;j++) if ((candidates >> j & 1) && motion[j].count && now_ns()-motion[j].last_host < 250000000ull) {
+        uint64_t count=motion[j].count, n=count<MOTION_HISTORY?count:MOTION_HISTORY;
+        for (uint64_t k=0;k<n;k++) {
+            unsigned i=(count-1-k)%MOTION_HISTORY;
+            if (motion[j].time[i] <= time) { *out=motion[j].data[i]; return 1; }
+        }
+    }
+    return 0;
+}
 #define SHAKE_G 3.0
 #define SHAKE_REV 1.5
 static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < atomic_load(&g_shake_end); }
@@ -339,8 +366,26 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
     int64_t samp = (int64_t)(guest_ns() / SIX_PERIOD_NS);
     int shakes = player_of(h >> 8 & 0xff) == 0;
-    for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, shakes);
+    int p=player_of(h >> 8 & 0xff);
+    pthread_mutex_lock(&motion_lock);
+    for (int i = 0; i < n; i++) {
+        six_sample(&out[i], samp - i, shakes);
+        dm_motion m;
+        // Explicit shake retains the original whole-cycle behavior.
+        if (!(shakes && shaking((uint64_t)(samp-i)*SIX_PERIOD_NS)) && physical_motion(p,(uint64_t)(samp-i)*SIX_PERIOD_NS,&m)) {
+            memcpy(out[i].acc,m.acc,sizeof m.acc); memcpy(out[i].gyro,m.gyro,sizeof m.gyro);
+            memcpy(out[i].angle,m.angle,sizeof m.angle); memcpy(out[i].dir,m.dir,sizeof m.dir);
+        }
+    }
+    pthread_mutex_unlock(&motion_lock);
     return n;
+}
+static unsigned six_rest(uint32_t h) {
+    int p=player_of(h >> 8 & 0xff); if (!p && shaking(guest_ns())) return 0;
+    dm_motion m; pthread_mutex_lock(&motion_lock); int present=physical_motion(p,guest_ns(),&m); pthread_mutex_unlock(&motion_lock);
+    if (!present) return 1;
+    float speed=0,acc=0; for(int i=0;i<3;i++) { speed+=m.gyro[i]*m.gyro[i]; acc+=m.acc[i]*m.acc[i]; }
+    return speed < 0.0001f && fabsf(acc-1) < 0.1f;
 }
 HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for handheld / dual Joy-Cons, one otherwise",
           int, h_hid_SixHandles, uint32_t *h, int n, const uint32_t *id, uint32_t style) {
@@ -494,7 +539,7 @@ HLE_FORCE("_ZN2nn3hid16GetGestureStatesEPNS0_12GestureStateEi", "gesture states,
 // Six-axis details: the current state, at rest unless shaking, fusion off
 HLE_FORCE("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor; always sampling on the host", void, h_hid_SixStop, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", "six-axis sensor current state", void, h_hid_SixState, SixAxisState *s, const uint32_t *h) { six_states(s, 1, *h); }
-HLE_FORCE("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", "six-axis sensor at rest: yes unless player 1's is shaking", unsigned, h_hid_SixRest, const uint32_t *h) { return player_of(*h >> 8 & 0xff) != 0 || !shaking(guest_ns()); }
+HLE_FORCE("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", "physical motion or the simulated shake determines rest", unsigned, h_hid_SixRest, const uint32_t *h) { return six_rest(*h); }
 // The console's own six-axis sensor (SevenSixAxisSensor, the body's orientation in handheld mode; The Legend of Zelda: Breath of the Wild): takes a work buffer and is switched through the hid service. The host provides none: switching succeeds, 0 states
 HLE_FORCE("_ZN2nn3hid28InitializeSevenSixAxisSensorEPvm", "console six-axis sensor initialization; not provided by the host", Result, h_hid_SevenInit, void *buf, size_t n) { (void)buf; (void)n; return RES_OK; }
 HLE_FORCE("_ZN2nn3hid26FinalizeSevenSixAxisSensorEv", "console six-axis sensor", Result, h_hid_SevenFini, void) { return RES_OK; }

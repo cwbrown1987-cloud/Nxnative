@@ -12,6 +12,7 @@ static int hid_usleep(useconds_t usec);
 #include "../pad_slots.h"
 
 static int checks, fails, g_mode = 1, g_signals;
+static uint64_t test_time = 1000000000ull;
 static void *g_signalled;
 static time_t rumble_second = 1;
 static void (*script_hold)(void);
@@ -19,8 +20,8 @@ static int hid_clock_gettime(clockid_t clock, struct timespec *ts) { (void)clock
 static int hid_usleep(useconds_t usec) { (void)usec; if (script_hold) script_hold(); return 0; }
 #define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s (line %d)\n", msg, __LINE__); } } while (0)
 int dm_opmode(void) { return g_mode; }
-uint64_t guest_ns(void) { return 1000000000ull; }
-uint64_t now_ns(void) { return 1000000000ull; }
+uint64_t guest_ns(void) { return test_time; }
+uint64_t now_ns(void) { return test_time; }
 uint64_t dm_guest_frame(void) { return 0; }
 void dm_touch_set(const dm_touch *t, int n) { (void)t; (void)n; }
 int touch_fill_n(void *out, int max, uint64_t now) { (void)out; (void)max; (void)now; return 0; }
@@ -241,6 +242,7 @@ static void t_script(void) {
     script_set(0, 0, 0, 0, 0); buttons_of(NPAD_HANDHELD, STYLE_HANDHELD);
     g_mode = 1; dm_pad_players(1);
     g_nsteps = 0;
+    test_time += 1000000000ull;   // let the scripted Shake finish before the physical-motion tests
 }
 
 int main(void) {
@@ -250,6 +252,23 @@ int main(void) {
     t_script();
     t_vibration();
     t_rumble_log();
+    g_mode = 1; ids((uint32_t[]){0,1}, 2); dm_pad_players(3);
+    dm_motion motion = {.acc={0,0,-1}, .gyro={0.1f,0.2f,0.3f}, .dir={1,0,0,0,1,0,0,0,1}};
+    dm_pad_motion(1, &motion);
+    SixAxisState six[3]; uint32_t h = 0x100;
+    CHECK(six_states(six, 3, h) == 3 && six[0].gyro[2] == 0.3f, "physical gyro reaches its player's six-axis state");
+    CHECK(!h_hid_SixRest(&h), "physical gyro is not reported at rest");
+    test_time += SIX_PERIOD_NS; motion.gyro[2] = 0.6f; dm_pad_motion(1, &motion);
+    six_states(six, 3, h);
+    CHECK(six[0].gyro[2] == 0.6f && six[1].gyro[2] == 0.3f, "six-axis history preserves distinct samples");
+    ids((uint32_t[]){0},1); six_states(six,1,0);
+    CHECK(six[0].gyro[2] == 0.6f, "one-player title receives merged controller motion");
+    test_time += 1000000000ull; six_states(six,1,0);
+    CHECK(six[0].gyro[2] == 0 && six[0].acc[2] == -1, "stale physical motion returns to rest");
+    test_time += 1000000; memset(motion.gyro,0,sizeof motion.gyro); dm_pad_motion(1,&motion);
+    six_states(six,3,0);
+    CHECK(six[0].gyro[2]==0 && six[1].gyro[2]==0 && six[2].gyro[2]==0, "fresh motion never revives history from before a stale gap");
+    dm_pad_motion(1, NULL); six_states(six,1,0); CHECK(six[0].gyro[2] == 0, "disconnect clears sensor history");
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

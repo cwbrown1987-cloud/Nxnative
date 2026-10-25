@@ -22,6 +22,10 @@ void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry
 void dm_pad_set_player(int player, uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry);   // player 0..DM_PLAYERS-1 (player 1..8)
 void dm_pad_players(uint32_t mask);   // bit p: player p + 1 has a controller; player 1 always counts as connected (the keyboard, the touch gamepad, DM_KEYS)
 uint32_t dm_player_npad(int player);  // the npad id the game reads player p + 1 on: Handheld (0x20) or No1 (0) for player 1, No n (id n - 1) for player n
+// Physical six-axis samples in Switch coordinates: G (gravity is -Z at rest),
+// revolutions/s, accumulated revolutions, and a column-major direction matrix.
+typedef struct { float acc[3], gyro[3], angle[3], dir[9]; } dm_motion;
+void dm_pad_motion(int player, const dm_motion *sample); // NULL clears history on disconnect/recenter
 
 // Optional diagnostic DM_HID_RECEIPT_LOG=<writable JSONL path>: received samples of real GetNpadState returns.
 // Fields read_start_ns/time_ns use the same host now_ns(); the front-end publish window must use the same helper, and a read interval that spans a publish must not be force-matched.
