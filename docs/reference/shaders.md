@@ -28,6 +28,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** it now goes by the zstd magic (`28 b5 2f fd`) whatever the name.
 - **Found on:** [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) (8,726 of the RomFS's 9,959 files, the shader archives among them). Of the other 21 games' RomFS on hand only Super Mario Galaxy's `GDDR3.zst` (a Vulkan game, no NVN split) has such a file.
 
+### HAL's `.cmp` containers: a size-prefixed frame
+
+- **Symptom:** the game asks for shaders the map does not have (`[RED] shader ... is not in the shader map`, hundreds of lines), and the split finds far fewer shaders than the game uses (121 against 27,288 on Kirby and the Forgotten Land).
+- **Cause:** HAL keeps its assets in `.cmp` containers: a 4-byte little-endian uncompressed size, then a frame (zstd, or LZ4 in the `ubin/` map data). The split decompressed a zstd file by its magic at offset 0, so a frame that starts at offset 4 was read raw, and the shaders inside the BFRES archives of those containers were never seen.
+- **Fix:** the split opens a size-prefixed frame as well (`unzs_bytes` for zstd, with the frame's dictionary handling as for a plain zstd file, `unlz4_bytes` for LZ4). The size prefix is checked against the decompressed length, so a file that is not a container is left alone.
+- **Found on:** Kirby and the Forgotten Land (`01004D300C5AE000`, in bring-up): 7,201 `.cmp` files, 5,121 of them zstd frames with 19,364 BNSH inside (11.2 GB decompressed) and 2,080 LZ4 frames, all of the latter in `ubin/` (0.3 GB, and no BNSH). The split now finds 27,288 shaders (18,476 in `gfx/`, 8,313 in `ptcl/`, 383 in `lyt/`, 67 in the loose `shader` files, 54 in `main`), against 121 before.
+
 ### BNSH in Bezel Engine archives
 
 - **How it is stored:** the shaders are BNSH in the `.bfsha` entries of the `.bea` archives (zstd entries, [01](../agents/01-extract.md)), most of them the engine's own in `System.nx.bea` (`_BezelSystemResources/<system>/shader/*.bfsha`: PBR shadow maps 846, post effects 770, …), the rest in the layouts' `__ArchiveShader.bnsh` and the per-archive shader packs (`.bnbshpk`), plus one BNSH in `main`.

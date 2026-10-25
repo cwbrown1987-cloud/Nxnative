@@ -536,6 +536,7 @@ def mtarc_shaders(d, label, out):
         if m[:4] == MTSPK: out.extend(mtspk_shaders(m, f'{label}#{path}'))
 
 SCNE, ZSTD_MAGIC = b'SCNE', bytes.fromhex('28b52ffd')
+LZ4_FRAME_MAGIC = bytes.fromhex('04224d18')   # the frame of HAL's other .cmp container (the ubin/ map data)
 def bea_members(d, label):
     """NintendoWare Bezel Engine archive ('.bea', magic 'SCNE', a NintendoWare binary file of version 0x10100; Big Brain Academy: Brain vs. Brain keeps nearly all of RomFS in 603 of them):
     +0x20 u64 entry count, +0x28 u64 offset of the entry pointer array (u64 each), each pointing at a 0x30-byte 'ASST' entry {+0x10 u16 kind, u16 alignment shift, u32 stored length,
@@ -1408,6 +1409,22 @@ def unzs(path):
     if did not in _ZD: _ZD[did] = zstd.ZstdDict(ZDICTS[did])
     return zstd.decompress(d, zstd_dict=_ZD[did])
 
+def unzs_bytes(d, size=None):
+    """A zstd frame in memory: HAL's .cmp containers (Kirby and the Forgotten Land) hold one after a 4-byte little-endian uncompressed size, and the split has to open them to find the shaders"""
+    fhd = d[4] if len(d) > 5 else 0
+    n, o = (0, 1, 2, 4)[fhd & 3], 6 - (fhd >> 5 & 1)   # dictionary ID size; it follows the window descriptor, which single-segment frames omit
+    did = int.from_bytes(d[o:o + n], 'little')
+    zstd = zstd_mod()
+    if not did: return zstd.ZstdDecompressor().decompress(d, max_length=size if size else (1 << 31))
+    if did not in ZDICTS: raise ValueError(f'the frame needs the zstd dictionary {did}, which Pack/ZsDic.pack.zs does not have')
+    if did not in _ZD: _ZD[did] = zstd.ZstdDict(ZDICTS[did])
+    return zstd.decompress(d, zstd_dict=_ZD[did])
+
+def unlz4_bytes(d):
+    """An LZ4 frame in memory: HAL's other .cmp container (the ubin/ map data)"""
+    import lz4.frame
+    return lz4.frame.decompress(d)
+
 def unity_program(code, where, stage=None):
     """Unity's Switch program code → [(stage, control, code)]; stage = the subprogram's stage from m_ParsedForm, which only the pre-2019.3 layout needs"""
     if len(code) >= 0x14 and code[0x10:0x14] == CTL_MAGIC:   # before 2019.3: 0x10 header + control section + code area, one stage
@@ -1615,6 +1632,15 @@ def scan_file(args):
         for nm, m in gfpak_members(open(path, 'rb').read(), '/' + rel): scan_blob(m, f'/{rel}{nm}', found)
         return rel, uniq_keys(found), var_pairs(found), trees
     d = unzs(path) if head[:4] == ZSTD_MAGIC else open(path, 'rb').read()   # by the magic: Paper Mario: The Thousand-Year Door names its zstd files .zst (8,726, its shaders among them)
+    if head[:4] != ZSTD_MAGIC and head[4:8] in (ZSTD_MAGIC, LZ4_FRAME_MAGIC):   # HAL's .cmp containers (Kirby and the Forgotten Land: 7,201 of them, 5,121 zstd frames with 19,364 BNSH inside and 2,080 LZ4 frames): a 4-byte little-endian uncompressed size, then the frame. Read raw, the split found 121 shaders and the game asked for 900 it did not have ("[RED] shader ... is not in the shader map")
+        n = struct.unpack_from('<I', d, 0)[0]
+        why = ''
+        try: dec = unzs_bytes(d[4:], n) if head[4:8] == ZSTD_MAGIC else unlz4_bytes(d[4:])
+        except Exception as e: dec = None; why = str(e)
+        if dec is None: why = why or 'the frame did not open'
+        elif len(dec) != n: dec = None; why = f'the size prefix says {n} bytes, the frame holds {len(dec)}'
+        if dec is None: print(f'[RED] {rel}: the container did not open ({why}): the file is read as it is', flush=True)   # a container that stays closed holds its shaders unread, and the game asks for what the split did not find
+        else: d = dec
     if d[:4] == b'Yaz0': d = yaz0(d)
     if d[:3] == b'XNB' and d[4] == 5 and d[5] & 0xC0 and len(d) > 14:   # a compressed XNB (Stardew Valley: 3,535 LZ4 files, 8 LZX): only effects (EffectReader) carry MGFX shaders, and for LZX the reader names sit in the first block, so it decides whether the rest is worth decoding
         if d[5] & 0x80:
