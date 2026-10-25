@@ -7788,7 +7788,8 @@ static unsigned mtl_pf_chmask(MTLPixelFormat pf) {
 }
 // GPU: clear a texture region with the given value (previously mislisted as a no-op, called 5 times at initialization; the initial value of a Metal private texture is undefined, and the game relies on the cleared initial value).
 // Whole level and whole face, all four channels written -> open one clear-only render pass per layer / depth slice (the hardware converts the clear value by the texture format, including integer and depth);
-// view with changed format: clear on a view of that format; partial region, partial channels, compressed / packaged textures (no render target usage): report a failure, to be implemented
+// A format view changes the clear value interpretation; colour regions / channel masks use a triangle. Unsupported depth/stencil regions and non-renderable formats are reported.
+static int clear_tex_draw(const p_clear_tex *c, id<MTLTexture> t, unsigned lv, unsigned l0);
 static void clear_tex(const p_clear_tex *c) {
     if (c->tex) zskip_del(c->tex->serial);
     id<MTLTexture> t = tex_mtl(c->tex);
@@ -7812,6 +7813,9 @@ static void clear_tex(const p_clear_tex *c) {
     }
     MTLPixelFormat pf = t.pixelFormat;
     int depth = pf == MTLPixelFormatDepth32Float || pf == MTLPixelFormatDepth16Unorm || pf == MTLPixelFormatDepth32Float_Stencil8, stencil = pf == MTLPixelFormatStencil8 || pf == MTLPixelFormatDepth32Float_Stencil8;
+    if (!depth && !stencil && (t.usage & MTLTextureUsageRenderTarget)
+        && (c->r.xoffset || c->r.yoffset || (NSUInteger)c->r.width != w || (NSUInteger)c->r.height != h || (c->mask & mtl_pf_chmask(pf)) != mtl_pf_chmask(pf))
+        && clear_tex_draw(c, t, lv, l0)) return;
     if (c->r.xoffset || c->r.yoffset || (NSUInteger)c->r.width != w || (NSUInteger)c->r.height != h || (c->mask & mtl_pf_chmask(pf)) != mtl_pf_chmask(pf)
         || !(t.usage & MTLTextureUsageRenderTarget)) {
         RED_ONCE(44, "texture clear case not implemented: region %d,%d %dx%d (level size %lux%lu) mask %#x render-target capable %d (format %#x flags %#x)", c->r.xoffset, c->r.yoffset, c->r.width, c->r.height,
@@ -7954,6 +7958,45 @@ static void clr_tri(id<MTL4RenderCommandEncoder> en, id<MTLRenderPipelineState> 
     enc_r_cull(en, MTLCullModeNone); enc_r_fill(en, MTLTriangleFillModeFill); enc_r_depth_bias(en, 0, 0, 0); enc_r_depth_clip(en, YES); enc_r_stencil_ref(en, sref, sref); g_ed.ok = 0;
     enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, 3);
     [en setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [en setArgumentTable:g_ft atStages:MTLRenderStageFragment];
+}
+// Texture clears use their explicit region, independent of the command buffer's render targets and scissor.
+// A load-action clear cannot preserve unmasked channels (Persona 5 Royal clears just alpha).
+static int clear_tex_draw(const p_clear_tex *c, id<MTLTexture> t, unsigned lv, unsigned l0) {
+    NSUInteger w = mip_extent(t.width, lv), h = mip_extent(t.height, lv);
+    int nz = c->r.depth ? c->r.depth : 1, is3d = t.textureType == MTLTextureType3D;
+    if (c->r.xoffset < 0 || c->r.yoffset < 0 || c->r.zoffset < 0 || c->r.width < 0 || c->r.height < 0 || nz < 0
+        || (uint64_t)c->r.xoffset + c->r.width > w || (uint64_t)c->r.yoffset + c->r.height > h
+        || (uint64_t)c->r.zoffset + nz + (is3d ? 0 : l0) > (is3d ? mip_extent(t.depth, lv) : t.arrayLength * (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray ? 6 : 1))) return 0;
+    if (!c->r.width || !c->r.height || !(c->mask & 15)) return 1;
+    clr_key k = {0}; k.kind = pf_int_kind(t.pixelFormat); k.mask = c->mask & 15; k.cfmt[0] = t.pixelFormat; k.samples = t.sampleCount;
+    id<MTLRenderPipelineState> ps = clr_pso(&k); if (!ps) return 0;
+    static id<MTL4ArgumentTable> vt, ft;
+    if (!ft) { NSError *e = nil; MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1;
+        vt = rec_table([g_dev newArgumentTableWithDescriptor:ad error:&e]); ft = vt ? rec_table([g_dev newArgumentTableWithDescriptor:ad error:&e]) : nil;
+        if (!ft) { vt = nil; return 0; } }
+    uint32_t val[4];
+    for (int i = 0; i < 4; i++) {
+        if (!k.kind) { float f = c->is_uint ? (float)c->c.u[i] : c->c.f[i]; memcpy(&val[i], &f, 4); }
+        else if (c->is_uint) val[i] = c->c.u[i];
+        else val[i] = k.kind == 1 ? (uint32_t)c->c.f[i] : (uint32_t)(int32_t)c->c.f[i];
+    }
+    rp_flush(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    id<MTLBuffer> b; size_t o = arena_alloc(32, &b); if (!b) return 0;
+    memcpy((uint8_t *)b.contents + o, val, 16); memset((uint8_t *)b.contents + o + 16, 0, 16);
+    [ft setAddress:b.gpuAddress + o atIndex:0]; [vt setAddress:b.gpuAddress + o + 16 atIndex:0];
+    for (int z = 0; z < nz; z++) {
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new]; MTLRenderPassColorAttachmentDescriptor *a = rp.colorAttachments[0];
+        a.texture = t; a.level = lv; a.loadAction = MTLLoadActionLoad; a.storeAction = MTLStoreActionStore;
+        if (is3d) a.depthPlane = c->r.zoffset + z; else a.slice = l0 + c->r.zoffset + z;
+        ser_gate(); id<MTL4RenderCommandEncoder> en = enc_r_begin(rp);
+        [en setArgumentTable:vt atStages:MTLRenderStageVertex]; [en setArgumentTable:ft atStages:MTLRenderStageFragment];
+        [en setViewport:(MTLViewport){0, 0, (double)w, (double)h, 0, 1}];
+        [en setScissorRect:(MTLScissorRect){c->r.xoffset, c->r.yoffset, c->r.width, c->r.height}];
+        [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; enc_r_end(en);
+    }
+    args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
+    static int once; if (!once++) MLOG("texture region / channel clear: drawn with channel mask %#x", c->mask);
+    return 1;
 }
 static void clr_note(int slot, int depth, int stencil) {   // as udc_note_draw for a draw: the attachment was written (zero-source skip, unwritten-attachment store)
     if (slot >= 0 && R.rt.color[slot]) { zskip_del(R.rt.color[slot]->serial); g_zskip_cand_ok[slot] = 0; }

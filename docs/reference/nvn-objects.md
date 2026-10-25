@@ -366,3 +366,10 @@ Games read this count as a position in their own command memory and size their h
 ### `nvnPrivate0`, an inlined command-buffer fast path flag
 
 - `nvnPrivate0`, a new SDK 20 import, needs nothing: it is a flag in `sdk`'s bss that enables an inlined command-buffer fast path when the NVN driver sets it (it stays 0). Found on [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0, SDK 20.5.22).
+
+### Linear render targets without LINEAR
+
+- **Symptom:** `SetupSurfaceInfoMemoryInside` asserts on the host's texture storage size before the first game frame.
+- **Cause:** the layout code treated only `LINEAR` (`0x10`) as linear. NVN permits `LINEAR_RENDER_TARGET` (`0x40`) alone; taking the tiled path ignores its row pitch. A 16x16 RGBA8 target with stride 128 was reported as 1,024 bytes rather than 2,048.
+- **Fix:** `nvn_tex.c` treats either flag as linear for storage, sparse classification and level geometry, retaining the 128-byte render-target row alignment. The block-linear swizzle/deswizzle interface rejects both linear flags.
+- **Found on:** [Persona 5 Royal](../../dm/games/01005CA01580E000/README.md) (experimental bring-up; the render-target builder is at `main+0x1012160` in the noted build). The flag classification also appeared in the closed [TotK reference PR #11](https://github.com/seedds/nxnative/pull/11), but was absent from the current main branch.

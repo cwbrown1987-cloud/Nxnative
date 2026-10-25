@@ -699,3 +699,10 @@ Digimon Story Cyber Sleuth: Complete Edition (Media.Vision's MVGL engine, SDK 6.
 ### GL movies decoded by the SDK's movie library
 
 - **Found on:** [Digimon Story Cyber Sleuth: Complete Edition](../../dm/games/010014E00DB56000/README.md): the USM movies' H.264 is decoded through the SDK's movie library (the host's decoder) into NV12 buffers (3,110,400 bytes a 1920x1080 frame); the game uploads the planes into a `GL_RED` and a `GL_RG` texture (two `glTexSubImage2D` a frame) and converts YUV in its own shader (in `main`, `SamplerY` / `SamplerUV`).
+
+### Texture-region clears with partial colour masks
+
+- **Symptom:** `[RED] texture clear case not implemented` for an RGBA8 texture with mask `0x8` when a movie is skipped.
+- **Cause:** `ClearTexture` used only a whole-level Metal load-action clear, which cannot preserve unmasked colour channels or texels outside an explicit region.
+- **Fix:** renderable colour textures use a standalone clear triangle with the explicit texture region and channel write mask. It loads the previous attachment content, interprets float / signed / unsigned outputs by the target format, and selects the view's mip and layer. The current render targets and command-buffer scissor do not change this clear. Full clears retain the load-action path; unsupported depth/stencil regions are still reported. GPU tests read back all channels, all mip levels and both array layers.
+- **Found on:** [Persona 5 Royal](../../dm/games/01005CA01580E000/README.md) (experimental bring-up): the 1920x1080 alpha-only texture clear when skipping its opening story movie.

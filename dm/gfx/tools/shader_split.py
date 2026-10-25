@@ -1453,7 +1453,61 @@ def unity_shaders(d, label, out, trees):
                 out.extend((where, st, ctl, cd) for st, ctl, cd in unity_program(code, where, stages.get(k)))
         out.extend(unity_compute(x, f'{label}{":" + node if node else ""}', trees))
 
+def gsc_shaders(d, label):
+    """GFD's GSC0 cache: one stage per HHNEEDLE record (P5R SDK 13.3.2).
+
+    The big-endian u32 at HHNEEDLE+8 counts from that length word to the
+    record end. A variable-length metadata prefix precedes one little-endian
+    NVN control section; control+0x20 gives its length, +0x704 the following
+    code length. BindProgram combines stages at runtime, so use a varying cover.
+    """
+    if len(d) < 32 or d[:4] != b'GFS0' or d[16:20] != b'GSC0':
+        red(f'{label}: not a GFS0/GSC0 shader cache')
+    out = []; at = 32
+    while (h := d.find(b'HHNEEDLE', at)) >= 0:
+        if h + 12 > len(d): red(f'{label}: truncated HHNEEDLE header @{h:#x}')
+        size = struct.unpack_from('>I', d, h + 8)[0]; end = h + 8 + size
+        if size < 0x760 or end > len(d): red(f'{label}: HHNEEDLE record @{h:#x} outside cache')
+        c = d.find(CTL_MAGIC, h + 12, end)
+        if c < 0 or c + 0x708 > end: red(f'{label}: HHNEEDLE @{h:#x} has no complete NVN control section')
+        nctl = struct.unpack_from('<I', d, c + 0x20)[0]
+        ncode = struct.unpack_from('<I', d, c + 0x704)[0]
+        if nctl < 0x760 or nctl & 3 or ncode < 0x80 or c + nctl + ncode > end:
+            red(f'{label}: HHNEEDLE @{h:#x} has invalid control/code lengths')
+        ctl, code = d[c:c + nctl], d[c + nctl:c + nctl + ncode]
+        st = 'cs' if code[:4] == CS_MAGIC else sph_stage(code) if code[:4] == GFX_MAGIC else None
+        if not st: red(f'{label}: HHNEEDLE @{h:#x} has an unknown shader stage')
+        why = check(label, st, ctl, code)
+        if why: red(f'{label}: HHNEEDLE @{h:#x}: {why}')
+        out.append((f'{label}#GSC@{h:#x}', st, ctl, code)); at = end
+    if not out: red(f'{label}: GSC0 cache contains no HHNEEDLE shaders')
+    return out
+
+
+def raw_nvn_shaders(d, label):
+    """Inline GFD/Rsdx programs: consecutive control + code, without GLSLC magic.
+
+    P5R main has 228, including six compute programs, only 108 of them inside
+    HHNEEDLE envelopes. Match all controls with their own lengths, stage and
+    code magic; keys were checked against missing-program dumps at boot.
+    """
+    out = []
+    for m in re.finditer(CTL_MAGIC, d):
+        c = m.start()
+        if c + 0x760 > len(d): continue
+        nc = struct.unpack_from('<I', d, c + 0x20)[0]
+        nk = struct.unpack_from('<I', d, c + 0x704)[0]
+        if nc < 0x760 or nc & 3 or nk < 0x80 or c + nc + nk > len(d): continue
+        ctl, code = d[c:c + nc], d[c + nc:c + nc + nk]
+        st = glslc_stage(ctl, code)
+        if not st or check(label, st, ctl, code): continue
+        out.append((f'{label}#NVN@{c:#x}', st, ctl, code))
+    return out
+
+
 def scan_blob(d, label, out):
+    if d[:4] == b'GFS0' and d[16:20] == b'GSC0':
+        out.extend(gsc_shaders(d, label)); return
     if d[:4] == b'Yaz0': d = yaz0(d)
     if d[:4] == b'SARC':
         for nm, m in sarc_members(d): scan_blob(m, f'{label}/{nm}', out)
@@ -1469,6 +1523,7 @@ def scan_blob(d, label, out):
         size = struct.unpack_from('<I', d, m.start() + 0x1c)[0]
         if m.start() + size <= len(d) and d[m.start() + 0x60:m.start() + 0x64] == b'grsc': out.extend(bnsh_shaders(d, m.start(), label))
     if MGFX in d: out.extend(mgfx_shaders(d, label))
+    if b'HHNEEDLE' in d: out.extend(raw_nvn_shaders(d, label))
 
 def group(label):
     """source group (second half of the package file name)"""
@@ -1481,7 +1536,7 @@ def ps_inputs(code):
     """Generic attributes a pixel shader reads: SPH words 6–13 are the input map, 8 bits for each of the 32 attributes (Ryujinx ShaderHeader.ImapTypes), non-zero = read; the translated MSL inputs are exactly user(locn<attribute>)"""
     return {i for i in range(32) if struct.unpack_from('<I', code, 0x30 + 4 * (6 + (i >> 2)))[0] >> ((i & 3) * 8) & 0xff}
 
-SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
+SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#GSC@', '#NVN@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
 # MonoGame's effects, whose passes may name no vertex shader and keep the one bound (Celeste: 10 of its 13 effects draw through SpriteBatch's vertex shader, which is in main); Next Level Games'
 # archives (Luigi's Mansion 3 makes 5,317 programs of one stage each at boot); PlatinumGames' shader objects (Bayonetta 3: one stage each, pg_shader); control sections loose in main
 # (Advance Wars 1+2: Re-Boot Camp's Bink shaders, raw_shaders), which no file pairs; and YEBIS's effect file (tfxo_shaders)
@@ -1596,7 +1651,7 @@ def scan_file(args):
         import unityfs
         try: unity_shaders(d, '/' + rel, found, trees if not TREES else dict(TREES))
         except unityfs.NoTree: return rel, {}, set(), 'defer'
-    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] != b'MSHD' and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members
+    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] != b'MSHD' and not (d[:4] == b'GFS0' and d[16:20] == b'GSC0') and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members
     else:
         scan_blob(d, '/' + rel, found)
         # whole GLSLC outputs in a file no other reader takes (FINAL FANTASY TACTICS - The Ivalice Chronicles: its engine's technique files, resources_nx/…/shader/*.tec, 261 outputs beside

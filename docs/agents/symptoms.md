@@ -255,6 +255,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 - an abort in device setup when `nvnTexturePoolGetSize` / `nvnSamplerPoolGetSize` returned 0. → [Pool size getters, texture address and command memory size](../reference/nvn-objects.md#pool-size-getters-texture-address-and-command-memory-size)
 - red stub lines for NVN calls. → [NVN calls that were red stubs](../reference/nvn-objects.md#nvn-calls-that-were-red-stubs)
 - `nvnWindowGetPresentInterval`, `nvnCommandBufferSetCopyImageStride` missing. → [SDK 8 window and copy-stride entry points](../reference/nvn-objects.md#sdk-8-window-and-copy-stride-entry-points)
+- `SetupSurfaceInfoMemoryInside` asserts on the host's texture storage size before the first game frame. → [Linear render targets without LINEAR](../reference/nvn-objects.md#linear-render-targets-without-linear)
 
 ## Rendering
 
@@ -329,6 +330,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 - the NSP script's provisional profile said Vulkan, and the capture boot crashed in the GL layer. → [Telling a GL game from an NVN or Vulkan one](../reference/rendering.md#telling-a-gl-game-from-an-nvn-or-vulkan-one)
 - a jump to address 0 right after `glGetFloatv(0xb12)` (`lr=main+0x2d58c4`). → [Which GL functions a game calls](../reference/rendering.md#which-gl-functions-a-game-calls)
 - in a capture run every program links with no uniforms; the game's first `Shader:send` raises a Lua error and, on the Switch, its error handler quits (Any Lua error quits a LÖVE game). → [GL shaders put together at run time and captured](../reference/rendering.md#gl-shaders-put-together-at-run-time-and-captured)
+- `[RED] texture clear case not implemented` for an RGBA8 texture with mask `0x8` when a movie is skipped. → [Texture-region clears with partial colour masks](../reference/rendering.md#texture-region-clears-with-partial-colour-masks)
 
 ## Shaders
 
@@ -385,6 +387,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 - a pipeline for a vertex shader that writes `render_target_array_index` cannot be built. → [Layer-writing vertex shaders get the triangle class](../reference/shaders.md#layer-writing-vertex-shaders-get-the-triangle-class)
 - the picture bright green and white from some scene on, in runs with pipelines compiled on demand (prewarm lists off or short) and in none with `DM_NVN_PREDICT=0`. → [The precompile look-ahead restores the scissor](../reference/shaders.md#the-precompile-look-ahead-restores-the-scissor)
 - the first boot sat on the loading clock for about a minute, the CPU idle, with every file read done after 12 s. → [A cold Metal cache looks like a long load](../reference/shaders.md#a-cold-metal-cache-looks-like-a-long-load)
+- a provisional Persona 5 Royal shader split finds no shaders in its CPK assets; boot programs are still missing if only the caches are read. → [GFD GSC shader caches and inline NVN programs](../reference/shaders.md#gfd-gsc-shader-caches-and-inline-nvn-programs)
 
 ## Game state
 

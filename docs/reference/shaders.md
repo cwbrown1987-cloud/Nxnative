@@ -599,3 +599,10 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Cause:** that run compiled its Metal libraries and pipelines on first use (cold cache). With a warm cache the title is up after about 15 s; what looked like a 40-second wait in the read log (`DM_FSLOG`) was the title screen itself, which reads nothing.
 - **Check:** screenshots every few seconds (`ctl.sh snap` from a script) told the two apart.
 - **Found on:** [Bayonetta 3](../../dm/games/01004A4010FEA000/README.md) (SDK 13.3.2).
+
+### GFD GSC shader caches and inline NVN programs
+
+- **Symptom:** a provisional Persona 5 Royal shader split finds no shaders in its CPK assets; boot programs are still missing if only the caches are read.
+- **Cause:** the CPK entries are GFS0/GSC0 caches, with variable-length HHNEEDLE envelopes around individual NVN stages, rather than BNSH or complete GLSLC outputs. `main` also holds consecutive control/code pairs without GLSLC headers; the existing pointer-based raw reader finds none of them.
+- **Fix:** `shader_split.py` reads GSC0 records through the existing CPK reader and as loose files. The big-endian length at HHNEEDLE+8 counts from the length word; inside it control+0x20 and control+0x704 give the control and code lengths. Bounds and stage headers are checked. In blobs containing HHNEEDLE, inline controls are accepted only when their own lengths, stage and code header agree. Both sources join the single-stage varying cover; existing CPK decoding and other container readers are preserved.
+- **Found on:** [Persona 5 Royal](../../dm/games/01005CA01580E000/README.md) (experimental bring-up, SDK 13): 30,418 unique stages in nine caches and 228 inline in `main`; 30,646 in total.
