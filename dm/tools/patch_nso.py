@@ -671,9 +671,8 @@ def table_cands(insl, rb):
         if m: cands.add(p.operands[1].imm + int(m.group(1), 0))
     return sorted(cands)
 def tail_call(insl, j):
-    """The br x18 is an indirect tail call, not a jump table: the last write of x18 before it is a plain pointer load and the br ends the function. Ace Attorney Investigations Collection
+    """The br x18 is an indirect tail call, not a jump table: the last write of x18 before it is a plain pointer load and the br ends its basic block. Ace Attorney Investigations Collection
     (Unity 2022.3 IL2CPP) main+0x1d271bc: ldr x18,[x0,#0x18]; ...; ldr x16,[sp]; ...; br x18, a thunk that moves stack arguments and jumps to the method pointer at +0x18"""
-    if j + 1 != len(insl): return False
     for p in reversed(insl[:j]):
         if 'x18' not in [p.reg_name(r) for r in p.regs_access()[1]]: continue
         return p.mnemonic == 'ldr' and bool(re.fullmatch(r'x18, \[(x\d+|sp)(, #(0x[0-9a-f]+|\d+))?\]', p.op_str))

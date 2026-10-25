@@ -86,9 +86,9 @@ The NSO rewriter (`dm/tools/patch_nso.py`) and its per-build tables (`dm/tools/s
 
 - **Symptom:** `jump table <addr>` assertion on a `br x18` with no table in front of it.
 - **Cause:** not a jump table but an indirect tail call: an IL2CPP thunk loads the method pointer with `ldr x18, [x0, #0x18]`, moves its stack arguments with every other scratch register (`ldr x16, [sp]`, `ldp x17, x15, [sp, #8]`, …) and ends with `br x18`.
-- **Fix:** when neither table form is found, the last write of `x18` is a plain load and the `br` ends the function, it becomes `x16 = guest x18; br x16` (`tail_call` / `site_br_call`; at a call `x16` / `x17` are free, as for `blr x18`). It is tried only where the rewriter used to stop.
-- **Found on:** [Ace Attorney Investigations Collection](../../dm/games/010005501E68C000/README.md) (Unity 2022.3 IL2CPP): `main+0x1d271bc` and `+0x204ebec`.
-- **Check:** every module the rewriter accepted before comes out byte-identical.
+- **Fix:** when neither table form is found, the last write of `x18` is a plain load and the `br` ends its basic block, it becomes `x16 = guest x18; br x16` (`tail_call` / `site_br_call`; at a call `x16` / `x17` are free, as for `blr x18`). It is tried only where the rewriter used to stop.
+- **Found on:** [Ace Attorney Investigations Collection](../../dm/games/010005501E68C000/README.md) (Unity 2022.3 IL2CPP): `main+0x1d271bc` and `+0x204ebec`; [Blasphemous 2](../../dm/games/010040801A4C8000/README.md): `main+0x1e86fc`.
+- **Check:** `test_tail_calls.py` covers a tail-call block followed by another block and a computed jump-table dispatch that must not be classified as a tail call. The Blasphemous 2 Mac route passes through the site and reaches early combat.
 
 ## Exclusive windows
 
