@@ -103,7 +103,7 @@ static void jit_key(char hx[33], uint64_t cmd, const jit_range *c0_in, const voi
 typedef struct { char name[16]; uint64_t base, size, pre; } jit_region;
 
 // ---- Serving (iOS; the Mac with DM_JIT_SERVE=<dir>): GenerateCode answered from the image dm/tools/jit_capture.py built, the plugin never runs ----
-// jit.img is the code memory's first part (mapped read + execute at the layout's base, loader.c; on iOS the executable's __TEXT,__dm_jit section, as the modules are embedded),
+// jit.img is the code memory's first part (mapped read + execute at the layout's base, loader.c; on iOS the executable's __TEXT,__dm<tag>_jit section, as the modules are embedded),
 // jit.tsv the requests by key (where each one's code lies in the image, its output and the output's host addresses to relocate) and jit.out the outputs
 typedef struct { char key[33]; uint64_t cmd, code_off, code_size, ro_off, ro_size, out_off, out_size; int ret; uint32_t nrel; uint64_t *rel_at, *rel_off; int *rel_mod; } jit_req;
 static jit_req *g_req; static int g_nreq; static const uint8_t *g_out; static size_t g_out_len; static uint64_t g_img_size, g_layout_rx, g_layout_ro;
@@ -142,7 +142,7 @@ static void jit_serve_load(const char *dir) {
     LOG("jit: serving %d requests from %s (image %#llx bytes, outputs %.1f MB): the plugin does not run", g_nreq, dir, (unsigned long long)g_img_size, g_out_len / 1048576.0);
 }
 static const jit_req *jit_find(const char *key) { for (int i = 0; i < g_nreq; i++) if (!strcmp(g_req[i].key, key)) return &g_req[i]; return NULL; }
-// The image at the layout's base: the Mac maps jit.img read + execute, iOS remaps the executable's signed __TEXT,__dm_jit pages there (as loader.c remaps the modules)
+// The image at the layout's base: the Mac maps jit.img read + execute, iOS remaps the executable's signed __TEXT,__dm<tag>_jit pages there (as loader.c remaps the modules)
 #if TARGET_OS_IPHONE
 #include <mach/mach.h>
 #include <mach-o/getsect.h>
@@ -151,9 +151,10 @@ static const jit_req *jit_find(const char *key) { for (int i = 0; i < g_nreq; i+
 static void jit_map_image(uint8_t *at, const char *dir) {
     if (!g_img_size) return;
 #if TARGET_OS_IPHONE
-    (void)dir; unsigned long z = 0;
-    const uint8_t *sec = getsectiondata(&_mh_execute_header, "__TEXT", "__dm_jit", &z);
-    if (!sec || z < g_img_size || ((uintptr_t)sec & 0x3fff)) die("jit: the image is not in the executable (__TEXT,__dm_jit), or smaller than jit.tsv says");
+    (void)dir; unsigned long z = 0; char sn[17]; const char *tg = getenv("DM_EMBED_TAG");   // an app of several programs tags each one's sections (gen_embed.py --tag)
+    snprintf(sn, sizeof sn, "__dm%s_jit", tg ? tg : "");
+    const uint8_t *sec = getsectiondata(&_mh_execute_header, "__TEXT", sn, &z);
+    if (!sec || z < g_img_size || ((uintptr_t)sec & 0x3fff)) die("jit: the image is not in the executable (__TEXT,%s), or smaller than jit.tsv says", sn);
     vm_address_t a = (vm_address_t)at; vm_prot_t cur = 0, max = 0;
     if (vm_remap(mach_task_self(), &a, g_img_size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)sec, FALSE, &cur, &max, VM_INHERIT_NONE) != KERN_SUCCESS || a != (vm_address_t)at || !(cur & VM_PROT_EXECUTE))
         die("jit: cannot remap the image to %p", at);

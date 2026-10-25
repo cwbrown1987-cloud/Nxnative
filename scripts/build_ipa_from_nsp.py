@@ -1159,6 +1159,60 @@ def capture_shaders(repo, d, patched, work, env, logs, g, api):
     return out
 
 
+JIT_SECS = 90   # the longest JIT boot capture: Super Mario 64 asks for its 14.2 MB of boot code 3 s after start and for its first run-time blocks within 10 s
+
+
+def uses_jit(exefs):   # main imports nn::jit (Super Mario 64 of Super Mario 3D All-Stars: its N64 code through the game's JIT plugin, dm/host/hle_jit.c)
+    main = pg.nso(exefs / 'main')[0]
+    return any(n.startswith('_ZN2nn3jit20CreateJitEnvironment') and not defined for n, defined, _ in pg.nso_syms.dynsyms(main))
+
+
+def jit_stamp(patched, g):   # what captures depend on: the size of every rewritten module (the image's layout) and the profile's request keys
+    sizes = sorted((f.name, f.stat().st_size) for f in Path(patched).glob('*.patched.bin'))
+    return json.dumps({'modules': sizes, 'jit_key_data': g.get('jit_key_data', ''), 'jit_out_code': g.get('jit_out_code', '')})
+
+
+def capture_jit(py, repo, d, patched, work, env, logs, g):
+    """A game that generates code at run time through nn::jit (uses_jit): the iPhone runs no such code, so it serves the plugin's output from an image built here (dm/tools/jit_capture.py,
+    hle_jit.c). The game boots twice in the Mac host (headless and silent) with DM_JIT_CAPTURE, each run into a folder of its own under <version dir>/jit_capture (boot1, boot2): two runs in
+    different layouts tell which output words are host addresses. Every other folder there is added too: the captures of play on the Mac (the Mac run command writes them to
+    jit_capture/play), since some code is made only when the game reaches it, and a request the image lacks stops the iPhone there. A capture folder made with other rewritten modules or
+    request keys is cleared (jit_capture/stamp.json). The image goes beside the RomFS (<version dir>/jit), where build_ipa.sh takes it"""
+    PROG.stage('JIT capture')
+    caps, out = d / 'jit_capture', d / 'jit'
+    stamp = jit_stamp(patched, g); sf = caps / 'stamp.json'
+    if caps.exists() and (not sf.exists() or sf.read_text() != stamp):
+        say(f'[RED] {caps}: made with other rewritten modules or request keys; cleared (play captures included: play the game on the Mac again for them)'); rmtree(caps)
+    caps.mkdir(parents=True, exist_ok=True); sf.write_text(stamp)
+    host = None
+    for name in ('boot1', 'boot2'):
+        c = caps / name
+        if any(c.glob('*.jit')): continue
+        if host is None: PROG.set(step='building the Mac host'); host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
+        part, rd, log = caps / f'{name}.partial', work / 'tmp/jit_run', logs / f'jit_{name}.log'
+        rmtree(part); rmtree(rd); part.mkdir(parents=True)
+        for x in ('save', 'temp', 'msl'): (rd / x).mkdir(parents=True)
+        henv = dict(env, DM_ROMFS=str(d / 'RomFS'), DM_SAVE=str(rd / 'save'), DM_TEMP=str(rd / 'temp'), DM_MSL_DIR=str(rd / 'msl'), DM_JIT_CAPTURE=str(part))
+        PROG.set(step=f'booting the game ({name})')
+        say(f'booting the game in the Mac host to capture the code its JIT plugin makes ({name}) → {c}')
+        last = {'n': 0, 't': time.time()}
+        def done():   # the boot code (the largest request) and nothing new for 10 s
+            fs = list(part.glob('*.jit')); n = len(fs)
+            if n != last['n']: last['n'], last['t'] = n, time.time()
+            return bool(fs and max(f.stat().st_size for f in fs) > 1 << 20 and time.time() - last['t'] > 10)
+        t0 = time.time(); rc = boot_mac(host, patched, henv, rd, log, JIT_SECS, done)
+        if not any(f.stat().st_size > 1 << 20 for f in part.glob('*.jit')):
+            if rc is not None: host_stopped(log, rc, time.time() - t0)
+            raise BuildError(f'the JIT capture ({name}) holds no boot code (host output: {log})')
+        swap_in(part, c); rmtree(rd)
+    PROG.set(step='image')
+    tmp = d / 'jit.partial'; rmtree(tmp)
+    run([py, repo / 'dm/tools/jit_capture.py', '--profile', g.id] + sorted(str(x) for x in caps.iterdir() if x.is_dir() and not x.name.endswith('.partial')) + [tmp], logs / 'jit_capture.log', env=env)
+    swap_in(tmp, out)
+    PROG.end((logs / 'jit_capture.log').read_text(errors='replace').strip().splitlines()[-1][:120])
+    return out
+
+
 # ---- A provisional profile after the rewrite: mem_used and the heap check ----
 def set_keys(g, changes, section):
     """Write keys into a provisional game.tsv, each under its reason, in a section of their own at the end; earlier rows of the same keys (and the reason line right above one) go.
@@ -1532,7 +1586,7 @@ def mac_host(py, repo, work, env, logs, g):
     return host, font
 
 
-def mac_run(work, game, patched, host, font, msl, aoc, gfx, lang, g, env_file=''):
+def mac_run(work, game, patched, host, font, msl, aoc, gfx, lang, g, env_file='', jit=False):
     """The command that runs the game in a window with sound after a Mac-only build (PLATFORM 'mac'; docs/development.md, Build by hand (Mac), step 5): its save and temporary storage in
     <id>_build/run (kept from run to run), the extracted RomFS, the Mac shader libraries (msl), the DLC, the profile's shader map (a host outside dm/host does not find it beside itself;
     c1_full.tsv and cb_extent.tsv are read beside it), the game language, and the switches of an environment file (DM_ENV_FILE / --env-file). Returns {'cmd': the command, 'env', 'host',
@@ -1543,6 +1597,8 @@ def mac_run(work, game, patched, host, font, msl, aoc, gfx, lang, g, env_file=''
     if aoc: renv['DM_AOC_DIR'] = aoc
     if gfx == 'nvn': renv['DM_NVN_SHMAP'] = g.table('shader_map.tsv')
     renv.update(DM_LANG=lang, DM_WINDOW=1, DM_AUDIO=1)
+    if jit:   # what the JIT plugin makes in play, for the iPhone's image (capture_jit)
+        (game / 'jit_capture/play').mkdir(parents=True, exist_ok=True); renv['DM_JIT_CAPTURE'] = game / 'jit_capture/play'
     if env_file: renv.update(env_file_pairs(env_file))
     q = lambda v: shlex.quote(str(v))
     return {'cmd': f'cd {q(rd)} && ' + ' '.join(f'{k}={q(v)}' for k, v in renv.items()) + f' {q(host)} {q(patched)}', 'env': renv, 'host': host, 'arg': patched, 'cwd': rd}
@@ -1901,6 +1957,8 @@ def pack_one(args, multi=False):
         pkey = split_shaders(py, repo, [dirs[v] / 'RomFS' for v in sv], [dirs[v] / 'ExeFS/main' for v in sv], sh / 'pkg', env, logs, g, own, oodle)
         ios = build_shaders(py, repo, sh, xlate, env, logs, g, pkey, mac)
     icon = next((d / 'icon.jpg' for d in (game, base) if (d / 'icon.jpg').exists()), None)   # the game icon nx_extract saved from the control data (English, icon.jpg); the packed version's first, then the base game's
+    jit = uses_jit(game / 'ExeFS')
+    if jit and not mac and not mac_pack: capture_jit(py, repo, game, patched, work, env, logs, g)   # the iPhone serves the plugin's output from an image
     if mac_pack:   # a Mac app: the Mac host, then the app packed from it and the build's files
         host, font = mac_host(py, repo, work, env, logs, g)
         if not icon: say('[RED] no game icon in the extraction (an older extraction did not save it: delete extract/ and run again); the app\'s icon will be blank')
@@ -1912,7 +1970,7 @@ def pack_one(args, multi=False):
         return
     if mac:   # a Mac-only build ends with the Mac host and the command that runs the game
         host, font = mac_host(py, repo, work, env, logs, g)
-        run_ = mac_run(work, game, patched, host, font, ios, aoc, gfx, lang, g, args.env_file or DM_ENV_FILE)
+        run_ = mac_run(work, game, patched, host, font, ios, aoc, gfx, lang, g, args.env_file or DM_ENV_FILE, jit)
         rmtree(work / 'tmp')
         if not multi:
             say(f'done: the game runs on the Mac with this command (its save in {work / "run/save"}, kept from run to run; DM_WINDOW=1 opens a window, DM_AUDIO=1 plays sound):')

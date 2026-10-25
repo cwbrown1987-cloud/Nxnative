@@ -11,10 +11,14 @@
 # (loader.c nro_pieces). Rows named 'refused' (an online SDK the host never loads) have no module
 # Usage: gen_embed.py [--tag <tag>] <build output dir> <output .S> <module name...>; link flags are printed to stdout (-segprot for the W segments). --tag (an app holding several
 # programs of a multi-program application, build_ipa.sh PROGRAMS_TSV): the program's sections are __dm<tag><name>x0 / __DM<tag><name>W / __dm<tag><name>x1 and __dm<tag>_nro_*, which the
-# loader takes from DM_EMBED_TAG (main.m)
+# loader takes from DM_EMBED_TAG (main.m). --jit <jit.img> (a game whose code comes through nn::jit: dm/tools/jit_capture.py's image, beside the RomFS) puts that image in
+# __TEXT,__dm<tag>_jit, which the host remaps as the code memory's start (hle_jit.c jit_map_image)
 import os, sys
-a = sys.argv[1:]; tag = ''
-if a[:1] == ['--tag']: tag, a = a[1], a[2:]
+a = sys.argv[1:]; tag = ''; jit = None
+while a[:1] in (['--tag'], ['--jit']):
+    if a[0] == '--tag': tag = a[1]
+    else: jit = os.path.abspath(a[1])
+    a = a[2:]
 out, dst, names = a[0], a[1], a[2:]
 PG = 0x4000
 def r16(x): return (x + PG - 1) & ~(PG - 1)
@@ -60,5 +64,7 @@ if nros:
         asm.append(f'    .ascii "{r[0]}"'); asm.append(f'    .space {32 - len(r[0])}')
         asm.append('    .quad ' + ', '.join(f'{v:#x}' for v in r[1:]))
     flags.append(f'-Wl,-segprot,__DM{tag}_NRO_W,rw,rw')
+if jit:
+    asm.append(f'    .section __TEXT,__dm{tag}_jit'); place(asm, jit, os.path.getsize(jit), 0, r16(os.path.getsize(jit)))
 open(dst, 'w').write('\n'.join(asm) + '\n')
 print(' '.join(flags))

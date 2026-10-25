@@ -96,10 +96,12 @@ if [ -n "${PROGRAMS_TSV:-}" ]; then   # the host over a table of the programs' p
   sed -i '' "s|^HEADER_SEARCH_PATHS = \$(inherited) |HEADER_SEARCH_PATHS = \$(inherited) \"$IOS/Gen/profile\" |" Gen/dm.xcconfig || die "header path"
   F=; : > Gen/embed.S
   while IFS= read -r row; do prog_set "$row"
-    F="$F $(python3 tools/gen_embed.py --tag "p$PN" "$PATCHED" "Gen/embed_p$PN.S" $MODS)" || die "gen_embed (program $PN)"
+    J=(); [ -f "$(dirname "$ROMFS")/jit/jit.img" ] && J=(--jit "$(dirname "$ROMFS")/jit/jit.img")   # the nn::jit image (dm/tools/jit_capture.py), beside the RomFS
+    F="$F $(python3 tools/gen_embed.py --tag "p$PN" ${J[@]+"${J[@]}"} "$PATCHED" "Gen/embed_p$PN.S" $MODS)" || die "gen_embed (program $PN)"
     cat "Gen/embed_p$PN.S" >> Gen/embed.S && rm "Gen/embed_p$PN.S"
   done < <(prog_rows); prog_back
-else F=$(python3 tools/gen_embed.py "$PATCHED" Gen/embed.S $MODS) || die "gen_embed"; fi
+else J=(); [ -f "$(dirname "$ROMFS")/jit/jit.img" ] && J=(--jit "$(dirname "$ROMFS")/jit/jit.img")
+  F=$(python3 tools/gen_embed.py ${J[@]+"${J[@]}"} "$PATCHED" Gen/embed.S $MODS) || die "gen_embed"; fi
 echo "OTHER_LDFLAGS = \$(inherited) \$(DM_FRAMEWORKS) $F" >> Gen/dm.xcconfig
 # One program's tables into TD: the rewriter's, the shader tables and the launcher's settings
 program_tables() {
@@ -168,17 +170,19 @@ APP=$DD/Build/Products/Release-iphoneos/DmIOS.app
 # msl/ is also deleted there, it took 1.5 GB of the home disk), then the shader libraries, the add-on content (the RomFS extracted from the player's DLC NSPs, one folder per index:
 # the app sets DM_AOC_DIR at launch, the host reports them as owned and mounts them from it) and the RomFS
 rm -rf "$APP/msl" "$O/Payload" "$O/out.ipa"   # (the last two: what the copy-and-zip packing left behind)
-P=Payload/DmIOS.app; SKIP=(--skip $P/_CodeSignature --skip $P/embedded.mobileprovision --skip $P/msl --skip $P/aoc --skip $P/romfs --skip $P/html)
+P=Payload/DmIOS.app; SKIP=(--skip $P/_CodeSignature --skip $P/embedded.mobileprovision --skip $P/msl --skip $P/aoc --skip $P/romfs --skip $P/html --skip $P/jit)
 if [ -n "$AOC" ] && [ -d "$AOC" ]; then MAPS_AOC=("$P/aoc=$AOC"); t "add-on content: $(ls "$AOC" | tr '\n' ' ')"; else MAPS_AOC=(); fi
 if [ -n "${PROGRAMS_TSV:-}" ]; then   # each program's shader libraries, RomFS and offline HTML pages under its own folder
   MAPS=("$P=$APP" "${MAPS_AOC[@]}")
   while IFS= read -r row; do prog_set "$row"; SKIP+=(--skip "$P/p$PN")
     MAPS+=("$P/msl/p$PN/$MSLDIR=$MSL_IOS/$MSLDIR" "$P/p$PN/romfs=$ROMFS")
     if [ -d "$(dirname "$ROMFS")/html" ]; then MAPS+=("$P/p$PN/html=$(dirname "$ROMFS")/html"); fi
+    if [ -d "$(dirname "$ROMFS")/jit" ]; then MAPS+=("$P/p$PN/jit=$(dirname "$ROMFS")/jit"); t "program $PN: nn::jit image $(dirname "$ROMFS")/jit"; fi   # its index and outputs, where the host finds them beside romfs (loader.c dm_jit_serve_dir)
   done < <(prog_rows); prog_back
 else
   MAPS=("$P=$APP" "$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "${MAPS_AOC[@]}" "$P/romfs=$ROMFS")
   if [ -d "$(dirname "$ROMFS")/html" ]; then MAPS+=("$P/html=$(dirname "$ROMFS")/html"); t "offline HTML pages: $(dirname "$ROMFS")/html"; fi   # beside romfs, where the host finds them (hle_web.c)
+  if [ -d "$(dirname "$ROMFS")/jit" ]; then MAPS+=("$P/jit=$(dirname "$ROMFS")/jit"); t "nn::jit image: $(dirname "$ROMFS")/jit"; fi   # its index and outputs beside romfs (loader.c dm_jit_serve_dir)
 fi
 t "pack IPA (already-compressed game files stored, everything else deflated)"
 ZS=$(gp zip_store); [ -z "${PROGRAMS_TSV:-}" ] || ZS=$(for g in $(prog_rows | cut -f2); do python3 "$DM/games/game.py" "$g" zip_store; done | tr ':' '\n' | sort -u | paste -sd: -)   # every program's
