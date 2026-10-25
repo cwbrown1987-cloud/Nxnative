@@ -2,6 +2,7 @@
 // oe::Initialize is in hle_sdkinit.c, not here.
 // Environment switches: DM_OPMODE=0 handheld / 1 console (default: the profile's op_mode, console unless set; console corresponds to the console-mode render profile); DM_LANG=language code (default en-US; the iOS app sets it from the IPA's DMLanguage, main.m).
 #include "hle.h"
+#include "front.h"
 
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
 #include <stdatomic.h>
@@ -147,10 +148,16 @@ static void prog_exec(void *p) {
     execve(P->exe, argv, P->env);
     LOG("[RED] oe::ExecuteProgram: cannot start %s (errno %d)", P->exe, errno);
 }
+static const char *prog_name(int index) {   // the profile's name of program index in an app of several programs (game.py header-multi), NULL otherwise
+#ifdef DM_GAME_MULTI
+    for (size_t i = 0; i < sizeof dm_games / sizeof *dm_games; i++) if (dm_games[i].program == index) return dm_games[i].name;
+#endif
+    (void)index; return NULL;
+}
 // Launch another program of a multi-program application (Octopath Traveler 0 imports it); on hardware it does not return: this process ends and the other program starts with the
 // parameters as its launch parameter (TryPopLaunchParameter). With DM_PROGRAMS the host starts it itself (above). With DM_EXEC_OUT=<file> (the iOS app's Documents, main.m) it writes
 // the program index (4 bytes, little-endian) and the parameters to that file and exits, and whoever starts it next starts that program (Super Mario 3D All-Stars' menu hands each
-// game 16 bytes, its LanguageCode and two volumes). Without either the host has only this program: logged, and the game carries on
+// game 16 bytes, its LanguageCode and two volumes); the front end first names the program and schedules a notification that opens the app again (front_program_handoff). Without either the host has only this program: logged, and the game carries on
 HLE_FORCE("_ZN2nn2oe14ExecuteProgramEiPKvm", "launch another program of the application: DM_PROGRAMS starts it in this process's place, DM_EXEC_OUT records it and the process ends; else logged", void, h_oe_ExecProgram, int index, const void *param, size_t n) {
     char hex[3 * 32 + 1] = ""; for (size_t i = 0; i < n && i < 32; i++) snprintf(hex + 3 * i, 4, " %02x", ((const uint8_t *)param)[i]);
     const char *pf = getenv("DM_PROGRAMS");
@@ -170,6 +177,7 @@ HLE_FORCE("_ZN2nn2oe14ExecuteProgramEiPKvm", "launch another program of the appl
     FILE *fp = fopen(f, "wb"); int32_t ix = index;
     if (!fp || fwrite(&ix, 4, 1, fp) != 1 || (n && fwrite(param, n, 1, fp) != 1) || fclose(fp)) { LOG("[RED] oe::ExecuteProgram(%d): cannot write DM_EXEC_OUT %s; the game carries on", index, f); if (fp) fclose(fp); return; }
     LOG("oe::ExecuteProgram(%d, %zu bytes of parameters:%s) → %s; this program ends", index, n, hex, f);
+    front_program_handoff(index, prog_name(index));   // the iOS app: "Starting <name>…", then a notification that opens it again (front_ios.m)
     dm_host_shutdown("ExecuteProgram");
 }
 HLE_FORCE("_ZN2nn2oe16DisableRecordingEv", "video recording switch; the host has no system recording", void, h_oe_DisableRec, void) {}

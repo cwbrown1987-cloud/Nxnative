@@ -59,7 +59,8 @@ static int boot_env(void) {
     // An app holding several programs of a multi-program application (build_ipa.sh PROGRAMS_TSV: Super Mario 3D All-Stars' launcher and the games it starts): dm/programs.txt lists them,
     // and each has its own files: <App>/p<N>/romfs (and html beside it), <App>/msl/p<N>, <App>/dm/p<N> (rewriter tables, shader tables, launcher settings) and its modules in sections
     // tagged p<N> (DM_EMBED_TAG, loader.c). The host profile is the program's (DM_PROGRAM, main.c dm_game_cur). iOS cannot start an app's process again, so oe::ExecuteProgram records
-    // the program and its parameters in Documents/program.bin (DM_EXEC_OUT, hle_oe.c) and the app ends; the next start runs that program, with those parameters as its launch
+    // the program and its parameters in Documents/program.bin (DM_EXEC_OUT, hle_oe.c), the app names it on screen and schedules a notification that opens it again (front_ios.m
+// front_program_handoff, when the player allowed notifications), and the app ends; the next start runs that program, with those parameters as its launch
     // parameter, until a program starts another (Sunshine's pause menu: Return to title selection starts program 0). Program 0 when nothing is recorded or the program is not in the app
     NSString *dmdir = [res stringByAppendingPathComponent:@"dm"], *msl = [res stringByAppendingPathComponent:@"msl"], *prog = nil;
     NSString *plist = [NSString stringWithContentsOfFile:[dmdir stringByAppendingPathComponent:@"programs.txt"] encoding:NSUTF8StringEncoding error:nil];

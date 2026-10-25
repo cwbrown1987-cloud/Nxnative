@@ -10,7 +10,9 @@ uint64_t now_ns(void) { return 0; }
 void dm_audio_suspend(int on) { (void)on; }   // stubs for the bg item of DM_OE_SCRIPT (hle_audio.c / hle_os.c / hle_nvn.c)
 void guest_clock_freeze_for(int reason, int on) { (void)reason; (void)on; }
 void dm_gfx_suspend(int on) { (void)on; }
-void dm_host_shutdown(const char *why) { (void)why; }   // hle_lifecycle.c: oe::ExecuteProgram with DM_EXEC_OUT ends the process
+static int g_step, g_shut_at, g_handoff_at, g_handoff_ix = -9; static const char *g_handoff_name = "unset";
+void dm_host_shutdown(const char *why) { (void)why; g_shut_at = ++g_step; }   // hle_lifecycle.c: oe::ExecuteProgram with DM_EXEC_OUT ends the process
+void front_program_handoff(int index, const char *name) { g_handoff_at = ++g_step; g_handoff_ix = index; g_handoff_name = name; }   // front.h: the iOS front end names the next program
 static void (*g_then)(void *); static void *g_then_arg;   // what oe::ExecuteProgram with DM_PROGRAMS hands the graceful exit (prog_exec and its plan)
 void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg) { (void)why; g_then = then; g_then_arg = arg; }
 static int env_has(char **env, const char *kv) { for (; env && *env; env++) if (!strcmp(*env, kv)) return 1; return 0; }
@@ -145,5 +147,18 @@ int main(void) {
       CHECK(g_then == prog_exec && g_then_arg && !strcmp(((prog_plan *)g_then_arg)->exe, "/h0"), "ExecuteProgram(0): the graceful exit then starts program 0's host");
       CHECK(gn == sizeof prm && !memcmp(got, prm, sizeof prm), "ExecuteProgram(0): its 16 bytes of parameters are in <cwd>/launch_param.bin");
       unlink(pp); unlink(tf); rmdir(dir); unsetenv("DM_PROGRAMS"); }
+    // DM_EXEC_OUT (the iOS app, main.m): the record {index, parameters}, then the front end names the program (overlay and notification), then the graceful exit
+    { char dir[] = "/tmp/t_oe_XXXXXX"; CHECK(mkdtemp(dir) != NULL, "temporary folder");
+      char rec[256]; snprintf(rec, sizeof rec, "%s/program.bin", dir); setenv("DM_EXEC_OUT", rec, 1);
+      static const uint8_t prm[16] = {'e', 'n', '-', 'U', 'S', 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8};
+      g_step = g_shut_at = g_handoff_at = 0; h_oe_ExecProgram(2, prm, sizeof prm);
+      uint8_t got[64] = {0}; size_t gn = 0; FILE *f = fopen(rec, "rb"); if (f) { gn = fread(got, 1, sizeof got, f); fclose(f); }
+      int32_t ix; memcpy(&ix, got, 4);
+      CHECK(gn == 20 && ix == 2 && !memcmp(got + 4, prm, sizeof prm), "DM_EXEC_OUT: program 2 and its 16 bytes of parameters recorded");
+      CHECK(g_handoff_at == 1 && g_shut_at == 2 && g_handoff_ix == 2, "DM_EXEC_OUT: the front end is told program 2 starts next, then the graceful exit");
+      CHECK(g_handoff_name == NULL, "DM_EXEC_OUT: no name for the program in an app of one program");
+      setenv("DM_EXEC_OUT", "/nonexistent/dir/program.bin", 1); g_step = g_shut_at = g_handoff_at = 0; h_oe_ExecProgram(0, prm, sizeof prm);
+      CHECK(!g_handoff_at && !g_shut_at, "DM_EXEC_OUT that cannot be written: no hand-off, no exit, the game carries on");
+      unlink(rec); rmdir(dir); unsetenv("DM_EXEC_OUT"); }
     printf("== oe %d checks, %d failed ==\n", checks, fails); return fails != 0;
 }

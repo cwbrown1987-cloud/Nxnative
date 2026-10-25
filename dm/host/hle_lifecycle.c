@@ -21,6 +21,7 @@ void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg) {
     _exit(0);
 }
 void dm_host_shutdown(const char *why) { dm_host_shutdown_then(why, NULL, NULL); }
+__attribute__((weak)) void front_program_handoff(int index, const char *name) { (void)index; (void)name; }   // front.h: the iOS front end names the next program and schedules its notification
 void dm_term_install(void) {
     signal(SIGTERM, SIG_IGN);                       // do not take the default action: hand over to the GCD signal source to wrap up on an ordinary thread
     static dispatch_source_t src;

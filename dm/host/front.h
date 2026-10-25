@@ -45,3 +45,8 @@ void front_web_close(void);
 void dm_web_message(const char *msg, size_t n);
 void dm_web_ended(uint32_t reason, const char *url);
 void dm_web_failed(const char *why);
+
+// The program an oe::ExecuteProgram recorded is about to start in the next run of the app (the iOS app, DM_EXEC_OUT, hle_oe.c): called on the guest thread after the record is written and
+// before the graceful exit. index = the program, name = its profile's name (NULL when the app holds one program). The iOS front end names it on screen for about 1.5 s and schedules a
+// local notification that opens the app again, when the player allowed notifications; it returns when the notification is scheduled. The default (hle_lifecycle.c, weak) returns at once
+void front_program_handoff(int index, const char *name);
