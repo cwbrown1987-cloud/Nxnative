@@ -91,6 +91,20 @@ int main(void) { @autoreleasepool {
     queue = dispatch_queue_create("test.rumble", DISPATCH_QUEUE_SERIAL);
     dispatch_queue_set_specific(queue, &queue, &queue, NULL);
     dm_haptics_init(apply, 1); drain();
+    __block int rawCalls=0; __block float rawLeft=0;
+    NSObject *owner=[NSObject new];
+    dm_haptics_apple_output(2, owner, ^(dm_haptic_state s, float gain) { rawCalls++; rawLeft=s.motor[0].amplitude_low*gain; });
+    dm_vibration_update raw={2,0,{0.5f,160,0,320}};
+    dm_haptics_send(&raw,1); drain(); assert(rawLeft==0.5f && (dm_haptics_available() & 4));
+    int before=rawCalls; usleep(100000); drain(); assert(rawCalls>before); // firmware watchdog refreshed
+    suspend(DM_HAPTICS_INACTIVE,YES); drain(); assert(rawLeft==0);
+    before=rawCalls; usleep(100000); drain(); assert(rawCalls==before); // stale timers cannot revive rumble
+    suspend(DM_HAPTICS_INACTIVE,NO); dm_haptics_send(&raw,1); drain(); assert(rawLeft==0.5f);
+    dm_haptics_apple_focus(0); drain(); assert(rawLeft==0);
+    suspend(DM_HAPTICS_INACTIVE,YES); suspend(DM_HAPTICS_INACTIVE,NO);
+    dm_haptics_send(&raw,1); drain(); assert(rawLeft==0); // app activation cannot bypass window suspension
+    dm_haptics_apple_focus(1); dm_haptics_send(&raw,1); drain(); assert(rawLeft==0.5f);
+    dm_haptics_apple_controller(2,nil); drain(); assert(rawLeft==0 && !(dm_haptics_available() & 4));
     TestEngine *left = [TestEngine new], *right = [TestEngine new];
     dispatch_sync(queue, ^{
         channels[0] = [NSMutableArray new];
