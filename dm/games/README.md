@@ -90,6 +90,9 @@ One row per profile; the notes are each profile's `README.md`.
 | [ROMANCE OF THE THREE KINGDOMS 8 REMAKE](0100C2A01A730000/README.md) | `0100C2A01A730000` | 1.1.3 | 17.5.3 | Koei Tecmo's KTGL | NVN |
 | [STEINS;GATE RE:BOOT](01008BC024FDE000/README.md) | `01008BC024FDE000` | 1.0.3 | 20.5.17 | M2's ADV engine | NVN |
 | [Stardew Valley](0100E65002BB8000/README.md) | `0100E65002BB8000` | 1.6.15.13 | 20.5.27 | MonoGame (C# → C++ by BRUTE) | NVN |
+| [Super Mario 3D All-Stars (the launcher, program 0)](010049900F546000/README.md) | `010049900F546000` | 1.0.0 (base) | 9.5.1 | Nintendo (sead / agl / gsys, NintendoWare) | NVN |
+| [Super Mario 3D All-Stars: Super Mario 64 (program 1)](010049900F546001/README.md) | `010049900F546001` | 1.0.0 (base) | 9.5.1 | N64 emulator (EmuAppNX64: recompiled NRO, JIT plugin through `nn::jit`) | Vulkan |
+| [Super Mario 3D All-Stars: Super Mario Sunshine (program 2)](010049900F546002/README.md) | `010049900F546002` | 1.0.0 (base) | 9.5.1 | NERD's Hagi GameCube layer (recompiled PowerPC) | Vulkan |
 | [Super Mario 3D World + Bowser's Fury](010028600EBDA000/README.md) | `010028600EBDA000` | 1.2.2 | 10.4.0 | Nintendo EPD (sead / agl, NintendoWare) | NVN |
 | [Super Mario Bros. Wonder](010015100B514000/README.md) | `010015100B514000` | 1.2.1 (and 1.0.0) | 16.2.12 (1.0.0: 16.2.0) | Nintendo EPD (sead / agl) | NVN |
 | [Super Mario Galaxy](010099C022B96000/README.md) | `010099C022B96000` | 1.3.1 | 18.3.5 | NERD's Hagi Wii layer (recompiled PowerPC) | Vulkan |

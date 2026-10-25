@@ -258,7 +258,15 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:**
   - [Super Mario 3D World + Bowser's Fury](../../dm/games/010028600EBDA000/README.md): `DM_NVN_MAGSCAN` on the A20 Pro found the blocks first in the 1920×1080 RGB10A2 composite (`ser=30`) in World 1-1, in the pass whose shader `66a71a3081b91b9a` renders into that texture while sampling it. They kept appearing with the sparkle particle `5e4de7561c670fee` dropped, so that earlier suspect (picked by position) is not the cause. `feedback_snap` lists `66a71a3081b91b9a` and `30e3ccb0bd304ead` (which samples a G-buffer target of its own pass on the title screen); in 1-1 that is one 8 MB copy per frame. `3e8567da37eb28a1` renders level 1 of a texture while its view covers levels 0–4 (mip-chain passes) and keeps the red line. The source said the fix was in place and waiting for a device run when written; the README lists the game as tested and playable on the iPhone.
   - [Captain Toad: Treasure Tracker](../../dm/games/01009BF0072D4000/README.md): agl's post-effect program 987 (`54f58a7cab608766`, the same program as 3D World's `66a71a3081b91b9a` in another build); `DM_NVN_FB_SNAP=all` cleared every frame and named this one shader, now in the profile's `feedback_snap`.
-- **Note:** doing it for every shader is too expensive: Breath of the Wild has over a thousand draws a frame that sample the G-buffer of their own pass (Mac frame time 16.6 → 36.6 ms), and Mario Wonder's submit time went from 1.4 to 4.0 ms. Those games' feedback draws (Mario Wonder `a7e5c6fd501cf21f` and `22a61cb1ec732aef` on its RG11B10F scene; BotW `4d3d5a4408c2e8d9`, `753d0169ae3ce4f0` and others on its 1600×900 G-buffer) had shown no blocks on the iPhone; if they do, `DM_NVN_MAGSCAN` names the pass and the shader goes into that profile's `feedback_snap`. `DM_NVN_FB_SNAP=all` snapshots every such draw.
+- **Note:** doing it for every shader is too expensive: Breath of the Wild has over a thousand draws a frame that sample the G-buffer of their own pass (Mac frame time 16.6 → 36.6 ms), and Mario Wonder's submit time went from 1.4 to 4.0 ms. Those games' feedback draws (Mario Wonder `a7e5c6fd501cf21f` and `22a61cb1ec732aef` on its RG11B10F scene; BotW `4d3d5a4408c2e8d9`, `753d0169ae3ce4f0` and others on its 1600×900 G-buffer) had shown no blocks on the iPhone; if they do, `DM_NVN_MAGSCAN` names the pass and the shader goes into that profile's `feedback_snap`. `DM_NVN_FB_SNAP=all` snapshots every such draw. A draw that samples an attachment its pass has already written takes the snapshot whatever the key: [An attachment sampled after its pass wrote it gets a snapshot](#an-attachment-sampled-after-its-pass-wrote-it-gets-a-snapshot).
+
+### An attachment sampled after its pass wrote it gets a snapshot
+
+- **Symptom:** something drawn and then corrected in place in the same pass comes out as it was before the pass: flat lavender where each game's artwork belongs in the Super Mario 3D All-Stars launcher (its movies transparent over the layout target's clear colour), while `DM_NVN_HILITE` and `texdump` show nothing landing.
+- **Cause:** a draw samples a colour attachment that the pass's clear or an earlier draw of the same open pass wrote. On NVN the read returns what was written; on Metal the attachment stays in tile memory until the pass ends, so the sample reads the memory from before the pass, whatever the GPU. agl converts each movie frame into an RGBA texture with its YUV program, then a second draw in the same pass, with no barrier, corrects the gamma in place by sampling the texture it renders into: it read the zeros it had stored the frame before.
+- **Fix:** the open pass keeps a mask of the colour attachments written in it (`g_fb_wrote` in `nvn_mtl.m`: cleared by its load action or by a clear drawn in it, or drawn into by a draw whose write mask and fragment outputs cover the slot, `fb_note_draw`), and `fb_prepare` takes the snapshot of [Same-pass feedback read through a snapshot](#same-pass-feedback-read-through-a-snapshot) for any draw that samples one of those, in every game. It fires only where Metal reads other bytes than the Switch. `feedback_snap` stays for draws that read an attachment their pass has not written; `DM_NVN_FB_SNAP=0` turns both off, and the snapshot log line counts the snapshots this rule took.
+- **Found on:** [Super Mario 3D All-Stars](../../dm/games/010049900F546000/README.md) (the launcher, agl's gamma draw `021631192bc452b6` after its YUV program `bf1135fd591c81ef`): one snapshot a frame (1440x1080 RGBA8), menu frames 16.66 ms p50.
+- **Check:** `t_fb_stale` (`dm/gfx/tests`): one draw writes red, a draw in the same pass samples that attachment into itself, one snapshot and red; with `DM_NVN_FB_SNAP=0` no snapshot; a sampling draw in a pass of its own takes none. Not measured on Breath of the Wild, Tears of the Kingdom, Wonder or the iPhone: if one of them has many draws sampling an attachment their pass already wrote, the snapshot count in the log shows it.
 
 ### Lower-left window origin
 
@@ -544,7 +552,7 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 
 ## Vulkan layer
 
-The Vulkan layer (`dm/gfx/vk/hle_vk.m`) was written for Hades; Super Mario Galaxy needed the additions below, each found from a red line or a screenshot on the route to the Star Festival.
+The Vulkan layer (`dm/gfx/vk/hle_vk.m`) was written for Hades; Super Mario Galaxy needed most of the additions below, each found from a red line or a screenshot on the route to the Star Festival, and Super Mario 64 of Super Mario 3D All-Stars the five after the queries.
 
 ### Vulkan shaders generated at run time
 
@@ -617,6 +625,44 @@ The Vulkan layer (`dm/gfx/vk/hle_vk.m`) was written for Hades; Super Mario Galax
 
 - Timestamps are their submit's completion time; occlusion queries count into a per-submit visibility buffer, copied to the pool when the submit completes.
 - **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md): two timestamp pools and a 3,072-entry occlusion pool.
+
+### `VK_EXT_debug_report`
+
+- **Symptom:** a call through a null pointer right after the Vulkan instance is created (`main+0x7494`).
+- **Cause:** the game enables `VK_EXT_debug_report`, which `vkCreateInstance` accepts as any extension, and calls `vkCreateDebugReportCallbackEXT` without checking the pointer.
+- **Fix:** the layer has the extension's three functions; it reports nothing through it, so the callback is kept as a handle and never called.
+- **Found on:** [Super Mario 3D All-Stars: Super Mario 64](../../dm/games/010049900F546001/README.md).
+
+### Specialization constants as Metal function constants
+
+- **Symptom:** Metal refuses the pipeline: "cannot be used to build a pipeline state" (an abort under the validation layer).
+- **Cause:** spirv-cross makes each specialization constant a Metal function constant at its SpecId, and the pipeline was built from the function without their values.
+- **Fix:** a stage with specialization data gets its function specialized with those values (`spec_fn` in `hle_vk.m`: typed from the function's own constants, kept per module, variant and data).
+- **Found on:** [Super Mario 3D All-Stars: Super Mario 64](../../dm/games/010049900F546001/README.md) (one int of `shader_vulkan_frag.spv`).
+
+### Packed 16-bit formats and R4G4
+
+- **Symptom:** `[vk] [RED] image format <n> not mapped`, then a crash on the null handle of that image (`vkGetImageMemoryRequirements`, `vkGetImageSubresourceLayout`).
+- **Cause:** formats the table lacked. Metal names packed components from the low bit up, Vulkan's `PACK16` formats from the high bit down, so each of these has a Metal twin under another name; `R4G4_UNORM_PACK8` has no Metal format at all.
+- **Fix:** `A1R5G5B5_UNORM_PACK16` is `BGR5A1Unorm`, `R5G5B5A1_UNORM_PACK16` `A1BGR5Unorm` and `R4G4B4A4_UNORM_PACK16` `ABGR4Unorm`, as the existing R5G6B5 row. A linear image of `R4G4_UNORM_PACK8` is an RG8 texture of its own, converted from the image's memory at each submit when its bytes changed (`conv_refresh`; the CPU's writes are final when it submits); any other image of it is a red line.
+- **Found on:** [Super Mario 3D All-Stars: Super Mario 64](../../dm/games/010049900F546001/README.md): the N64's RGBA 5551 textures (`A1R5G5B5`) and IA 4-bit textures (`R4G4`), linear images it writes from the CPU through `vkGetImageSubresourceLayout`.
+
+### Image clears and dynamic stencil state
+
+- **Symptom:** depth-tested geometry missing (the title's Mario head, the logo, the file select's frame and buttons; choosing a file showing nothing); `UNIMPL` lines for `vkCmdClearColorImage` and `vkCmdClearDepthStencilImage` in the log's list of stubs.
+- **Cause:** those were stubs, so the depth buffer the game clears each frame kept old values; so were the dynamic stencil states (`vkCmdSetStencilCompareMask` / `WriteMask` / `Reference`).
+- **Fix:** the two clears go through an empty render pass per level and layer (an aspect left out is loaded and kept), and images with transfer-destination usage get render-target usage for it. The stencil reference is set at the draw; the compare and write masks pick a depth-stencil state made once per combination (`dss_of`). Dynamic line width is accepted, with a no-op `vkCmdSetLineWidth` (Metal draws lines one pixel wide).
+- **Found on:** [Super Mario 3D All-Stars: Super Mario 64](../../dm/games/010049900F546001/README.md) (the owner's report).
+- **Check:** `t_vk_clear` (`dm/gfx/tests`, under the Metal validation layer): a depth-only clear keeping the stencil, the mask states, specialization and the R4G4 conversion.
+- **Note:** the stub list in the log is worth reading early.
+
+### Frees of descriptor sets whose pool is gone
+
+- **Symptom:** a crash in `set_free` from `vkFreeDescriptorSets` as a program ends.
+- **Cause:** the game frees descriptor sets whose pool it has already reset or destroyed, which NVIDIA's driver tolerates; the second free read freed memory.
+- **Fix:** the layer keeps a table of the sets that exist (`set_live`) and ignores a free of one that does not, with a red line once (`vkFreeDescriptorSets: a set that no longer exists (freed with its pool), ignored`).
+- **Found on:** [Super Mario 3D All-Stars: Super Mario 64](../../dm/games/010049900F546001/README.md), on its way back to the launcher.
+- **Check:** `t_vk_clear` frees a set after its pool, with the freed memory reused.
 
 ### Not translated in the Vulkan layer: geometry shaders and LOD bias
 

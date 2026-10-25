@@ -99,6 +99,13 @@ The yield back-off (`DM_YIELD_BACKOFF`) and the rewriter's spin waits (`patch_ns
 - **Check:** check such a change on [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) outdoors: its `PlacementMgr` and `RadarMgr` turned out to yield per item too, and a `sched_yield` on each of their 200,000 yields a second cost a third of a core more than the back-off had; with no host call, CPU energy fell instead (numbers in [development.md](../development.md) "Yield loops").
 - **Note:** a temporary log of which of x19–x28 move at each yield, per thread, is what told the two kinds apart.
 
+### Zero-timeout polls between yields keep a yield run
+
+- **Symptom:** one guest thread takes most of a core in a loop of yields and zero-timeout polls; frames stretch when the Mac is loaded and the sound crackles.
+- **Cause:** every `WaitSynchronization` ended the run of yields, so a thread that polls an event (`TryWaitSystemEvent`: a `WaitSynchronization` with timeout 0) and yields in turn never reached the back-off and stayed in plain yields.
+- **Fix:** a `WaitSynchronization` with timeout 0 that finds nothing, right after a yield, leaves the run going (`thr_yield` in `hle_thread.c`), and the back-off starts as for a loop of yields alone.
+- **Found on:** [Super Mario 3D All-Stars: Super Mario Sunshine](../../dm/games/010049900F546002/README.md): Hagi's main thread polls a system event (`main+0x82c4`) and yields in turn, about 2.5 million times a second, 88% of a core. The process went from 110% to about 50% of a core at Delfino Airstrip (main thread 870 → 290 ms/s), 30 fps held; with a load average of 15–23 on the Mac, frames had stretched to 100–400 ms and the audio starved.
+
 ## Events and notifications
 
 ### One auto-clear event shared by a pool's workers
