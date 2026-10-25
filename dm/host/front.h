@@ -10,6 +10,7 @@ int front_screen_max_fps(void);
 // to a mode of the same size whose rate is, and back when the window leaves fullscreen or that screen (front_mac.m; none on iOS). Called from the present thread
 void front_screen_match(int fps);
 #include <stdint.h>
+#include <stddef.h>
 // Text input box (for the software keyboard swkbd): the main thread shows a native input box and the calling thread blocks until the user confirms / cancels.
 // All text is UTF-8; max_chars is the maximum character count (0 = unlimited, only a hint for the front end; truncation is done uniformly by the caller hle_swkbd.c in UTF-16 units).
 // Confirm returns 1 and writes the result into out (including the terminating 0); cancel returns 0;
@@ -30,3 +31,17 @@ void dm_touch_set(const dm_touch *t, int n);
 // Timing: when a save write fails (disk full etc.) within one of the game's save transactions (between two Commits), so that this Commit is refused and the previously committed save is unchanged, it is called once per refused transaction;
 // the next transaction that succeeds commits as usual, and the front end need not do any recovery. err = the first failing errno (ENOSPC = 28 means out of space). Called on the game thread; the front end switches to the main thread itself and must not block
 void front_save_failed(int err);
+
+// Offline HTML pages (the web applet's offline pages; hle_web.c): a web view over the game picture (web_apple.m, Mac and iPhone). Called from guest threads; the front end works on its main
+// thread. front_web_open: dir = the folder the document path is relative to (an HtmlDocument's html-document), path = the document path with its query, callback = the URL prefix whose
+// loading ends the page (exit reason 3, the URL as the last URL), hidden = loaded without being shown until front_web_show. 0 = opened; -1 = no web view (no window): the caller's
+// stand-in answers. front_web_send hands the page a content message (its nx "message" event); front_web_close removes the page. The defaults (hle_web.c, weak) have no web view
+typedef struct { uint32_t repeat_delay, repeat_pulse; } dm_web_opts;   // key repeat in frames (the argument's SetKeyRepeatFrame); 0 = the browser's default
+int front_web_open(const char *dir, const char *path, const char *callback, int hidden, const dm_web_opts *opts);
+void front_web_show(void);
+void front_web_send(const char *msg, size_t n);
+void front_web_close(void);
+// The front end's reports (any thread): a content message from the page (nx.sendMessage); the page ended (exit reason 0 end, 1 back, 3 callback URL; url NULL = none); it could not be loaded
+void dm_web_message(const char *msg, size_t n);
+void dm_web_ended(uint32_t reason, const char *url);
+void dm_web_failed(const char *why);

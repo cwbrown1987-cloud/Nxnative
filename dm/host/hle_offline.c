@@ -160,54 +160,7 @@ HLE_FORCE("_ZN2nn3pdm30QueryApplicationPlayStatisticsEPNS0_25ApplicationPlayStat
 HLE_FORCE("_ZN2nn3web13ShowLobbyPageEPNS0_20LobbyPageReturnValueERKNS0_16ShowLobbyPageArgE", "online lobby web applet (cut)", Result, h_web_Lobby, void *rv, const void *arg) { (void)rv; (void)arg; LOG("web::ShowLobbyPage (cut)"); return RES_FAIL; }
 // Tears of the Kingdom imports the general web page applet too (the game constructs the return value itself, so it stays as constructed)
 HLE_FORCE("_ZN2nn3web11ShowWebPageEPNS0_18WebPageReturnValueERKNS0_14ShowWebPageArgE", "web page applet (cut)", Result, h_web_Page, void *rv, const void *arg) { (void)rv; (void)arg; LOG("web::ShowWebPage (cut)"); return RES_FAIL; }
-// Octopath Traveler 0 imports the offline HTML page applet too (pages shipped in the game's HTML document NCA, which the host does not extract)
-HLE_FORCE("_ZN2nn3web19ShowOfflineHtmlPageEPNS0_26OfflineHtmlPageReturnValueERKNS0_22ShowOfflineHtmlPageArgE", "offline HTML page applet (cut)", Result, h_web_Offline, void *rv, const void *arg) {
-    (void)rv; (void)arg; LOG("web::ShowOfflineHtmlPage (cut)"); return RES_FAIL;
-}
-// The offline HTML page as a session the game drives while it runs (Super Mario 3D All-Stars' Sunshine: its launcher pause menu, launcher_pause_menu.htdocs, started hidden at boot and
-// shown with Appear when the player suspends). The SDK's own Start creates a library applet (null read in applet::StartLibraryAppletImmediately). The host renders no HTML: the page loads
-// at once, sends one empty content message (the pause menu sends end_sound_load once its sounds load, and the game waits for any message before Appear), and closes when it appears,
-// as if the player closed it (exit reason 0, no last URL): the game resumes. The return value's getters stay in the SDK (reason at +0, URL at +8, URL size at +0x1008)
-static _Alignas(16) uint8_t g_ev_web[0x100];
-static int g_web_state;   // 0 none, 1 started (the ready message pending), 2 loaded, 3 appeared (closed)
-HLE_FORCE("_ZN2nn3web17OfflineWebSessionC1Ev", "offline HTML session (host stand-in, no applet): nothing to construct", void, h_webs_Ctor, void *s) { (void)s; }
-HLE_FORCE("_ZN2nn3web17OfflineWebSessionD1Ev", "offline HTML session (host stand-in)", void, h_webs_Dtor, void *s) { (void)s; }
-HLE_FORCE("_ZN2nn3web17OfflineWebSession17GetWorkBufferSizeEv", "offline HTML session work buffer: the SDK's size (0xd0), unused by the stand-in", size_t, h_webs_WorkSize, void) { return 0xd0; }
-HLE_FORCE("_ZN2nn3web17OfflineWebSession10InitializeEPvm", "offline HTML session (host stand-in): the work buffer is not used", void, h_webs_Init, void *s, void *buf, size_t n) { (void)s; (void)buf; (void)n; }
-HLE_FORCE("_ZN2nn3web17OfflineWebSession8FinalizeEv", "offline HTML session (host stand-in)", void, h_webs_Fini, void *s) { (void)s; g_web_state = 0; }
-HLE_FORCE("_ZN2nn3web17OfflineWebSession5StartEPPNS_2os15SystemEventTypeERKNS0_22ShowOfflineHtmlPageArgE", "start an offline HTML page: the host renders none, the page counts as loaded (one empty content message)",
-          Result, h_webs_Start, void *s, void **ev, const void *arg) {
-    (void)s; (void)arg;
-    static int n; if (n++ < 4) LOG("web::OfflineWebSession::Start: the host renders no HTML; the page loads at once and closes when it appears");
-    hle_bind_system_event(g_ev_web, 0); hle_clear_system_event(g_ev_web);
-    if (ev) *ev = g_ev_web;
-    g_web_state = 1;
-    return RES_OK;
-}
-HLE_FORCE("_ZN2nn3web17OfflineWebSession6AppearEv", "show the offline HTML page: the stand-in closes it at once (the exit event fires)", unsigned, h_webs_Appear, void *s) {
-    (void)s; g_web_state = 3; hle_signal_system_event(g_ev_web);
-    static int n; if (n++ < 8) LOG("web::OfflineWebSession::Appear: the page closes at once (the host renders no HTML)");
-    return 1;
-}
-HLE_FORCE("_ZN2nn3web17OfflineWebSession21TrySendContentMessageEPKcm", "message to the offline HTML page: taken, no page reads it", unsigned, h_webs_Send, void *s, const char *msg, size_t n) { (void)s; (void)msg; (void)n; return 1; }
-HLE_FORCE("_ZN2nn3web17OfflineWebSession24TryReceiveContentMessageEPmPcm", "message from the offline HTML page: one empty message once it is started (its ready message), none after",
-          unsigned, h_webs_Recv, void *s, size_t *out, char *buf, size_t n) {
-    (void)s;
-    if (g_web_state != 1) return 0;
-    g_web_state = 2; if (buf && n) buf[0] = 0; if (out) *out = 0;
-    return 1;
-}
-HLE_FORCE("_ZNK2nn3web17OfflineWebSession16NeedsWaitForExitEv", "whether the offline HTML page was started and not waited for", unsigned, h_webs_Needs, const void *s) { (void)s; return g_web_state != 0; }
-HLE_FORCE("_ZN2nn3web17OfflineWebSession11RequestExitEv", "close the offline HTML page (the exit event fires)", void, h_webs_ReqExit, void *s) {
-    (void)s; LOG("web::OfflineWebSession::RequestExit");
-    if (g_web_state) g_web_state = 3, hle_signal_system_event(g_ev_web);
-}
-HLE_FORCE("_ZN2nn3web17OfflineWebSession11WaitForExitEPNS0_26OfflineHtmlPageReturnValueE", "the offline HTML page's end: closed by the player (reason 0), no last URL", Result, h_webs_Wait, void *s, void *rv) {
-    (void)s;
-    if (rv) { *(uint64_t *)rv = 0; ((char *)rv)[8] = 0; *(uint64_t *)((char *)rv + 0x1008) = 0; }
-    g_web_state = 0; hle_clear_system_event(g_ev_web);
-    return RES_OK;
-}
+// The offline HTML pages (ShowOfflineHtmlPage, OfflineWebSession): hle_web.c
 
 // ---------- C interface (nnsocket* / nnssl*): offline as well. The arguments are all in registers and the host does not look at them ----------
 HLE_FORCE("nnsocketAccept", "offline (cut)", int, h_c_sk_Accept, void) { return -1; }
