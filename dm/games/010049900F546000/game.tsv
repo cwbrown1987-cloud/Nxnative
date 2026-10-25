@@ -1,0 +1,45 @@
+# Game profile of Super Mario 3D All-Stars (Switch, base game v0 = 1.0.0, no update), program 0: the launcher. Plays on the Mac
+# Format: see dm/games/README.md
+# A multi-program application: the launcher (program 0, this profile) starts Super Mario 64 (program 1, title ID base + 1, an N64 emulator on nn::jit), Super Mario Sunshine
+# (program 2, 010049900F546002: NERD's Hagi on Vulkan) and Super Mario Galaxy (program 3, 32-bit ARM, which Apple silicon cannot run: its tile stays in the menu but cannot be
+# started, patches.py) with oe::ExecuteProgram, handing each a 16-byte launch parameter (LanguageCode, two volume floats). The host hands the switch to whoever started it
+# (DM_EXEC_OUT, hle_oe.c).
+# Nintendo's sead / agl / gsys with NintendoWare's layout library on NVN, SDK 9.5.1. RomFS: zstd-compressed SARC archives (.zs), the menu's backgrounds and the opening as
+# H.264 MP4 movies through the SDK's movie library (subsdk0), which agl converts into a texture and corrects for gamma in place (the same-pass snapshot of nvn_mtl.m fb_prepare)
+
+# ---- Identity ----
+title_id	010049900F546000
+program_id	010049900F546000
+
+# ---- App ----
+name	Super Mario 3D All-Stars
+ipa	SuperMario3DAllStars.ipa
+app_category	public.app-category.games
+# the menu wraps its clears in conditional rendering (SetRenderEnableConditional): without evaluating it every frame is black
+render_cond	on
+
+# ---- Versions ----
+build	v0	1.0.0	main=ff44f58218c6a6b22b24c3e1af680a7f	subsdk0=7a5e537af42c5847f02410d81096ff0e	sdk=f93ce78898c2583ae08d87d3f2c2e4d6
+package	v0
+shader_versions	v0
+
+# ---- Files ----
+# load order as on Horizon: main, subsdk0 (NintendoSDK_movie), sdk
+modules	main subsdk0 sdk
+romfs_marker	MovieData/BgMovieGalaxy.mp4
+zip_store	.bwav:.mp4:.zs:.metallib
+
+# ---- Memory ----
+# The NPDM declares no system resource (META +0x14 = 0): main sets a heap with SetHeapSize, 2.93 GB of the 3.25 GB heap region. The other EPD / sead games' partition without
+# virtual address memory (4 GB block = 256 MB in front + 256 MB alias region + 256 MB stack region + 3.25 GB heap region). Measured on the Mac at the menu (the title, every tile,
+# a soundtrack): 550 MB resident, 362 MB of it GPU allocations
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+sys_resource	0x0
+
+# ---- Shader split (shader_split.py) ----
+# 3,899 shaders: agl's and gsys's BAHS (sharcb) in Lib, BNSH in ShaderData and the layouts, and 40 in main
+shader_groups	/Sound/=sound /Layout/=layout /Message/=message /LayoutActor/=layoutactor /SystemData/=systemdata /Font/=font /MovieData/=moviedata /Lib/=lib /ShaderData/=shaderdata /UI/=ui /Env/=env /GameData/=gamedata /SLink2/=slink2 /Shader/=shader /System/=system
+shader_note	Super Mario 3D All-Stars launcher shaders
