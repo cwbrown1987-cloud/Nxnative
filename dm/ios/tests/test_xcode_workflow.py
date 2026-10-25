@@ -57,10 +57,12 @@ class XcodePipelineTests(unittest.TestCase):
                 'build_shaders': root / 'shaders', 'build_vk_shaders': root / 'shaders',
                 'build_gl_shaders': root / 'shaders', 'provisional_prep': None, 'chain_header': None,
                 'refine_after_rewrite': profile, 'derive_profile': '1.0.0', 'run': None,
+                'uses_jit': False,   # the fixture's ExeFS has no main to read imports from
             }.items():
                 mocks[name] = stack.enter_context(patch.object(build, name, return_value=value))
             stack.enter_context(patch.dict(os.environ))  # derived profiles change the tool search environment
-            stack.enter_context(patch.object(game, 'by_title', return_value=registered))
+            # one program: no profile for the title IDs after it (a multi-program application prepares one project over each program's, xcode_programs)
+            stack.enter_context(patch.object(game, 'by_title', side_effect=lambda t: registered if t == int(registered.id, 16) else None))
             stack.enter_context(patch.object(game, 'load', return_value=profile))
             stack.enter_context(patch.object(profile_guess, 'build_sources', return_value=sources))
             stack.enter_context(patch.object(nacp, 'name', return_value='Fixture Game'))
@@ -163,6 +165,51 @@ class ResourceStagingTests(unittest.TestCase):
             environment.update(DM_COPY_GAME_RESOURCES='NO', PLATFORM_NAME='iphonesimulator')
             result = subprocess.run(['bash', str(REPO / 'dm/ios/tools/stage_resources.sh')], env=environment)
             self.assertEqual(result.returncode, 0)
+
+    def test_several_programs(self):
+        # An app of several programs (build_ipa.sh PROGRAMS_TSV): each program's RomFS, offline pages and nn::jit image under p<index>, its shaders under msl/p<index>,
+        # as the IPA lays them out; a program no longer listed goes, and preparing the project for one program again takes the p<index> folders away
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            ios = root / 'xcode'; (ios / 'Gen').mkdir(parents=True); (ios / 'Gen/dm.xcconfig').touch()
+            chain_h = root / 'dmsh_chain.h'; chain_h.write_text('#define DMSH_CHAIN "fixture"\n')
+            rows = []
+            for n, chain in ((0, 'b-fixture'), (1, 'vk'), (2, 'b-fixture')):
+                game = root / f'p{n}'; (game / 'RomFS').mkdir(parents=True); (game / 'RomFS/marker').write_text(f'game {n}')
+                (game / 'shader' / chain).mkdir(parents=True); (game / 'shader' / chain / 'fixture.metallib').write_text(f'{chain} {n}')
+                rows.append(f'{n}\t{game / "RomFS"}\tmarker\t{game / "shader" / chain}\t{chain}\n')
+            (root / 'p1/html').mkdir(); (root / 'p1/html/page.htm').write_text('page'); (root / 'p1/jit').mkdir(); (root / 'p1/jit/index.tsv').write_text('jit')
+            app = root / 'products/DmIOS.app'
+            environment = dict(os.environ, SRCROOT=str(ios), TARGET_BUILD_DIR=str(app.parent), UNLOCALIZED_RESOURCES_FOLDER_PATH=app.name, PLATFORM_NAME='iphoneos')
+            def stage(table, *programs):
+                (ios / 'Gen/resources_programs.tsv').write_text('# program\tRomFS\tmarker\tiOS shaders\tshader folder\n' + ''.join(table))
+                arguments = ['gen_resources.py', str(ios), str(root / 'p0/RomFS'), 'marker', str(root / 'p0/shader/b-fixture'), 'b-fixture', '', str(root / 'dd'), str(chain_h), *programs]
+                with patch.object(sys, 'argv', arguments): gen_resources.main()
+                return subprocess.run(['bash', str(REPO / 'dm/ios/tools/stage_resources.sh')], env=environment, capture_output=True, text=True)
+            result = stage(rows, 'Gen/resources_programs.tsv')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for n, chain in ((0, 'b-fixture'), (1, 'vk'), (2, 'b-fixture')):
+                self.assertEqual((app / f'p{n}/romfs/marker').read_text(), f'game {n}')
+                self.assertEqual((app / f'msl/p{n}' / chain / 'fixture.metallib').read_text(), f'{chain} {n}')
+            self.assertEqual((app / 'p1/html/page.htm').read_text(), 'page')
+            self.assertEqual((app / 'p1/jit/index.tsv').read_text(), 'jit')
+            self.assertFalse((app / 'p0/html').exists() or (app / 'romfs').exists())
+            result = stage(rows[:2], 'Gen/resources_programs.tsv')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(sorted(p.name for p in (app / 'msl').iterdir()), ['p0', 'p1'])
+            self.assertFalse((app / 'p2').exists())
+            # A program's files missing (the drive): nothing is copied or removed
+            (root / 'p1/RomFS/marker').unlink()
+            result = stage(rows[:2], 'Gen/resources_programs.tsv')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Game files unavailable', result.stderr)
+            self.assertTrue((app / 'p1/romfs/marker').exists())
+            # Prepared for one program again: its files at the top, the programs' folders gone
+            result = stage(rows[:1])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((app / 'romfs/marker').read_text(), 'game 0')
+            self.assertEqual([p.name for p in (app / 'msl').iterdir()], ['b-fixture'])
+            self.assertFalse((app / 'p0').exists() or (app / 'p1').exists())
 
 
 if __name__ == '__main__':

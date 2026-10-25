@@ -60,7 +60,7 @@ PROGRAM = 0                             # program index of a multi-program appli
                                         #   the program packed, under the title ID base + index (its own profile); 0 = the application's first program, as Horizon starts it
 PROGRAMS = ''                           # a multi-program application packed from program 0 (PROGRAM 0): the programs packed with it, e.g. '0,2'; empty = 0 and every program whose title ID
                                         #   (base + index) has a game profile in dm/games. On the Mac they run as one: the run command starts program 0, and each oe::ExecuteProgram starts another;
-                                        #   on the iPhone one IPA holds them all, and the app starts the program the last oe::ExecuteProgram named (it ends then: iOS cannot restart it)
+                                        #   on the iPhone one IPA (or Xcode project, PREPARE_XCODE) holds them all, and the app starts the program the last oe::ExecuteProgram named (it ends then: iOS cannot restart it)
 
 PROGRESS = 'auto'                       # stage lines on the console: 'bar' (one line per stage, redrawn in place), 'lines' (a plain line every BEAT seconds), 'off' (only each stage's start and end); 'auto' = bar in a terminal or Spyder, lines when the output goes to a file; 'json' = one JSON event per line, for a program that shows the build
 BEAT = 30                               # seconds between progress lines in 'lines' mode
@@ -1666,7 +1666,7 @@ def parse_args(argv):
     ap.add_argument('--program', type=int, help='program index of a multi-program application to pack (Super Mario 3D All-Stars: 1-3 the games), under the title ID base + index (default: the PROGRAM setting, 0)')
     ap.add_argument('--programs', help='a multi-program application packed from program 0: the programs packed with it, comma-separated, e.g. 0,2 (default: the PROGRAMS setting; empty = 0 and every program '
                     'whose title ID, base + index, has a game profile). On the Mac the run command starts program 0 and each program the game starts runs in its place (DM_PROGRAMS); '
-                    'on the iPhone one IPA holds them all and starts the program the last one started (not with --prepare-xcode)')
+                    'on the iPhone one IPA (or, with --prepare-xcode, one Xcode project) holds them all and starts the program the last one started')
     ap.add_argument('--progress', choices=('auto', 'bar', 'lines', 'json', 'off'), help='stage lines on the console: bar = one line per stage, redrawn in place; lines = a plain line every BEAT seconds; json = newline-delimited JSON events (no prompts); off = only each stage\'s start and end '
                     '(default: the PROGRESS setting; auto = bar in a terminal or Spyder, lines when the output goes to a file or a pipe)')
     return ap.parse_args(argv)
@@ -1709,14 +1709,13 @@ def program_list(args, nsp_dir, repo):
 def main(args=None):
     """One program (pack_one), or several programs of a multi-program application packed from program 0 (program_list): each into its own work folder from its own profile,
     then on the Mac one run command over them all (DM_PROGRAMS, a programs.tsv in program 0's work folder: oe::ExecuteProgram starts the named program in the host's place, hle_oe.c),
-    on the iPhone one IPA holding them all (ios_programs). An Xcode project (--prepare-xcode) holds one program"""
+    on the iPhone one IPA holding them all (ios_programs), or one Xcode project holding them all (--prepare-xcode, xcode_programs)"""
     args = args or parse_args([])
     PROG.mode = progress_mode(args.progress or PROGRESS)
     global PROGRAM
     PROGRAM = PROGRAM if args.program is None else args.program
     if not 0 <= PROGRAM < 16: raise BuildError(f'the program index (PROGRAM / --program) must be 0-15: {PROGRAM}')
     mac = (args.platform or PLATFORM) == 'mac'
-    if args.prepare_xcode or PREPARE_XCODE: return pack_one(args)   # an Xcode project holds one program
     repo = find_repo(Path(globals().get('__file__') or sys.argv[0]).resolve())
     nsp_dir = Path(os.path.expanduser(args.nsp_dir or NSP_DIR or ask('NSP folder: ', 'the NSP folder'))).resolve()
     if not nsp_dir.is_dir(): raise BuildError(f'not a folder: {nsp_dir}')
@@ -1733,7 +1732,7 @@ def main(args=None):
             for k in os.environ.keys() - environ.keys(): del os.environ[k]
             os.environ.update(environ)
     PROGRAM = 0
-    if not mac: return ios_programs(repo, runs, progs)
+    if not mac: return (xcode_programs if args.prepare_xcode or PREPARE_XCODE else ios_programs)(repo, runs, progs)
     tsv = Path(runs[0]['cwd']).parent / 'programs.tsv'
     rows = ['# The programs of this multi-program application on the Mac (build_ipa_from_nsp.py): index, its host (exe), rewritten modules (arg), run folder (cwd) and environment.',
             '# DM_PROGRAMS=<this file>: oe::ExecuteProgram ends the running program and starts the named one in its place (hle_oe.c)']
@@ -1765,6 +1764,29 @@ def ios_programs(repo, runs, progs):
         if not r['keep']: say(f'deleting the extracted game files: {r["ex"]}'); rmtree(r['ex'])
     say(f'done: {out_ipa} ({out_ipa.stat().st_size / 2**30:.1f} GB): programs {", ".join(map(str, progs))}; the app starts program 0, and the program a game starts the next time it is opened')
     for r in runs.values(): report_profile_status(r['g'], r['reg'], r['pkg_ver'], r['derived'], r['provisional'])
+    return runs
+
+
+def xcode_programs(repo, runs, progs):
+    """One Xcode project holding every packed program (build_ipa.sh --prepare-xcode with PROGRAMS_TSV), as ios_programs packs one IPA: program 0's project, app and identity;
+    its build phase copies each program's RomFS, shader libraries, offline pages and nn::jit image under p<index> (stage_resources.sh)"""
+    r0 = runs[0]; work = r0['work']
+    tsv = work / 'ipa_programs.tsv'
+    tsv.write_text('# program\tprofile\trewritten modules\tRomFS\tiOS shaders\tgraphics API (build_ipa.sh PROGRAMS_TSV)\n' + ''.join('\t'.join(map(str, runs[n]['row'])) + '\n' for n in progs))
+    say(f'preparing one Xcode project with programs {", ".join(map(str, progs))}')
+    PROG.stage('prepare Xcode')
+    run(['bash', repo / 'dm/ios/tools/build_ipa.sh', '--prepare-xcode'], work / 'logs/prepare_xcode.log', env=dict(r0['ipa_env'], PROGRAMS_TSV=str(tsv)))
+    sys.path.insert(0, str(repo / 'dm/ios/tools')); import xcode_projects
+    workspace, project = r0['workspace'], r0['project']
+    try: xcode_projects.register_project(workspace, project, r0['app_name'], workspace.with_name(workspace.stem + '-derived-data'))
+    except ValueError as e: raise BuildError(str(e)) from e
+    PROG.end()
+    for r in runs.values(): rmtree(r['work'] / 'tmp')
+    say(f'ready: {workspace}')
+    say(f'game project: {project} (programs {", ".join(map(str, progs))}; the app starts program 0, and the program a game starts the next time it is opened)')
+    say(f'Xcode derived data: {work / "xcode-derived-data"}')
+    say('choose the game scheme in Xcode, select your Team and iPhone or iPad, then Run (Release)')
+    for r in runs.values(): report_profile_status(r['g'], r['reg'], r['pkg_ver'], r['derived'], r['provisional'], 'Xcode project')
     return runs
 
 
@@ -1852,7 +1874,8 @@ def pack_one(args, multi=False):
     workspace = Path(os.path.expanduser(args.xcode_workspace or XCODE_WORKSPACE)).resolve() if (args.xcode_workspace or XCODE_WORKSPACE) else nsp_dir.parent / 'NxNative.xcworkspace'
     if prepare_xcode and workspace.suffix != '.xcworkspace': raise BuildError('--xcode-workspace must end in .xcworkspace')
     saved_signing = {}
-    if prepare_xcode:
+    xcode_app = prepare_xcode and not (multi and PROGRAM)   # the project's app: program 0's, in a multi-program application (xcode_programs)
+    if xcode_app:
         sys.path.insert(0, str(repo / 'dm/ios/tools')); import xcode_projects
         try:
             saved_signing = xcode_projects.signing_settings(project)
@@ -1919,7 +1942,7 @@ def pack_one(args, multi=False):
     if not app_name and not (mac and not mac_pack): raise BuildError(f'no game name in the base extraction ({base / "control.nacp"}; an older extraction did not save it: delete extract/ and run again, or give --app-name)')
     bundle_id = args.bundle_id or BUNDLE_ID or saved_signing.get('PRODUCT_BUNDLE_IDENTIFIER') or f'org.nxnative.{app:016x}'
     team_id = args.team_id or TEAM_ID or env.get('DM_TEAM_ID') or saved_signing.get('DEVELOPMENT_TEAM') or '0000000000'
-    if prepare_xcode:
+    if xcode_app:
         try: xcode_projects.check_bundle_id(workspace, project, bundle_id)
         except ValueError as e: raise BuildError(str(e)) from e
     # the app version is the packed game's display version: the update's control data when an update is packed (nx_extract saves it next to the RomFS), else the base game's
@@ -1990,6 +2013,9 @@ def pack_one(args, multi=False):
     show_fps = SHOW_FPS if args.show_fps is None else args.show_fps
     ipa_env['DM_SHOW_FPS'] = '1' if show_fps else '0'
     if show_fps: say('frame-rate counter: on (DM_SHOW_FPS=0 in the app\'s Documents/env.txt turns it off)')
+    if multi:   # an app of several programs: main builds it (or prepares its Xcode project) once over every program's parts
+        return {'ipa_env': ipa_env, 'out_ipa': out_ipa, 'work': work, 'ex': ex, 'keep': keep, 'reg': reg, 'g': g, 'pkg_ver': pkg_ver, 'derived': derived, 'provisional': provisional,
+                'row': (PROGRAM, g.id, patched, game / 'RomFS', ios, gfx), 'project': project, 'workspace': workspace, 'app_name': app_name}
     if prepare_xcode:
         PROG.stage('prepare Xcode')
         run(['bash', repo / 'dm/ios/tools/build_ipa.sh', '--prepare-xcode'], logs / 'prepare_xcode.log', env=ipa_env)
@@ -2003,9 +2029,6 @@ def pack_one(args, multi=False):
         say('choose the game scheme in Xcode, select your Team and iPhone or iPad, then Run (Release)')
         report_profile_status(g, reg, pkg_ver, derived, provisional, 'Xcode project')
         return
-    if multi:   # an app of several programs: main builds it once over every program's parts
-        return {'ipa_env': ipa_env, 'out_ipa': out_ipa, 'work': work, 'ex': ex, 'keep': keep, 'reg': reg, 'g': g, 'pkg_ver': pkg_ver, 'derived': derived, 'provisional': provisional,
-                'row': (PROGRAM, g.id, patched, game / 'RomFS', ios, gfx)}
     watch = IpaWatch(repo, work / 'ipa', out_ipa)
     PROG.stage('app build', poll=watch.poll, step='starting')   # build_ipa.sh's "pack IPA" line starts the stage "IPA pack"
     run(['bash', repo / 'dm/ios/tools/build_ipa.sh', out_ipa], logs / 'build_ipa.log', env=ipa_env, on_line=watch.line)

@@ -108,7 +108,7 @@ python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder -k ~/keys/prod.keys --
 
 # the same, then a double-clickable Mac app of the game in the NSP folder (<game name>.app), signed with your Developer ID instead of ad-hoc
 python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder -k ~/keys/prod.keys --platform mac-app --mac-sign "Developer ID Application: <name> (<team ID>)"
-# a multi-program application (Super Mario 3D All-Stars): every program with a profile in one IPA (on the Mac: one run command, DM_PROGRAMS); --programs 0,2 lists them, --program 1 packs one alone
+# a multi-program application (Super Mario 3D All-Stars): every program with a profile in one IPA (with --prepare-xcode, one Xcode project; on the Mac: one run command, DM_PROGRAMS); --programs 0,2 lists them, --program 1 packs one alone
 python3 scripts/build_ipa_from_nsp.py ~/Games/3DAllStars -k ~/keys/prod.keys
 ```
 
