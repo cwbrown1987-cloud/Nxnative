@@ -404,6 +404,29 @@ void nro_load(module_t *m) {
     LOG("NRO %s loaded (load %u, base %p): %u imports of the modules loaded before bound to it", m->name, m->loads, m->base, n);
 }
 
+// A JIT plugin (hle_jit.c) runs in the jit service's own process on Horizon, beside the game but not linked with it: it is relocated against itself only (its own definitions,
+// undefined weak symbols 0; Super Mario 64's EmuSystemJITPlugin.nro has only those and relative relocations) and never takes part in the game's symbol lookups
+void nro_load_alone(module_t *m) {
+    pthread_rwlock_wrlock(&g_modules_mu);
+    if (m->loads) memcpy(m->base + m->data_off, m->pristine, m->pristine_len);
+    m->loads++; m->loaded = 1;
+    relocs_t rl = relocs_of(m);
+    unsigned nrel = rl.relr ? relr_apply(m, rl.relr, rl.relrsz, (uint64_t)m->base) : 0, nsym = 0;
+    for (int t = 0; t < 2; t++)
+        for (uint64_t i = 0; i < rl.n[t]; i++) {
+            const Elf64_Rela *r = &rl.tab[t][i];
+            uint64_t *where = (uint64_t *)(m->base + r->r_offset);
+            unsigned type = ELF64_R_TYPE(r->r_info);
+            if (type == R_AARCH64_RELATIVE) { *where = (uint64_t)m->base + r->r_addend; nrel++; continue; }
+            const Elf64_Sym *s = &m->symtab[ELF64_R_SYM(r->r_info)];
+            if (!s->st_shndx && ELF64_ST_BIND(s->st_info) != STB_WEAK) die("%s: %s is not defined in the module, and a module loaded alone binds nothing outside itself", m->name, m->strtab + s->st_name);
+            uint64_t v = s->st_shndx ? (uint64_t)m->base + s->st_value : 0;
+            *where = type == R_AARCH64_JUMP_SLOT ? v : v + r->r_addend; nsym++;
+        }
+    pthread_rwlock_unlock(&g_modules_mu);
+    LOG("NRO %s loaded alone (load %u, base %p): %u relative relocations, %u to its own or undefined weak symbols", m->name, m->loads, m->base, nrel, nsym);
+}
+
 void nro_unload(module_t *m) {
     pthread_rwlock_wrlock(&g_modules_mu);
     m->loaded = 0;

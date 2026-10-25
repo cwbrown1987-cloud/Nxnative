@@ -29,12 +29,18 @@ run: $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_fs_
 	$(B)/t_haptics
 	$(B)/t_haptics_apple
 	$(B)/t_nro
-run: $(B)/t_nro
+	$(B)/t_jit 2>/dev/null
+run: $(B)/t_nro $(B)/t_jit
 $(B)/t_nro: t_nro.c ../loader.c ../hle_ro.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	clang -O1 -g -Wall -Wno-unused-function -Wno-deprecated-declarations -I.. $(GINC) -o $@ t_nro.c
 .PHONY: nro
 nro: $(B)/t_nro
 	$(B)/t_nro
+$(B)/t_jit: t_jit.c ../loader.c ../hle_jit.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	clang -O1 -g -Wall -Wno-unused-function -Wno-deprecated-declarations -I.. $(GINC) -o $@ t_jit.c
+.PHONY: jit
+jit: $(B)/t_jit
+	$(B)/t_jit
 $(GAME_H):
 	$(MAKE) -C .. game_profile GAME=$(GAME)
 $(B)/t_heap_size: t_heap_size.c ../hle_svc.c ../dm.h $(GAME_H) | $(B)
