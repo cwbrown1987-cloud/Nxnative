@@ -9254,6 +9254,7 @@ static void mtl_release_statics(void) {
     for (int i = 0; i < 8; i++) { g_bcrt[i].base = nil; g_bcrt[i].shadow = nil; g_bcrt[i].buf = nil; }
     for (int i = 0; i < 2; i++) g_ms_s[i].b = nil;
     for (int i = 0; i < PSO_PEND_MAX; i++) g_pp[i].ps = nil;
+    g_snap_res = nil; g_snap_ev = nil; NIL_ALL(g_snap_alloc); NIL_ALL(g_snap_cb); for (int i = 0; i < SNAP_MAX; i++) g_snap[i].tex = nil;   // frame buffering (DM_PRESENT_SNAP)
     int nk = atomic_load(&g_rk_cnt); if (nk > 96) nk = 96;
     for (int k = 0; k < nk; k++) { __strong id *p = (__strong id *)g_rk_p[k]; for (int i = 0; i < g_rk_n[k]; i++) p[i] = nil; }
     atomic_store(&g_rk_cnt, 0);
