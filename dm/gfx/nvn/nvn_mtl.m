@@ -1700,6 +1700,26 @@ static void up_blit_add(id<MTLBuffer> src, size_t off, size_t row, size_t image,
     g_up_blits[g_nup_blits++] = (up_blit){src, off, row, image, size, dst, slice, level};
 }
 
+// A LINEAR texture (the game writes its storage from the CPU: glyph caches, skinning matrices) can only be a zero-copy view when its pool offset and row pitch are aligned to what
+// Metal asks for the format. On iOS that alignment is 64 bytes and a guest offset such as 0x8d800a0 is not; the texture used to become a private one, and the CPU's writes never
+// reached the GPU (characters' 1024x64 RGBA32F skinning textures stayed zero: their bodies vanished while the scene drew). Such a texture takes the upload path instead, copied row
+// by row in its linear layout (pkg_upload_ below); a linear one must not be deswizzled. DM_NVN_LIN_UPLOAD=1 forces this path on any Mac, to measure it there.
+static int tex_linear_layout(const tex_t *t) {
+    if (!t->mem || !(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || t->d.target != NVN_TEXTURE_TARGET_2D || t->d.levels > 1 || t->d.samples > 1) return 0;
+    uint32_t pf = 0; uint8_t swz[4]; int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    return nvn_fmt_to_mtl(t->d.format, &pf, swz) && pf && bpb && bw == 1 && bh == 1;
+}
+static int tex_linear_zero_copy(const tex_t *t) {
+    static int force = -1; if (force < 0) { const char *e = getenv("DM_NVN_LIN_UPLOAD"); force = e && atoi(e); if (force) MLOG("DM_NVN_LIN_UPLOAD=1: linear textures go through the CPU upload path"); }
+    if (force || !tex_linear_layout(t)) return 0;
+    uint32_t pf = 0; uint8_t swz[4]; nvn_fmt_to_mtl(t->d.format, &pf, swz);
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    size_t row = t->d.stride ? t->d.stride : (size_t)(t->d.width ? t->d.width : 1) * bpb;
+    void *mb; uint64_t mo;
+    if (!mtl_addr((uint64_t)t->mem, (uint64_t)row * (t->d.height ? t->d.height : 1), &mb, &mo)) return 0;
+    NSUInteger al = [g_dev minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)pf];
+    return !(mo % al || row % al);
+}
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse);
 int nvn_host_readable(uint64_t a, uint64_t n);   // hle_nvn.c: guest memory and sparse pools
 int nvn_sparse_pool(const void *pool); uint64_t nvn_sparse_gen(void); uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n);
@@ -1752,6 +1772,22 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     if (stamp) {   // no stamp: a one-time upload of content the CPU will not change (tex_init_fill), with no write tracking
         if (sparse) nvn_sparse_protect(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size); else nvn_dirty_protect(t->mem, t->L.size);
         *stamp = nvn_dirty_now(); }
+    if (tex_linear_layout(t)) {   // LINEAR: copy rows in its own layout, never deswizzle (a zero-copy view that Metal's alignment forbade takes this path)
+        int lw, lh, lbpb = nvn_fmt_bpb(t->d.format, &lw, &lh);
+        size_t w = MAX(t->d.width, 1u), h = MAX(t->d.height, 1u);
+        size_t row = t->d.stride ? t->d.stride : w * (size_t)lbpb;
+        size_t bytes = row * h;
+        const uint8_t *src = t->mem; uint8_t *part = NULL;
+        if (sparse) { part = malloc(bytes ? bytes : 1); nvn_sparse_copy(t->pool, part, (uint64_t)(uintptr_t)t->mem, bytes); src = part; }
+        g_bp_up_bytes += bytes;
+        up_begin();
+        id<MTLBuffer> stg = [g_dev newBufferWithLength:bytes ? bytes : 16 options:MTLResourceStorageModeShared];
+        res_add(stg); [g_up_keep addObject:stg];
+        memcpy(stg.contents, src, bytes);
+        up_blit_add(stg, 0, row, bytes, MTLSizeMake(w, h, 1), mt, 0, 0);
+        up_flush(); free(part);
+        return mt;
+    }
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;   // a cube array's depth counts layer-faces (tex_desc)
     size_t total = 0;
@@ -1885,13 +1921,19 @@ static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-
 static int tex_init_fill(const tex_t *t, id<MTLTexture> mt) {
     if (!t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->has_layout) return 0;
     if (t->d.samples > 1 || (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) || ((int)mt.pixelFormat >= 250 && (int)mt.pixelFormat <= 262)) return 0;   // 250..262: Depth16Unorm … X24_Stencil8 (some names are macOS-only)
+    if (mt.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) return 0;   // the GPU writes it: its CPU-side storage is not the content it will hold
     int no_cpu = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) != 0;
     static int flush_fill = -1; if (flush_fill < 0) { const char *e = getenv("DM_NVN_FLUSH_FILL"); flush_fill = !e || atoi(e) != 0; }
-    if (!no_cpu && (!flush_fill || !nvn_flushed(t->mem, t->L.size))) return 0;
+    // Default on: a new sampled texture in a CPU-writable pool whose storage holds data is filled from it even when the game never flushed that range. The Great Ace Attorney's chapter
+    // title card is a 2048x2048 BC7 texture the loader copies into such a pool before its first use without a flush (its .tex loader has no cache maintenance at all); the dirty-page path
+    // would catch later writes, but the card is drawn on that first use, so it came out black while the background behind it drew. New textures are filled only when nothing has written
+    // to them yet (no layout, not virtual/sparse, not render target / image), so this is the NVN pool content the CPU put there. DM_NVN_FILL_UNFLUSHED=0 turns it off.
+    static int fill_unflushed = -1; if (fill_unflushed < 0) { const char *e = getenv("DM_NVN_FILL_UNFLUSHED"); fill_unflushed = e ? atoi(e) != 0 : 1; }
+    if (!no_cpu && !fill_unflushed && (!flush_fill || !nvn_flushed(t->mem, t->L.size))) return 0;
     if (!atomic_load(&g_sub_thread_set) || !on_sub_thread() || !mem_any(t->mem, t->L.size)) return 0;   // the upload batch belongs to the submit thread
     if (pkg_upload(t, NULL, mt) != mt) return 0;
     static uint64_t n[2]; if (n[no_cpu]++ < 4) MLOG("initial content: ser=%llu %ux%ux%u format %#x filled from its storage, %s (%llu so far)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format,
-                                                    no_cpu ? "a CPU_NO_ACCESS pool's" : "flushed by the CPU before its first use", (unsigned long long)n[no_cpu]);
+                                                    no_cpu ? "a CPU_NO_ACCESS pool's" : nvn_flushed(t->mem, t->L.size) ? "flushed by the CPU before its first use" : "written by the CPU without a flush", (unsigned long long)n[no_cpu]);
     return 1;
 }
 
@@ -1967,7 +2009,8 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     if (t->magic != MAGIC('T', 'E', 'X', 0)) { RED_ONCE(70, "texture object no longer valid (magic %#x, first case ser=%llu): no MTLTexture created", t->magic, (unsigned long long)t->serial); return nil; }
     // A sampled texture in a sparse virtual pool holds what the CPU wrote into the physical pages mapped there (Monster Hunter Rise: the hunter's innerwear, ASTC 6x6 with no packaged
     // layout, came out magenta, and the face black): it is read through the page table like a packaged one. Render targets, images, linear and buffer textures stay GPU textures (as ft_add)
-    int packaged = (t->has_layout || tex_cpu_written(t->serial) || (t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && t->d.target != NVN_TEXTURE_TARGET_BUFFER
+    int lin_cpu = tex_linear_layout(t) && !tex_linear_zero_copy(t);   // linear texture whose pool offset / row pitch forbids a zero-copy view: upload its rows instead
+    int packaged = (t->has_layout || tex_cpu_written(t->serial) || lin_cpu || (t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && t->d.target != NVN_TEXTURE_TARGET_BUFFER
                     && !(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_IMAGE)) && nvn_sparse_pool(t->pool))) && t->mem;
     {   // Diagnostic DM_NVN_TEXINFO=WxH: log storage and description of textures of that size on first resolution (to tell whether two textures share storage and why they were not merged)
         static int ti = -1; static uint32_t tw, th; static uint64_t last[64]; static int nl;
