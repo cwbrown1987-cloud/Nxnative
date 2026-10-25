@@ -70,6 +70,9 @@ static range_t *find_span(uintptr_t a, size_t len) {
 static void unprotect_page(range_t *r, uintptr_t p) {   // The caller has already changed the state from PROT to BUSY
     mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
     atomic_store(&r->gen[p], atomic_fetch_add(&g_now, 1) + 1);
+    // "now" moves on once more after the page's generation is stored: a checker that read "now" between the two found the page clean and kept that "now" as its last
+    // look (pkg->seen, the index ranges' seen); the page is writable from here on, so without a newer "now" its later writes went unseen (MacNativeGames a166602)
+    atomic_fetch_add(&g_now, 1);
     atomic_store(&r->state[p], PG_NONE);
 }
 // Unprotect one page of a range: if protected, unprotect and stamp it; if another thread is changing its protection, wait for it to finish and look again -- if the other side was setting read-only, the page is PROT after the wait and still has to be unprotected
@@ -175,13 +178,16 @@ void nvn_dirty_protect(const void *addr, size_t len) {
     if (!r) return;
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     // Consecutive pages are merged into one mprotect (per-page calls reach thousands per frame on the first upload of large textures; character select page startup frame 5: 4888 calls).
-    // Pages already PROT / BUSY break the consecutive run: do not protect again, and do not touch pages another thread is changing
+    // Pages already PROT / BUSY break the consecutive run: do not protect again, and do not touch pages another thread is changing.
+    // A BUSY page is waited out (the run so far is protected first, so none of ours is BUSY meanwhile) and looked at again: an unprotect in progress leaves the page writable
+    // with a generation the caller's stamp may cover, so skipped, its later writes never faulted and the texture stayed stale (MacNativeGames a166602)
     uintptr_t run = 0; int open = 0;
     for (uintptr_t i = p; i <= q + 1; i++) {
         uint8_t st = PG_NONE;
         int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
         if (took && !open) { run = i; open = 1; }
         if (!took && open) { mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT); open = 0; }
+        if (!took && i <= q && st == PG_BUSY && busy_wait(r, i)) i--;   // this page again
     }
 }
 uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }

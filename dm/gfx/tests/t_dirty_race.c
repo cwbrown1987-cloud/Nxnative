@@ -32,6 +32,46 @@ int t_mprotect(void *a, size_t n, int prot) {
     return mprotect(a, n, prot);
 }
 
+// A page another thread is unprotecting (its mprotect to writable done and the new generation stored, the state still BUSY) must be waited out by nvn_dirty_protect and
+// protected again: skipped, it stayed writable with a generation the caller's stamp covers, and later writes to it were never seen (MacNativeGames a166602, missing letters
+// in a glyph cache). Thread C plays the last step of that unprotect 50 ms late
+static _Atomic uint8_t *g_c_state;
+static void *thread_c(void *arg) { (void)arg; usleep(50000); atomic_store(g_c_state, PG_NONE); return NULL; }
+static void busy_protect(size_t pg) {
+    uint8_t *page = mmap(NULL, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (page == MAP_FAILED) { perror("mmap"); g_fail++; return; }
+    nvn_dirty_add_range(page, pg);
+    range_t *r = find_span((uintptr_t)page, 1); uintptr_t i = r ? ((uintptr_t)page - r->base) >> g_shift : 0;
+    nvn_dirty_protect(page, pg);
+    uint8_t st = PG_PROT;
+    if (!r || !atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY)) { printf("busy page: not protected\n"); g_fail++; return; }
+    mprotect(page, pg, PROT_READ | PROT_WRITE);   // what unprotect_page does before it stores the generation
+    atomic_store(&r->gen[i], atomic_fetch_add(&g_now, 1) + 1);
+    g_c_state = &r->state[i];
+    pthread_t tc; pthread_create(&tc, NULL, thread_c, NULL);
+    uint64_t stamp = nvn_dirty_now();   // an uploader's stamp, then its protect
+    nvn_dirty_protect(page, pg);
+    pthread_join(tc, NULL);
+    EXPECT("protect waits out a page being unprotected (state PROT)", PG_PROT, atomic_load(&r->state[i]));
+    EXPECT("no write after the stamp yet: clean", 0, nvn_dirty_since(page, 16, stamp));
+    page[0] = 7;
+    EXPECT("a later write to that page is seen", 1, nvn_dirty_since(page, 16, stamp));
+}
+// Why the uploads take their stamp before nvn_dirty_protect: a write that faults while the pages are protected or read gets a generation above a stamp taken before and
+// leaves its page writable; a stamp taken after covers it, so that write and every later one are missed (the second check is the old order, expected to miss)
+static void stamp_order(size_t pg) {
+    uint8_t *page = mmap(NULL, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (page == MAP_FAILED) { perror("mmap"); g_fail++; return; }
+    nvn_dirty_add_range(page, pg);
+    uint64_t before = nvn_dirty_now();
+    nvn_dirty_protect(page, pg);
+    page[0] = 1;   // faults during the upload
+    uint64_t after = nvn_dirty_now();
+    page[0] = 2;   // after the read: no fault, the page is writable
+    EXPECT("stamp before protect: the writes are seen", 1, nvn_dirty_since(page, 16, before));
+    EXPECT("stamp after protect (the old order): the writes are missed", 0, nvn_dirty_since(page, 16, after));
+}
+
 int main(void) {
     crash_install();
     size_t pg = (size_t)getpagesize();
@@ -53,5 +93,7 @@ int main(void) {
     else { printf("  (read failed errno=%d; the page is read-only while its state is 'none', a direct write would spin in the page-fault handler, so this check is skipped)\n", errno); g_fail++; }
     EXPECT("this write is recorded as dirty (against a stamp from before set-read-only)", 1, nvn_dirty_since(g_page, 16, stamp));
     close(fd);
+    busy_protect(pg);
+    stamp_order(pg);
     printf("t_dirty_race: %s\n", g_fail ? "FAILED" : "all passed"); return g_fail != 0;
 }
