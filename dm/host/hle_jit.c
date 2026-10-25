@@ -70,10 +70,11 @@ HLE_FORCE("_ZN2nn3jit20CreateJitEnvironmentEPNS0_9JitHandleERKNS0_27JitEnvironme
     jit_env *e = calloc(1, sizeof *e);
     pthread_mutex_init(&e->mu, NULL);
     e->plugin = m;
+    uint8_t *rx = NULL;
 #if TARGET_OS_IPHONE
     die("jit::CreateJitEnvironment: iOS runs no code generated at run time");
 #else
-    uint8_t *rx = mmap(NULL, rx_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    rx = mmap(NULL, rx_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
     if (rx == MAP_FAILED) die("jit: MAP_JIT mapping of %#llx bytes failed", (unsigned long long)rx_size);
 #endif
     uint8_t *ro = mmap(NULL, ro_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
