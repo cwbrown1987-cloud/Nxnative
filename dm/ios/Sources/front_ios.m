@@ -143,6 +143,13 @@ static UILabel *front_ios_fps_label(void) {
 }
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
+// Offline HTML pages (web_apple.m): the page's view goes over the game view and under the gamepad, which lets touches on no control through to it while the page is
+// shown (DmGamepad.m hitTest); the page takes them as a click on what they land on, and the gamepad and controllers drive it as on the Switch
+void front_web_attach(UIView *box) {
+    UIView *v = g_root.view; box.frame = v.bounds;
+    if (g_root.game) [v insertSubview:box aboveSubview:g_root.game]; else [v addSubview:box];
+}
+void front_web_detach(UIView *box) { (void)box; }
 void front_run(void (*guest)(void)) { guest(); }   // Already on main.m's big-stack thread
 
 // Software keyboard: show a UIAlertController on the main thread, the calling thread waits for the result
