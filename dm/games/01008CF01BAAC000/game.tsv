@@ -1,0 +1,46 @@
+# Game profile of The Legend of Zelda: Echoes of Wisdom (Switch, base game 1.0.0 = v0, a cartridge dump). Plays on the Mac (the title, file select and about 4 minutes of play, at 60 fps with sound)
+# Format: see dm/games/README.md
+# Grezzo's engine on NintendoWare (G3d / Ui2d / Vfx / Atk / Font), as Link's Awakening, SDK 16.2.0, NVN; modules main + subsdk0 (GLSLC, the runtime shader compiler) + subsdk1 (NintendoSDK_movie) + sdk.
+# RomFS (10,963 files, 7.48 GB): bfres models and maps (region_common/map, region_common/actor), shaders in region_common/shader/*.bfsha (BNSH), particle effects in region_common/effect/*.ptcl,
+# layouts in region_common/ui/*.arc (SARC), movies in region_common/movie/*.webm. The provisional profile's guesses held: no host or rewriter change
+
+# ---- Identity ----
+title_id	01008CF01BAAC000
+program_id	01008CF01BAAC000
+
+# ---- App ----
+# Game name: only a label for profile listings and the Mac window title; the iOS app name is the game name in the base NSP, and the bundle ID comes from the base game title ID (build_ipa.sh / NSP script)
+name	The Legend of Zelda: Echoes of Wisdom
+ipa	ZeldaEchoesOfWisdom.ipa
+app_category	public.app-category.adventure-games
+
+# ---- Versions ----
+# the base game is a cartridge dump (.xci) with no ticket; no update was brought up
+build	v0	1.0.0	main=a581406bc985865113d18cb19f11d544	subsdk0=e0d8adcc446cf14d6af1a51193f72e30	subsdk1=ff0149d0b5e882b87c2f06a981302b13	sdk=3053b22935e32ddf15ef81997603e5c2
+package	v0
+shader_versions	v0
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 subsdk1 sdk
+romfs_marker	region_common/audio/edward.bfsar
+zip_store	.arc:.bffnt:.bfntpj:.bfres:.bfsar:.bfstm:.bntx:.ptcl:.webm:.metallib
+
+# ---- Memory ----
+# The NPDM declares no system resource, so the game has no virtual address memory: it sets a heap of 3.11 GB and allocates from it.
+# The block is 256 MB in front + 256 MB alias region + 256 MB stack region + 3.25 GB heap region
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares no system resource: IsVirtualAddressMemoryEnabled is false, as on Horizon
+sys_resource	0x0
+
+# ---- Shader split (shader_split.py; BNSH / BAHS) ----
+# shader_* keys are in every shader's cache key: the groups and the note are the provisional profile's, kept so that its shader libraries stay valid
+shader_groups	/region_common/=regioncommon /regionEU/=regioneu /regionUS/=regionus /regionJP/=regionjp /regionCN/=regioncn /regionKR/=regionkr /regionTW/=regiontw
+shader_note	The Legend of Zelda: Echoes of Wisdom shaders (provisional profile)
+
+# ---- After the rewrite ----
+# the rewritten modules are larger than the default 64 MB of used memory
+mem_used	0x6600000
