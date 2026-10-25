@@ -87,6 +87,16 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Check:** here (a built-in 120 Hz screen, a multiple of every link rate) a harness drove `front_mac.m` asked for 50 fps: no switch in the window, 120 → 50 Hz in fullscreen, 120 Hz again on leaving it, and 120 Hz after quitting in fullscreen; at 60 fps and with `DM_SCREEN_MATCH=0` nothing switched.
 - **Not checked:** the link's new range after a switch has not run here (Hades windowed and fullscreen paced at 60 as before).
 
+### A display link one refresh ahead of the screen halves the frame rate
+
+- **Symptom:** a Mac game at a steady 60 fps drops to 30 after entering fullscreen and stays there until it quits or leaves fullscreen, with the GPU nearly idle (about 5 ms a frame). The `display link up to tick` line's `submission ahead of target display p50` falls from about 50 ms to about 16.5 ms, and `on-screen` counts nearly every frame dropped (297 of 300). Refocusing the window does not bring it back.
+- **Cause:** in fullscreen on a 120 Hz ProMotion screen the system hands the display link's drawables only one refresh ahead (`preferredFrameLatency` 1), against about three in a window, and a frame taken on a tick then misses its refresh every other time. A new link object made in fullscreen comes up the same way, so it is fullscreen itself, not a stale link. A 0.6 s `DM_TEST_LINK_STALL` in a window recovered at 60.
+- **Fix:** while the window is in fullscreen the present thread takes its own drawables (present pacing mode 0, as `DM_PRESENT_LINK=0`), and the display link comes back when the window leaves fullscreen (`front_fullscreen` in `front_mac.m`, `link_sync` in `nvn_mtl.m`; the log shows `present pacing mode 1 → 0` and `0 → 1`). A link started again begins its silence watch from its start (`g_link_tick_ns` in `link_main`): from the last tick of the old one, `mtl_present_wait` took the time in fullscreen for a stall (`[RED] display link silent for 22.0 s while active`) and dropped frames.
+- **Measured** (Ctrl+Cmd+F 25 s into a windowed run, three runs each): no link in fullscreen held 59.6–60 fps with 0–2 frames dropped per 300; `preferredFrameLatency` 3 held 60 in two runs of three and about 45 in the third, 2 settled at about 42; recreating the link once the drawable size settles stayed at 30 (latency 1) or about 40 (latency 3); `DM_PRESENT_FIFO=0` did not help. After leaving fullscreen the window ran at 55–59 fps with a lead of about 33 ms for about 15 s, then 60 at 49.8 ms.
+- **Also:** `empty ticks` in that line no longer wraps to 18446744073709551615 when the presents are one ahead of the ticks, and the startup log names the link's latency (`display link: preferredFrameLatency 1`).
+- **Found on:** [Mario vs. Donkey Kong](../../dm/games/0100B99019412000/README.md) on a MacBook Pro (M4 Pro) with its built-in 120 Hz ProMotion screen, on AC power, Low Power Mode off.
+- **Not checked:** other Mac screens (60 Hz, external, 144 / 165 Hz, where fullscreen also switches the screen's rate, `front_screen_match`), and other games in fullscreen.
+
 ## CPU cost and pacing
 
 ### Submissions handed to the GPU in segments

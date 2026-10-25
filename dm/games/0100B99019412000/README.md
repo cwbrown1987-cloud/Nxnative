@@ -52,6 +52,7 @@ General host changes first needed here; each applies to every game:
 
 - **32 outputs for AAC movie decoders and one AAC frame from `GetOutputBufferSize`** (`MD_NOUT_AAC` in `hle_movie.c`): [AAC decoders offer at most 32 outputs](../../../docs/reference/movies.md#aac-decoders-offer-at-most-32-outputs), [AAC output buffer size is one frame](../../../docs/reference/movies.md#aac-output-buffer-size-is-one-frame).
 - **Advanced blend modes** (`blend_st`, `adv_blend`): [Advanced blend modes as Porter-Duff factors](../../../docs/reference/rendering.md#advanced-blend-modes-as-porter-duff-factors).
+- **A display link one refresh ahead of the screen halves the frame rate** (Mac, 120 Hz ProMotion, after entering fullscreen; no display link in fullscreen, `front_fullscreen` / `link_sync`): [A display link one refresh ahead of the screen halves the frame rate](../../../docs/reference/frame-rate.md#a-display-link-one-refresh-ahead-of-the-screen-halves-the-frame-rate).
 - **A value filter for `DM_PROBE_POLL`** (`=<value>`, for a word that changes often before the bad store): [05, Probes without a debugger](../../../docs/agents/05-debugging.md#probes-without-a-debugger-dm_probe).
 
 ## Open
