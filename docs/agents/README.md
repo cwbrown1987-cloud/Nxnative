@@ -11,6 +11,7 @@ Everything here was learned on Diablo II: Resurrected (SDK ~12, NVN 53, the orig
 | [03-bringup.md](03-bringup.md) | Getting the host to boot the game: the run loop, how to read the log, and a catalogue of every failure pattern met so far with its root cause and fix |
 | [04-graphics.md](04-graphics.md) | NVN on Metal for a new title: object sizes, shader containers and keys, binding layouts, bindless textures, depth mode, index sizes, swizzle, transient render targets, the diagnostic switches |
 | [05-debugging.md](05-debugging.md) | Recipes: crash reports, lldb scripts, Ghidra headless decompilation, objdump, memory growth, render-pass and texture dumps, on-device diagnostics, offline pipeline link checks |
+| [06-intel-mac.md](06-intel-mac.md) | Building an IPA on an Intel Mac: the universal translator launcher, a native Oodle decoder in place of the arm64 host, disk layout, signing and installing |
 
 ## Ground rules
 
