@@ -367,7 +367,7 @@ static void au_stop_at(void *g, void *lr) {
     uint32_t rh = atomic_load_explicit(&a->rel_head, memory_order_acquire);
     uint32_t rt = atomic_load_explicit(&a->rel_tail, memory_order_acquire);
 
-    LOG("[AUDIOSTOPDBG] audio #%d pending=%u released=%u pos=%llu event=%p",
+    LOG("audio #%d Stop: pending=%u released=%u pos=%llu event=%p",
         a->id,
         qt - qh,
         rt - rh,
