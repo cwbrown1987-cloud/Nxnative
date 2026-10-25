@@ -97,9 +97,18 @@ HLE_FORCE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", "launch parameter: the bytes
 // Tears of the Kingdom (SDK 20.5.22): the index of the program that launched this one in a multi-program application. The SDK asks the applet proxy, which the host never opens
 // (null read in applet::GetPreviousProgramIndex right after the window setup); -1 = launched from the home menu
 HLE_FORCE("_ZN2nn2oe23GetPreviousProgramIndexEv", "previous program index: launched from HOME, -1", int, h_oe_PrevProgram, void) { return -1; }
-// Launch another program of a multi-program application (Octopath Traveler 0 imports it); on hardware it does not return. The host has only this program: logged, and the game carries on
-HLE_FORCE("_ZN2nn2oe14ExecuteProgramEiPKvm", "launch another program of the application: the host runs only this one (logged)", void, h_oe_ExecProgram, int index, const void *param, size_t n) {
-    (void)param; LOG("[RED] oe::ExecuteProgram(%d, %zu bytes of parameters): the host runs only this program; the game carries on", index, n);
+// Launch another program of a multi-program application (Octopath Traveler 0 imports it); on hardware it does not return: this process ends and the other program starts with the
+// parameters as its launch parameter (TryPopLaunchParameter). With DM_EXEC_OUT=<file> the host does the same: it writes the program index (4 bytes, little-endian) and the
+// parameters to that file and exits, and whoever started it starts the program (Super Mario 3D All-Stars' menu hands each game 16 bytes, its LanguageCode and two volumes).
+// Without it the host has only this program: logged, and the game carries on
+HLE_FORCE("_ZN2nn2oe14ExecuteProgramEiPKvm", "launch another program of the application: with DM_EXEC_OUT, written there and the process ends; else logged", void, h_oe_ExecProgram, int index, const void *param, size_t n) {
+    char hex[3 * 32 + 1] = ""; for (size_t i = 0; i < n && i < 32; i++) snprintf(hex + 3 * i, 4, " %02x", ((const uint8_t *)param)[i]);
+    const char *f = getenv("DM_EXEC_OUT");
+    if (!f || !*f) { LOG("[RED] oe::ExecuteProgram(%d, %zu bytes of parameters:%s): the host runs only this program; the game carries on (DM_EXEC_OUT=<file> hands it over)", index, n, hex); return; }
+    FILE *fp = fopen(f, "wb"); int32_t ix = index;
+    if (!fp || fwrite(&ix, 4, 1, fp) != 1 || (n && fwrite(param, n, 1, fp) != 1) || fclose(fp)) { LOG("[RED] oe::ExecuteProgram(%d): cannot write DM_EXEC_OUT %s; the game carries on", index, f); if (fp) fclose(fp); return; }
+    LOG("oe::ExecuteProgram(%d, %zu bytes of parameters:%s) → %s; this program ends", index, n, hex, f);
+    void dm_host_shutdown(const char *why); dm_host_shutdown("ExecuteProgram");
 }
 HLE_FORCE("_ZN2nn2oe16DisableRecordingEv", "video recording switch; the host has no system recording", void, h_oe_DisableRec, void) {}
 // Silence the game's sound in system video captures (through am; FINAL FANTASY RESONANCE imports both): the host records nothing

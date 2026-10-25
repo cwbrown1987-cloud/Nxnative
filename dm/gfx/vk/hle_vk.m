@@ -1575,5 +1575,14 @@ static void *vk_lookup(const char *name) {
     pthread_mutex_unlock(&mu);
     return fn;
 }
+// VK_EXT_debug_report, which CreateInstance accepts as any extension: the host's layer reports nothing through it, so the callback is kept as a handle and never called.
+// Super Mario 3D All-Stars' Super Mario 64 (program 1) enables the extension and calls vkCreateDebugReportCallbackEXT without checking the pointer: it jumped to 0 (main+0x7494)
+VK(vkCreateDebugReportCallbackEXT, VkResult, VkInstance i, const VkDebugReportCallbackCreateInfoEXT *ci, const VkAllocationCallbacks *a, VkDebugReportCallbackEXT *cb) {
+    (void)i; (void)ci; (void)a; static _Atomic uint64_t n; *cb = (VkDebugReportCallbackEXT)(uintptr_t)(atomic_fetch_add(&n, 1) + 1); return VK_SUCCESS;
+}
+VK(vkDestroyDebugReportCallbackEXT, void, VkInstance i, VkDebugReportCallbackEXT cb, const VkAllocationCallbacks *a) { (void)i; (void)cb; (void)a; }
+VK(vkDebugReportMessageEXT, void, VkInstance i, VkDebugReportFlagsEXT f, VkDebugReportObjectTypeEXT t, uint64_t o, size_t l, int32_t c, const char *p, const char *m) {
+    (void)i; (void)f; (void)t; (void)o; (void)l; (void)c; (void)p; (void)m;
+}
 VK(vkGetInstanceProcAddr, PFN_vkVoidFunction, VkInstance i, const char *name) { (void)i; return (PFN_vkVoidFunction)vk_lookup(name); }
 VK(vkGetDeviceProcAddr, PFN_vkVoidFunction, VkDevice d, const char *name) { (void)d; return (PFN_vkVoidFunction)vk_lookup(name); }
