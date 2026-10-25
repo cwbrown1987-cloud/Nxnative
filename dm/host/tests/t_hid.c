@@ -219,7 +219,7 @@ static void t_script_hold(void) {
     CHECK(buttons_of(0, STYLE_FULLKEY) == (DM_BTN_A | DM_BTN_B | DM_BTN_X), "script, controller and keyboard buttons are combined");
     CHECK(buttons_of(0, STYLE_FULLKEY) == (DM_BTN_A | DM_BTN_B | DM_BTN_X), "a scripted hold survives controller updates after the press latch is consumed");
     CHECK(lx_of(0) == -0x7000, "the scripted stick wins over controller drift");
-    CHECK(atomic_load(&g_shake_on), "controller updates do not stop a scripted shake");
+    CHECK(atomic_load(&g_shake_on[0]), "controller updates do not stop a scripted shake");
 }
 static void t_script(void) {
     g_mode = 1; dm_pad_players(1);
@@ -229,7 +229,7 @@ static void t_script(void) {
     script_hold = t_script_hold; keys_main(NULL); script_hold = NULL;
     CHECK(buttons_of(0, STYLE_FULLKEY) == (DM_BTN_B | DM_BTN_X), "script release preserves the controller and keyboard buttons");
     CHECK(lx_of(0) == 120, "script release preserves the controller stick");
-    CHECK(!atomic_load(&g_shake_on), "script release ends its shake hold");
+    CHECK(!atomic_load(&g_shake_on[0]), "script release ends its shake hold");
     dm_input_set(0, 0, 0, 0, 0); dm_pad_set(0, 0, 0, 0, 0); buttons_of(0, STYLE_FULLKEY);
     g_steps[0] = (key_step){.btn = DM_BTN_Y}; keys_main(NULL);
     CHECK(buttons_of(0, STYLE_FULLKEY) == DM_BTN_Y, "a short scripted press is latched until the game reads");
@@ -243,6 +243,100 @@ static void t_script(void) {
     g_mode = 1; dm_pad_players(1);
     g_nsteps = 0;
     test_time += 1000000000ull;   // let the scripted Shake finish before the physical-motion tests
+}
+
+static void t_shake(void) {
+    SixAxisState six[6]; NpadState pad;
+    uint32_t first = 0;
+    g_mode = 1; ids((uint32_t[]){0,1,2,3,4,5,6,7,NPAD_HANDHELD}, 9);
+    dm_input_set(0,0,0,0,0);
+    for (int p = 0; p < DM_PLAYERS; p++) { dm_pad_set_player(p,0,0,0,0,0); dm_pad_motion(p,NULL); }
+    dm_pad_players(0xff); test_time += 1000000000ull;
+    for (int p = 0; p < DM_PLAYERS; p++) fill(&pad,(uint32_t)p,STYLE_FULLKEY);   // consume older tests' press latches
+
+    for (int p = 1; p < DM_PLAYERS; p++) {
+        uint32_t h = (uint32_t)p << 8;
+        dm_pad_set_player(p,DM_BTN_A | DM_BTN_SHAKE,0,0,0,0); test_time += 20000000;
+        h_hid_SixState(six,&h);
+        CHECK(six[0].acc[0] > 0 && six[0].gyro[2] > 0 && !h_hid_SixRest(&h), "each secondary player receives its own mapped Shake");
+        h_hid_SixState(six,&first);
+        CHECK(six[0].acc[0] == 0 && h_hid_SixRest(&first), "secondary Shake does not leak into player 1 in multiplayer");
+        fill(&pad,(uint32_t)p,STYLE_FULLKEY);
+        CHECK(pad.buttons == DM_BTN_A, "Shake never reaches the game's Npad button bits");
+        dm_pad_set_player(p,0,0,0,0,0); test_time += 20000000;
+        h_hid_SixState(six,&h);
+        CHECK(six[0].acc[0] > 0 && !h_hid_SixRest(&h), "releasing secondary Shake lets the current cycle finish");
+        test_time += 200000000;
+        h_hid_SixState(six,&h);
+        CHECK(six[0].acc[0] == 0 && h_hid_SixRest(&h), "released secondary Shake returns to rest");
+    }
+
+    // DM_KBD_PLAYER=own puts the controller in slot 1. A one-player game
+    // merges it into player 1, including a tap released before any sensor read.
+    ids((uint32_t[]){0,NPAD_HANDHELD}, 2); dm_pad_players(7);
+    test_time = (test_time / SIX_PERIOD_NS + 1) * SIX_PERIOD_NS;
+    dm_pad_set_player(1,DM_BTN_SHAKE,0,0,0,0); test_time += 1000000;
+    dm_pad_set_player(1,0,0,0,0,0); test_time += 19000000;
+    CHECK(h_hid_SixStates(six,6,&first) == 6 && six[0].acc[0] > 0 && six[5].acc[0] == 0,
+          "one-player merged Shake preserves a short tap and its sensor history");
+    CHECK(!h_hid_SixRest(&first), "one-player merged Shake is not reported at rest");
+    test_time += 200000000;
+    CHECK(h_hid_SixRest(&first), "one-player merged tap finishes its cycle");
+
+    dm_pad_set_player(1,DM_BTN_SHAKE,0,0,0,0); test_time += 20000000;
+    ids((uint32_t[]){0,1}, 2);
+    uint32_t second = 0x100;
+    h_hid_SixState(six,&second);
+    CHECK(six[0].acc[0] > 0 && h_hid_SixRest(&first), "held Shake follows the player's current Npad assignment");
+    dm_pad_set_player(2,DM_BTN_SHAKE,0,0,0,0); test_time += 20000000;
+    CHECK(h_hid_SixRest(&first), "unsupported multiplayer slots do not shake player 1");
+    ids((uint32_t[]){0}, 1);
+    dm_pad_set_player(1,0,0,0,0,0); test_time += 200000000;
+    h_hid_SixState(six,&first);
+    CHECK(six[0].acc[0] != 0 && !h_hid_SixRest(&first), "releasing one merged controller leaves another controller's Shake held");
+    dm_pad_set_player(2,0,0,0,0,0); test_time += 200000000;
+    CHECK(h_hid_SixRest(&first), "all merged Shake sources released returns to rest");
+
+    g_mode = 0; ids((uint32_t[]){NPAD_HANDHELD}, 1);
+    uint32_t handheld = 0x2001;
+    dm_pad_set_player(1,DM_BTN_SHAKE,0,0,0,0); test_time += 20000000;
+    h_hid_SixState(six,&handheld);
+    CHECK(six[0].acc[0] > 0 && !h_hid_SixRest(&handheld), "secondary Shake merges into the handheld sensor");
+    dm_pad_players(1);
+    h_hid_SixState(six,&handheld);
+    CHECK(six[0].acc[0] == 0 && h_hid_SixRest(&handheld), "disconnecting a merged Shake controller removes its motion");
+    dm_pad_players(3);
+    h_hid_SixStates(six,6,&handheld);
+    int cleared = 1; for (int i = 0; i < 6; i++) cleared &= six[i].acc[0] == 0;
+    CHECK(cleared && h_hid_SixRest(&handheld), "immediate slot reuse does not inherit the disconnected controller's Shake history");
+    test_time += 200000000;
+
+    g_mode = 1; ids((uint32_t[]){0,1}, 2);
+    dm_motion physical = {.acc={0,0,-1}, .gyro={0,0,0.25f}, .dir={1,0,0,0,1,0,0,0,1}};
+    dm_pad_motion(1,&physical);
+    dm_pad_set_player(1,DM_BTN_SHAKE,0,0,0,0); test_time += 20000000;
+    h_hid_SixState(six,&second);
+    CHECK(six[0].acc[0] > 0 && six[0].gyro[2] > 0.5f, "secondary Shake overrides physical motion for its whole cycle");
+    dm_pad_set_player(1,0,0,0,0,0); test_time += 200000000; dm_pad_motion(1,&physical);
+    h_hid_SixState(six,&second);
+    CHECK(six[0].acc[0] == 0 && six[0].gyro[2] == 0.25f, "physical motion resumes after secondary Shake finishes");
+    dm_pad_motion(1,NULL);
+
+    dm_input_set(DM_BTN_SHAKE,0,0,0,0); dm_pad_set(DM_BTN_SHAKE,0,0,0,0); test_time += 20000000;
+    dm_input_set(0,0,0,0,0); test_time += 200000000;
+    CHECK(!h_hid_SixRest(&first) && h_hid_SixRest(&second), "keyboard release preserves player 1's controller Shake without affecting player 2");
+    dm_pad_set(0,0,0,0,0); test_time += 200000000;
+    CHECK(h_hid_SixRest(&first), "keyboard and first-controller Shake still return to rest");
+
+    script_set(DM_BTN_SHAKE,0,0,0,0); test_time += 20000000;
+    h_hid_SixState(six,&first);
+    CHECK(six[0].acc[0] > 0 && !h_hid_SixRest(&first) && h_hid_SixRest(&second), "scripted Shake reaches only player 1's sensor");
+    dm_pad_set_player(1,DM_BTN_SHAKE,0,0,0,0); test_time += 20000000;
+    CHECK(!h_hid_SixRest(&first) && !h_hid_SixRest(&second), "scripted and secondary-controller Shake can run together");
+    script_set(0,0,0,0,0); test_time += 200000000;
+    CHECK(h_hid_SixRest(&first) && !h_hid_SixRest(&second), "script release preserves the secondary controller's Shake");
+    dm_pad_set_player(1,0,0,0,0,0); test_time += 200000000;
+    CHECK(h_hid_SixRest(&second), "secondary Shake returns to rest after the overlapping script finishes");
 }
 
 int main(void) {
@@ -269,6 +363,7 @@ int main(void) {
     six_states(six,3,0);
     CHECK(six[0].gyro[2]==0 && six[1].gyro[2]==0 && six[2].gyro[2]==0, "fresh motion never revives history from before a stale gap");
     dm_pad_motion(1, NULL); six_states(six,1,0); CHECK(six[0].gyro[2] == 0, "disconnect clears sensor history");
+    t_shake();
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

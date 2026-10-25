@@ -14,6 +14,11 @@ immediately and persist per controller model in `controllers.plist` under
 model share a mapping within that directory. Extra buttons are usable only
 when the controller/driver exposes them.
 
+Shake drives that controller's six-axis sensor and follows its player assignment.
+In one-player games it merges into player 1 with the controller's other input,
+including when `DM_KBD_PLAYER=own` reserves the first slot for the keyboard.
+A brief press completes one shake cycle; holding repeats it.
+
 The existing eight-player allocation is retained: controllers take separate
 slots. Press a button or move a stick to join with a GameController device;
 reconnecting controllers reclaim a free slot of their model, and a

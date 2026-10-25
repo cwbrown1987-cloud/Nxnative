@@ -237,6 +237,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md): it reads all 16 history entries per sensor and ignores the count, like its npad history ([History reads fill every requested entry](#history-reads-fill-every-requested-entry)).
 - **Note:** find a game's swing detector by probing the accelerometer value it reads (`DM_PROBE=main:626248@x8+10` in Odyssey 1.4.1).
 
+### Mapped Shake on secondary controllers
+
+- **Symptom:** a button mapped to Shake does nothing on a secondary controller, including the first physical controller with `DM_KBD_PLAYER=own`, even though its normal buttons work in a one-player game.
+- **Cause:** the synthetic shake tracked only the keyboard and controller slot 0, and six-axis reads enabled it only for player 1.
+- **Fix:** track whole shake cycles per controller slot and select a source using the same player assignments as buttons and physical motion. One-player games merge secondary sources into player 1; multiplayer keeps each player's shake separate. Short taps, release completion, physical-motion fallback and the at-rest query follow that source. Removing a slot discards its pending shake so reconnecting cannot inherit it.
+- **Found on:** controller-mapping review and synthetic regressions in `dm/host/tests/t_hid.c`, covering all secondary slots, keyboard reservation, docked/handheld merging, disconnect and physical-motion coexistence.
+
 ### SDK 20 six-axis sensor and amiibo (`nfp`) calls
 
 - **Symptom:** SDK 20 calls that reach a service; `nfp`'s `AttachActivateEvent` / `AttachDeactivateEvent` crashed in the SDK at `sdk+0x3f2a78`.

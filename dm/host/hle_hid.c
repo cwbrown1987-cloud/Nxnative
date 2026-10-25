@@ -33,32 +33,34 @@ static _Atomic int64_t g_sampling = 1 << 16;   // starts high so the history ent
 static uint64_t pack(int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     return (uint64_t)(uint16_t)lx | (uint64_t)(uint16_t)ly << 16 | (uint64_t)(uint16_t)rx << 32 | (uint64_t)(uint16_t)ry << 48;
 }
-// Shake (DM_BTN_SHAKE on any player 1 path): whole side-to-side cycles on the guest clock, so the controller always comes back to rest. A press starts a shake (or continues one still
-// finishing), holding keeps shaking, and a release lets the current cycle finish: a tap of one frame is still one whole shake
+// Shake (DM_BTN_SHAKE on any input path): whole side-to-side cycles on the guest clock, so the controller always comes back to rest. A press starts a shake (or continues one still
+// finishing), holding keeps shaking, and a release lets the current cycle finish: a tap of one frame is still one whole shake. Track each controller slot separately; slot 0
+// also includes keyboard / touch and scripted input. Sensor reads route these sources with the same player assignments as buttons and physical motion.
 #define SHAKE_HZ 6.0
 static const uint64_t SHAKE_CYCLE_NS = (uint64_t)(1e9 / SHAKE_HZ);
-static _Atomic uint64_t g_shake_t0, g_shake_end;   // the current shake's start and end; end = UINT64_MAX while held
-static _Atomic int g_shake_on;
-static void shake_note(void) {
-    int on = ((atomic_load(&g_btn) | atomic_load(&g_sc_btn) | atomic_load(&g_pad_btn[0])) & DM_BTN_SHAKE) != 0;
-    if (atomic_exchange(&g_shake_on, on) == on) return;
+static _Atomic uint64_t g_shake_t0[DM_PLAYERS], g_shake_end[DM_PLAYERS];   // each shake's start and end; end = UINT64_MAX while held
+static _Atomic int g_shake_on[DM_PLAYERS];
+static void shake_note(int p) {
+    uint64_t buttons = atomic_load(&g_pad_btn[p]); if (!p) buttons |= atomic_load(&g_btn) | atomic_load(&g_sc_btn);
+    int on = (buttons & DM_BTN_SHAKE) != 0;
+    if (atomic_exchange(&g_shake_on[p], on) == on) return;
     uint64_t t = guest_ns();
-    if (on) { if (t >= atomic_load(&g_shake_end)) atomic_store(&g_shake_t0, t); atomic_store(&g_shake_end, UINT64_MAX); }
-    else { uint64_t t0 = atomic_load(&g_shake_t0); atomic_store(&g_shake_end, t0 + ((t - t0) / SHAKE_CYCLE_NS + 1) * SHAKE_CYCLE_NS); }
+    if (on) { if (t >= atomic_load(&g_shake_end[p])) atomic_store(&g_shake_t0[p], t); atomic_store(&g_shake_end[p], UINT64_MAX); }
+    else { uint64_t t0 = atomic_load(&g_shake_t0[p]); atomic_store(&g_shake_end[p], t0 + ((t - t0) / SHAKE_CYCLE_NS + 1) * SHAKE_CYCLE_NS); }
 }
 void dm_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     uint64_t old = atomic_exchange(&g_btn, buttons); atomic_fetch_or(&g_latch, buttons & ~old); atomic_store(&g_axes, pack(lx, ly, rx, ry));
-    shake_note();
+    shake_note(0);
 }
 void dm_pad_set_player(int p, uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     if (p < 0 || p >= DM_PLAYERS) return;
     uint64_t old = atomic_exchange(&g_pad_btn[p], buttons); atomic_fetch_or(&g_pad_latch[p], buttons & ~old); atomic_store(&g_pad_axes[p], pack(lx, ly, rx, ry));
-    if (!p) shake_note();
+    shake_note(p);
 }
 void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) { dm_pad_set_player(0, buttons, lx, ly, rx, ry); }
 static void script_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     uint64_t old = atomic_exchange(&g_sc_btn, buttons); atomic_fetch_or(&g_sc_latch, buttons & ~old); atomic_store(&g_sc_axes, pack(lx, ly, rx, ry));
-    shake_note();
+    shake_note(0);
 }
 uint64_t dm_input_samples(void) { return (uint64_t)atomic_load(&g_sampling); }
 // DM_KEYS scripted input (for tests): "seconds:key[+key][~hold seconds][*count/interval seconds],...", e.g. "8:A,12:A,15:Down~0.5,16:A+B,40:A*80/2" (A every 2 s from 40 s on, 80 times). Key names A B X Y LS RS L R ZL ZR (plus the sticks LLeft LUp LRight LDown and RLeft RUp RRight RDown) Plus Minus Left Up Right Down, left stick LLeft LUp LRight LDown,
@@ -221,7 +223,10 @@ void dm_pad_players(uint32_t mask) {
     mask = (mask | 1u) & ((1u << DM_PLAYERS) - 1);
     uint32_t old = atomic_exchange(&g_players, mask);
     for (int p = 1; p < DM_PLAYERS; p++) if ((old ^ mask) >> p & 1) {
-        if (!(mask >> p & 1)) dm_pad_set_player(p, 0, 0, 0, 0, 0);   // a controller that went away leaves nothing pressed
+        if (!(mask >> p & 1)) {
+            dm_pad_set_player(p, 0, 0, 0, 0, 0);   // a controller that went away leaves nothing pressed
+            atomic_store(&g_shake_end[p], 0);   // discard its finishing cycle and history before the slot can be reused
+        }
         if (atomic_load(&g_ids_supported) & id_bit((uint32_t)p)) style_changed((uint32_t)p);
     }
     note_merged();
@@ -341,15 +346,20 @@ static int physical_motion(int p, uint64_t time, dm_motion *out) { // lock held
 }
 #define SHAKE_G 3.0
 #define SHAKE_REV 1.5
-static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < atomic_load(&g_shake_end); }
-static void six_sample(SixAxisState *s, int64_t samp, int shakes) {
+static int shake_source(int p, uint64_t t) {
+    if (p < 0) return -1;
+    uint32_t candidates = 1u << p; if (!p) candidates |= merged_players();
+    for (int j = 0; j < DM_PLAYERS; j++) if ((candidates >> j & 1) && t >= atomic_load(&g_shake_t0[j]) && t < atomic_load(&g_shake_end[j])) return j;
+    return -1;
+}
+static void six_sample(SixAxisState *s, int64_t samp, int shake) {
     memset(s, 0, sizeof *s);
     uint64_t t = (uint64_t)samp * SIX_PERIOD_NS;
     s->delta_ns = SIX_PERIOD_NS; s->sampling = samp; s->attributes = 1;   // IsConnected
     s->acc[2] = -1;
     double yaw = 0;
-    if (shakes && shaking(t)) {
-        double ph = 2 * M_PI * SHAKE_HZ * (double)(t - atomic_load(&g_shake_t0)) / 1e9;
+    if (shake >= 0) {
+        double ph = 2 * M_PI * SHAKE_HZ * (double)(t - atomic_load(&g_shake_t0[shake])) / 1e9;
         s->acc[0] = (float)(SHAKE_G * sin(ph));
         s->gyro[2] = (float)(SHAKE_REV * sin(ph));
         yaw = SHAKE_REV / (2 * M_PI * SHAKE_HZ) * (1 - cos(ph)); s->angle[2] = (float)yaw;
@@ -359,20 +369,21 @@ static void six_sample(SixAxisState *s, int64_t samp, int shakes) {
 }
 // SixAxisSensorHandle: byte 0 the style's bit number, byte 1 the npad id, byte 2 the device (left / right Joy-Con of a pair). The styles made of two Joy-Cons (handheld, dual) have
 // two sensors, the others one. A handle reads as connected while its controller is connected in that style; otherwise its entries are zero (not connected) and the count 0.
-// Only player 1's controller shakes (DM_BTN_SHAKE comes from the keyboard, the iPhone and DM_KEYS, all player 1)
+// Mapped Shake follows its controller's player, including controllers merged into player 1 for one-player games.
 static int six_connected(uint32_t h) { return (h & 0xff) < 32 && (style_of(h >> 8 & 0xff) >> (h & 0xff) & 1); }
 static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (n <= 0) return 0;
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
     int64_t samp = (int64_t)(guest_ns() / SIX_PERIOD_NS);
-    int shakes = player_of(h >> 8 & 0xff) == 0;
     int p=player_of(h >> 8 & 0xff);
     pthread_mutex_lock(&motion_lock);
     for (int i = 0; i < n; i++) {
-        six_sample(&out[i], samp - i, shakes);
+        uint64_t time = (uint64_t)(samp - i) * SIX_PERIOD_NS;
+        int shake = shake_source(p, time);
+        six_sample(&out[i], samp - i, shake);
         dm_motion m;
         // Explicit shake retains the original whole-cycle behavior.
-        if (!(shakes && shaking((uint64_t)(samp-i)*SIX_PERIOD_NS)) && physical_motion(p,(uint64_t)(samp-i)*SIX_PERIOD_NS,&m)) {
+        if (shake < 0 && physical_motion(p,time,&m)) {
             memcpy(out[i].acc,m.acc,sizeof m.acc); memcpy(out[i].gyro,m.gyro,sizeof m.gyro);
             memcpy(out[i].angle,m.angle,sizeof m.angle); memcpy(out[i].dir,m.dir,sizeof m.dir);
         }
@@ -381,7 +392,7 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     return n;
 }
 static unsigned six_rest(uint32_t h) {
-    int p=player_of(h >> 8 & 0xff); if (!p && shaking(guest_ns())) return 0;
+    int p=player_of(h >> 8 & 0xff); if (shake_source(p,guest_ns()) >= 0) return 0;
     dm_motion m; pthread_mutex_lock(&motion_lock); int present=physical_motion(p,guest_ns(),&m); pthread_mutex_unlock(&motion_lock);
     if (!present) return 1;
     float speed=0,acc=0; for(int i=0;i<3;i++) { speed+=m.gyro[i]*m.gyro[i]; acc+=m.acc[i]*m.acc[i]; }
