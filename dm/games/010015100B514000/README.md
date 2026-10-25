@@ -9,6 +9,7 @@ Base game v0 (1.0.0, SDK 16.2.0), update 1.0.1 (v65536, SDK 16.2.0; short Mac cr
 | Resource heap +16 KB | [`patches.py`](patches.py) `CUTS`, v0 `main` `cd6e42ae…` at `main+0x1e62fc`, 1.0.1 `main` `f91868b8…` at `main+0x1f6890`, 1.2.1 `main` `ff773e90…` at `main+0x1cf9b0` | a resource heap came up about 0x70 bytes short; see [Memory](#memory) |
 | 5 GB guest layout: `mem_reserve 0x140000000`, `mem_alias 0xB8000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | [`game.tsv`](game.tsv) | 256 MB in front + 2.875 GB alias region + 256 MB stack region + 1.625 GB heap region: the game maps 1.75 GB of virtual address memory on demand into the alias region and asks for a 1.47 GB heap |
 | `shader_versions v0 v327680` | `game.tsv` | the shader tables are the union of both versions, so packing either needs both NSPs |
+| `feedback_snap a7e5c6fd501cf21f 22a61cb1ec732aef` | `game.tsv` | two full-screen passes sample their own attachment; without a snapshot an Apple M6 showed flickering black 16×16 blocks; see [Rendering](#rendering) |
 
 No `dm/tools/sdk_patches.py` cut for its `sdk` builds (`3053b229…` v0, `e4bd58ca…` 1.2.1). No `render_cond`: a minute's boot counted 65,536 or more clears under render conditions, and the game needs none. No `pad_layout`: the virtual gamepad starts in the 2D layout.
 
@@ -53,7 +54,7 @@ Game-specific findings; the general host changes they led to are listed under [F
 - Its transient render targets are new texture objects every frame over the same storage, never finalized; without sharing host textures by `(pool, offset, description)` they leaked about 13 MB a frame.
 - 8-bit index buffers in its full-screen passes and final copy; scissored zero clears of sub-rectangles of small targets (pyramid levels packed into 480×272, 256×256 and 64×36 targets); a depth clear scissored outside a pass, which the host still clears whole (`depth-stencil clear with a scissor or partial stencil mask, cleared whole`).
 - Its 4×4 fallback textures (black, white, transparent, red) are filled with `nvnTextureWriteTexels`; since they upload from guest memory, materials that sample the default white texture got slightly brighter.
-- Same-pass feedback draws `a7e5c6fd501cf21f` and `22a61cb1ec732aef` on its RG11B10F scene have shown no magenta blocks on the iPhone so far, so the profile lists no `feedback_snap`; snapshotting every shader raised submit time from 1.4 to 4.0 ms.
+- **Resolved: flickering black 16×16 blocks in courses (Mac, Apple M6, v0).** Pure black, aligned to the 16-pixel grid, one block in about 1 frame of 30 in the first course, most often in the lower left; title screen and menus clean. Two full-screen passes sample the 1920×1080 RG11B10F scene they render into (`a7e5c6fd501cf21f`, blended, from `GameAglShader`; `22a61cb1ec732aef`, agl's `agl_technique_pfx`), 2 snapshots a frame. Screenshots of the course's opening dialogue, counted for whole black 16×16 tiles: with `DM_NVN_FB_SNAP=0` 6 of 160 screenshots, with `DM_NVN_FB_SNAP=all` 0 of 80, with only these two keys 0 of 120, and 0 of 150 with them in the profile (the screenshot route is in [Mac routes](#mac-routes)). The profile's `feedback_snap` lists both; snapshotting every shader instead raised submit time from 1.4 to 4.0 ms. The iPhone had shown no magenta blocks from them. See [Same-pass feedback read through a snapshot](../../../docs/reference/rendering.md#same-pass-feedback-read-through-a-snapshot).
 - Uniform updates inside a pass: attachment loads and stores unchanged by the deferred updates (its updates already covered what the draws read).
 - It ships agl's BC4 block encoder `0544282c162305db` (the shader Tears of the Kingdom draws into a BC4 3D texture).
 - Mario keeps NVN's GL depth mode (near = −w).
@@ -89,6 +90,7 @@ Game-specific findings; the general host changes they led to are listed under [F
 ## Mac routes
 
 - `DM_KEYS="12:A,14:A,20:A,26:A,32:A"` reaches the opening course.
+- v0 with a fresh save, step by step through `DM_CTL`: `L+R~0.3` at the title, then `A` (New Game), `A` (one player), `LUp~0.2` and `A` (a character), `A` (OK); about 15 s later the course's opening dialogue, where `shot` lines every 0.35 s gave the black-block counts in [Rendering](#rendering).
 
 ## Found on this game
 
