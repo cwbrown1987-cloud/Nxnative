@@ -1,0 +1,50 @@
+# Super Mario 3D All-Stars (010049900F546000, base game 1.0.0 = v0, no update), SDK 9.5.1: its program 1, Super Mario 64 (title ID base + 1, packed with --program 1).
+# The launcher (program 0, 010049900F546000) starts it with oe::ExecuteProgram and a 16-byte launch parameter (LanguageCode, two volume floats; DM_LAUNCH_PARAM on the Mac).
+# An N64 emulator ("EmuAppNX64") running the Japanese Shindou ROM (rom/Stardust_JP/01_UNSMJ3.002.bin) three ways: C++-recompiled N64 code in an NRO (05_UNSMJ3.002.nro,
+# the same file as nro/NROBuilder.nro, loaded with ro::LoadModule), the precompiled block list 03_UNSMJ3.002.pcb (4,235 MIPS blocks, overlays included), which its JIT plugin
+# (nro/EmuSystemJITPlugin.nro) turns into 14.2 MB of AArch64 at boot through nn::jit (hle_jit.c, GenerateCode command 3), and the blocks neither covers, compiled at run time
+# (command 4: 5 blocks, 20 KB, through the title, the file select, the castle and a course). Its renderer is Vulkan (dm/gfx/vk/hle_vk.m), with 4 SPIR-V shaders in the RomFS;
+# Lua scripts (06_UNSMJ3.002.lua) patch the N64 code at fixed addresses (English text and fonts).
+
+# ---- Identity ----
+title_id	010049900F546001
+program_id	010049900F546001
+
+# ---- App ----
+name	Super Mario 3D All-Stars: Super Mario 64
+ipa	SuperMario3DAllStars64.ipa
+app_category	public.app-category.games
+# a 3D game pad (the camera is on the right stick)
+pad_layout	full
+
+# ---- Versions ----
+build	v0	1.0.0	main=9d00360ea7ceac4e84955cc18ef8b197	sdk=cdb385c299fdba2786299ea08a86ca25
+package	v0
+shader_versions	v0
+
+# ---- Graphics ----
+# main imports Vulkan, not NVN: the host's Vulkan layer. The game clears its targets with vkCmdClearColorImage / vkCmdClearDepthStencilImage and sets the stencil state
+# dynamically, specializes one int of its fragment shader, and keeps the N64's textures as linear RGBA8, RGBA5551 and R4G4 images the CPU writes
+
+# ---- Files ----
+# not loaded, main takes nothing from them the host does not supply: subsdk0 (NintendoSDK_Vulkan), subsdk1 (NintendoSDK_OpenGL), subsdk2 (GLSLC). The precompiled NRO and the
+# JIT plugin are mapped from patched_v0/nro.tsv (collected by the hashes the RomFS's NRRs register)
+modules	main sdk
+romfs_marker	rom/Stardust_JP/01_UNSMJ3.002.bin
+zip_store	.cpio:.nro:.pcb:.metallib
+
+# ---- Memory ----
+# No virtual address memory (the NPDM declares no system resource). main sets a heap of the pool − 64 MB − its 520 MB bss (counted as used memory): 2.64 GB, and nnMain
+# (main+0x2984) cuts it into expanded heaps of 390 MB (the JIT work buffer: 384 MB of code memory, 2 MB of data memory, 2 MB of plugin state), 128, 416, 128 and 400 MB and one
+# of heap − 2,378 MB, each memset when made: the whole heap is touched at boot (footprint 3.2 GB on the Mac). A smaller pool makes the last one negative: with a 1 GB heap the
+# boot crashed at main+0x2aac. So the pool is the hardware's; the guest block is 3.5 GB (front 256 MB + alias 256 MB + stack 256 MB + heap region 2.75 GB), within iOS's 6 GB
+# reservation
+mem_reserve	0xe0000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+sys_resource	0x0
+
+# ---- Shader split ----
+shader_groups	/Message/=message /rom/=rom /nro/=nro /.nrr/=nrr
+shader_note	Super Mario 64 has no NVN shaders (its 4 SPIR-V shaders go through the Vulkan layer)

@@ -57,12 +57,15 @@ static uint32_t umax(uint32_t a, uint32_t b) { return a > b ? a : b; }
 
 // ---------- Formats ----------
 enum { K_COLOR, K_INT, K_DEPTH, K_DS, K_STENCIL, K_BLOCK };
-typedef struct { VkFormat vk; MTLPixelFormat pf; MTLVertexFormat vf; uint8_t bytes, bw, bh, kind; } fmt_t;   // bytes per texel, or per block (bw x bh) for compressed formats
+typedef struct { VkFormat vk; MTLPixelFormat pf; MTLVertexFormat vf; uint8_t bytes, bw, bh, kind, conv; } fmt_t;   // bytes per texel in memory, or per block (bw x bh) for compressed formats; conv: CONV_*
 #define FC(v, p, x, b) {VK_FORMAT_##v, MTLPixelFormat##p, MTLVertexFormat##x, b, 1, 1, K_COLOR}
 #define FI(v, p, x, b) {VK_FORMAT_##v, MTLPixelFormat##p, MTLVertexFormat##x, b, 1, 1, K_INT}
 #define FD(v, p, b, k) {VK_FORMAT_##v, MTLPixelFormat##p, MTLVertexFormatInvalid, b, 1, 1, k}
 #define FB(v, p, b, w, h) {VK_FORMAT_##v, MTLPixelFormat##p, MTLVertexFormatInvalid, b, w, h, K_BLOCK}
 #define FV(v, x, b) {VK_FORMAT_##v, MTLPixelFormatInvalid, MTLVertexFormat##x, b, 1, 1, K_COLOR}
+// Formats Metal lacks, kept in a Metal format of their own that the layer fills from the image's memory (conv_refresh): only linear images, which the CPU writes
+enum { CONV_NONE, CONV_RG4 };   // CONV_RG4: R4G4_UNORM_PACK8 (R in the high nibble) as RG8Unorm
+#define FX(v, p, b, c) {VK_FORMAT_##v, MTLPixelFormat##p, MTLVertexFormatInvalid, b, 1, 1, K_COLOR, c}
 static const fmt_t g_fmts[] = {
     FC(R8_UNORM, R8Unorm, UCharNormalized, 1), FC(R8_SNORM, R8Snorm, CharNormalized, 1), FI(R8_UINT, R8Uint, UChar, 1), FI(R8_SINT, R8Sint, Char, 1),
     FC(R8G8_UNORM, RG8Unorm, UChar2Normalized, 2), FC(R8G8_SNORM, RG8Snorm, Char2Normalized, 2), FI(R8G8_UINT, RG8Uint, UChar2, 2), FI(R8G8_SINT, RG8Sint, Char2, 2),
@@ -73,6 +76,11 @@ static const fmt_t g_fmts[] = {
     FC(A2B10G10R10_UNORM_PACK32, RGB10A2Unorm, UInt1010102Normalized, 4), FI(A2B10G10R10_UINT_PACK32, RGB10A2Uint, Invalid, 4),
     FC(B10G11R11_UFLOAT_PACK32, RG11B10Float, FloatRG11B10, 4), FC(E5B9G9R9_UFLOAT_PACK32, RGB9E5Float, FloatRGB9E5, 4),
     FC(R5G6B5_UNORM_PACK16, B5G6R5Unorm, Invalid, 2),
+    // The other packed 16-bit formats with a Metal twin (Apple GPUs; Metal names the components from the lowest bit up, Vulkan's PACK16 from the highest down).
+    // Super Mario 64 (Super Mario 3D All-Stars) keeps the N64's RGBA 5551 textures as A1R5G5B5; its first such image failed and the game used the null handle
+    // Super Mario 64 also writes the N64's IA 4-bit textures as R4G4, which Metal has no format for
+    FX(R4G4_UNORM_PACK8, RG8Unorm, 1, CONV_RG4),
+    FC(A1R5G5B5_UNORM_PACK16, BGR5A1Unorm, Invalid, 2), FC(R5G5B5A1_UNORM_PACK16, A1BGR5Unorm, Invalid, 2), FC(R4G4B4A4_UNORM_PACK16, ABGR4Unorm, Invalid, 2),
     FC(R16_UNORM, R16Unorm, UShortNormalized, 2), FC(R16_SNORM, R16Snorm, ShortNormalized, 2), FI(R16_UINT, R16Uint, UShort, 2), FI(R16_SINT, R16Sint, Short, 2),
     FC(R16_SFLOAT, R16Float, Half, 2),
     FC(R16G16_UNORM, RG16Unorm, UShort2Normalized, 4), FC(R16G16_SNORM, RG16Snorm, Short2Normalized, 4), FI(R16G16_UINT, RG16Uint, UShort2, 4),
@@ -185,10 +193,12 @@ struct VkDeviceMemory_T { VkDeviceSize size; uint32_t type; __strong id<MTLBuffe
 struct VkBuffer_T { VkDeviceSize size; VkBufferUsageFlags usage; VkDeviceMemory mem; VkDeviceSize off; };
 struct VkBufferView_T { VkBuffer buf; const fmt_t *f; VkDeviceSize off, range; __strong id<MTLTexture> tex; };
 struct VkImage_T { __strong id<MTLTexture> tex; const fmt_t *f; VkFormat fmt; VkImageType type; uint32_t w, h, d, mips, layers, samples; VkDeviceSize size; uint64_t serial;
-                  VkImageUsageFlags usage; uint32_t pitch; };   // pitch: row pitch of a linear image (its texture is made over the bound memory), 0 otherwise
+                  VkImageUsageFlags usage; uint32_t pitch;   // pitch: row pitch of a linear image (its texture is made over the bound memory), 0 otherwise
+                  VkDeviceMemory cmem; VkDeviceSize coff; uint8_t *ccopy; int cfresh; };   // a converted linear image (fmt_t conv): its memory, and the bytes last converted
 struct VkImageView_T { __strong id<MTLTexture> tex; VkImage img; };
 struct VkSampler_T { __strong id<MTLSamplerState> s; };
-struct VkShaderModule_T { const shinfo *si; __strong id<MTLFunction> fn, fn_d; char key[17]; int tried_d; };   // fn_d: the dual-source variant vk_<key>_d, looked up on first use
+struct VkShaderModule_T { const shinfo *si; __strong id<MTLFunction> fn, fn_d; char key[17]; int tried_d;   // fn_d: the dual-source variant vk_<key>_d, looked up on first use
+                          __strong NSMutableDictionary *spec; };   // functions specialized with the pipelines' constants (spec_fn), by variant and data
 struct VkPipelineCache_T { int unused; };
 // Query pool: a result is valid once the submit that wrote it has completed (g_done >= ticket). Timestamps are the completion time of their submit (in ns,
 // timestampPeriod 1), the same for every timestamp of one submit; occlusion results are copied from the submit's visibility buffer when it completes
@@ -220,6 +230,8 @@ struct VkPipeline_T {
     MTLPrimitiveType prim; MTLCullMode cull; MTLWinding wind; MTLTriangleFillMode fill; MTLDepthClipMode clip;
     int bias; float bias_c, bias_s, bias_cl; float blend[4]; uint32_t sref_f, sref_b;
     int dyn_vp, dyn_sc, has_vp, has_sc; MTLViewport vp; VkRect2D sc;
+    int dyn_scm, dyn_swm, dyn_sref;   // dynamic stencil compare mask, write mask, reference (Metal keeps the masks in the depth-stencil state: dss_of)
+    __strong MTLDepthStencilDescriptor *dsd; __strong NSMutableDictionary *dss_masks;   // with a dynamic mask: the descriptor, and its states by mask combination
 };
 struct VkCommandPool_T { struct VkCommandBuffer_T *cbs; };
 struct VkCommandBuffer_T { void *loader; VkCommandPool pool; struct VkCommandBuffer_T *prev, *next; uint8_t *buf; size_t n, cap; };
@@ -492,6 +504,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         *out = im; return VK_SUCCESS;
     }
     if (ci->tiling == VK_IMAGE_TILING_LINEAR) RED1("linear image %ux%u format %d levels %u layers %u: content does not follow the bound memory", ci->extent.width, ci->extent.height, ci->format, ci->mipLevels, ci->arrayLayers);
+    if (f->conv) RED1("image format %d: Metal has none, and only linear 2D images of it are converted", ci->format);
     @autoreleasepool {
         uint32_t layers = umax(1, ci->arrayLayers), samples = umax(1, ci->samples);
         int cube = (ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && layers % 6 == 0;
@@ -506,6 +519,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         td.arrayLength = cube ? layers / 6 : layers;
         MTLTextureUsage u = MTLTextureUsageShaderRead;
         if (ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) u |= MTLTextureUsageRenderTarget;
+        if ((ci->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) && f->kind != K_BLOCK && !f->conv) u |= MTLTextureUsageRenderTarget;   // vkCmdClear*Image clears through a render pass
         if (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) u |= MTLTextureUsageShaderWrite;
         // A stencil-aspect view of a depth-stencil image is an X32_Stencil8 view, which Metal allows only with the format-view usage (Vulkan needs no mutable-format flag for it;
         // the API validation layer aborts without it). As in the NVN layer, it costs nothing measured on a depth-stencil texture
@@ -521,7 +535,50 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
     }
     return VK_SUCCESS;
 }
-VKB(vkDestroyImage, void, VkDevice d, VkImage im, const VkAllocationCallbacks *a) { (void)d; (void)a; if (im) { im->tex = nil; free(im); } }
+static void conv_drop(VkImage im);
+VKB(vkDestroyImage, void, VkDevice d, VkImage im, const VkAllocationCallbacks *a) { (void)d; (void)a; if (im) { if (im->ccopy) conv_drop(im); im->tex = nil; free(im); } }
+// Converted linear images: a texture of their own in the Metal format, filled at each submit from the image's memory when its bytes changed since the last conversion.
+// The game finishes its CPU writes before it submits the work that samples them (Vulkan's host write ordering), so the submit is where the bytes are final
+static pthread_mutex_t g_conv_mu = PTHREAD_MUTEX_INITIALIZER;
+static VkImage *g_conv; static unsigned g_nconv, g_capconv;
+static VkResult conv_bind(VkImage im, VkDeviceMemory m, VkDeviceSize off) {
+    if (off + im->size > m->size) { LOG("[vk] [RED] linear image %ux%u format %d does not fit its memory", im->w, im->h, im->fmt); return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
+    @autoreleasepool {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:im->f->pf width:im->w height:im->h mipmapped:NO];
+        td.storageMode = MTLStorageModeShared; td.usage = MTLTextureUsageShaderRead;
+        im->tex = [g_dev newTextureWithDescriptor:td];
+    }
+    if (!im->tex) { LOG("[vk] [RED] cannot create converted image %ux%u format %d", im->w, im->h, im->fmt); return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
+    im->cmem = m; im->coff = off; im->ccopy = malloc(im->size); im->cfresh = 0;
+    pthread_mutex_lock(&g_conv_mu);
+    if (g_nconv == g_capconv) { g_capconv = g_capconv ? 2 * g_capconv : 64; g_conv = realloc(g_conv, g_capconv * sizeof *g_conv); }
+    g_conv[g_nconv++] = im;
+    pthread_mutex_unlock(&g_conv_mu);
+    OLOG("linear image %p format %d converted to Metal format %lu", (void *)im, im->fmt, (unsigned long)im->f->pf);
+    return VK_SUCCESS;
+}
+static void conv_drop(VkImage im) {
+    pthread_mutex_lock(&g_conv_mu);
+    for (unsigned i = 0; i < g_nconv; i++) if (g_conv[i] == im) { g_conv[i] = g_conv[--g_nconv]; break; }
+    pthread_mutex_unlock(&g_conv_mu);
+    free(im->ccopy); im->ccopy = NULL;
+}
+static void conv_refresh(void) {
+    pthread_mutex_lock(&g_conv_mu);
+    uint8_t *tmp = NULL; size_t cap = 0;
+    for (unsigned i = 0; i < g_nconv; i++) {
+        VkImage im = g_conv[i]; const uint8_t *src = (const uint8_t *)mem_buf(im->cmem).contents + im->coff;
+        if (im->cfresh && !memcmp(src, im->ccopy, im->size)) continue;
+        memcpy(im->ccopy, src, im->size); im->cfresh = 1;
+        size_t need = (size_t)im->w * im->h * 2; if (need > cap) { cap = need; tmp = realloc(tmp, cap); }
+        for (uint32_t y = 0; y < im->h; y++) for (uint32_t x = 0; x < im->w; x++) {   // CONV_RG4, the only kind so far
+            uint8_t v = im->ccopy[(size_t)y * im->pitch + x]; tmp[((size_t)y * im->w + x) * 2] = (v >> 4) * 17; tmp[((size_t)y * im->w + x) * 2 + 1] = (v & 15) * 17;
+        }
+        [im->tex replaceRegion:MTLRegionMake2D(0, 0, im->w, im->h) mipmapLevel:0 withBytes:tmp bytesPerRow:(NSUInteger)im->w * 2];
+    }
+    pthread_mutex_unlock(&g_conv_mu);
+    free(tmp);
+}
 VK(vkGetImageMemoryRequirements, void, VkDevice d, VkImage im, VkMemoryRequirements *r) {
     (void)d; r->alignment = 4096; r->size = (im->size + 4095) & ~4095ull; r->memoryTypeBits = 7;
 }
@@ -539,6 +596,7 @@ VK(vkGetImageSubresourceLayout, void, VkDevice d, VkImage im, const VkImageSubre
 VKB(vkBindImageMemory, VkResult, VkDevice d, VkImage im, VkDeviceMemory m, VkDeviceSize off) {   // other images keep their own storage
     (void)d; if (!im->pitch) return VK_SUCCESS;
     id<MTLBuffer> b = mem_buf(m); if (!b) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (im->f->conv) return conv_bind(im, m, off);
     @autoreleasepool {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:im->f->pf width:im->w height:im->h mipmapped:NO];
         td.storageMode = MTLStorageModeShared; td.resourceOptions = MTLResourceStorageModeShared;
@@ -807,7 +865,7 @@ VKB(vkCreateShaderModule, VkResult, VkDevice d, const VkShaderModuleCreateInfo *
     else OLOG("CreateShaderModule %s", m->key);
     *out = m; return VK_SUCCESS;
 }
-VKB(vkDestroyShaderModule, void, VkDevice d, VkShaderModule m, const VkAllocationCallbacks *a) { (void)d; (void)a; if (m) { m->fn = m->fn_d = nil; free(m); } }
+VKB(vkDestroyShaderModule, void, VkDevice d, VkShaderModule m, const VkAllocationCallbacks *a) { (void)d; (void)a; if (m) { m->fn = m->fn_d = nil; m->spec = nil; free(m); } }
 // Pipeline caches hold nothing: the game's initial data is NVIDIA's binary cache (Super Mario Galaxy's data/database/vulkan/*.cache), and Metal keeps its own
 VK(vkCreatePipelineCache, VkResult, VkDevice d, const VkPipelineCacheCreateInfo *ci, const VkAllocationCallbacks *a, VkPipelineCache *out) {
     (void)d; (void)ci; (void)a; *out = zalloc(sizeof **out); return VK_SUCCESS;
@@ -843,6 +901,46 @@ static int dual_source(const VkPipelineColorBlendStateCreateInfo *cb) {   // a b
     }
     return 0;
 }
+// Specialization constants: spirv-cross turns each into a Metal function constant at the index of its SpecId ([[function_constant(id)]], the SPIR-V default when no value
+// is given), and Metal refuses a pipeline with such a function until it is specialized. A stage with specialization data gets its function made with those values
+// (newFunctionWithName:constantValues:), typed from the function's own constants, and kept per module, variant and data: pipelines that share them share the function.
+// Super Mario 64 (Super Mario 3D All-Stars) specializes one int of its fragment shader (shader_vulkan_frag.spv); the pipeline failed Metal's validation without it
+static id<MTLFunction> spec_fn(VkShaderModule m, id<MTLFunction> base, const VkSpecializationInfo *si) {
+    if (!base || !si || !si->mapEntryCount) return base;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;   // pipelines may be built on several threads
+    NSMutableData *key = [NSMutableData dataWithBytes:base.name.UTF8String length:strlen(base.name.UTF8String) + 1];
+    for (uint32_t i = 0; i < si->mapEntryCount; i++) {
+        const VkSpecializationMapEntry *e = &si->pMapEntries[i];
+        if (e->offset + e->size > si->dataSize) { RED1("specialization constant %u lies beyond its data", e->constantID); continue; }
+        [key appendBytes:&e->constantID length:4]; [key appendBytes:(const uint8_t *)si->pData + e->offset length:e->size];
+    }
+    pthread_mutex_lock(&mu);
+    id<MTLFunction> f = m->spec[key];
+    pthread_mutex_unlock(&mu);
+    if (f) return f;
+    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+    NSDictionary<NSString *, MTLFunctionConstant *> *fc = base.functionConstantsDictionary;
+    for (uint32_t i = 0; i < si->mapEntryCount; i++) {
+        const VkSpecializationMapEntry *e = &si->pMapEntries[i];
+        if (e->offset + e->size > si->dataSize) continue;
+        MTLFunctionConstant *c = nil;
+        for (MTLFunctionConstant *k in fc.allValues) if (k.index == e->constantID) { c = k; break; }
+        if (!c) continue;   // the translated function no longer uses it
+        const uint8_t *v = (const uint8_t *)si->pData + e->offset; uint32_t w = 0; memcpy(&w, v, e->size < 4 ? e->size : 4);
+        if (c.type == MTLDataTypeBool) { bool b = w != 0; [cv setConstantValue:&b type:MTLDataTypeBool atIndex:c.index]; }   // VkBool32: 4 bytes
+        else if ((c.type == MTLDataTypeInt || c.type == MTLDataTypeUInt || c.type == MTLDataTypeFloat) && e->size == 4) [cv setConstantValue:&w type:c.type atIndex:c.index];
+        else RED1("specialization constant %u: Metal type %lu, %zu bytes, not implemented", e->constantID, (unsigned long)c.type, e->size);
+    }
+    NSError *err = nil;
+    f = [g_lib newFunctionWithName:base.name constantValues:cv error:&err];
+    if (!f) { LOG("[vk] [RED] cannot specialize %s: %s", base.name.UTF8String, err.localizedDescription.UTF8String); return base; }
+    pthread_mutex_lock(&mu);
+    if (!m->spec) m->spec = [NSMutableDictionary new];
+    m->spec[key] = f;
+    pthread_mutex_unlock(&mu);
+    OLOG("specialized %s with %u constants", base.name.UTF8String, si->mapEntryCount);
+    return f;
+}
 static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
     VkPipeline p = zalloc(sizeof *p); p->layout = ci->layout;
     @autoreleasepool {
@@ -850,15 +948,14 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
         char keys[64] = ""; int dual = dual_source(ci->pColorBlendState);
         for (uint32_t s = 0; s < ci->stageCount; s++) {
             const VkPipelineShaderStageCreateInfo *st = &ci->pStages[s]; VkShaderModule m = st->module;
-            if (st->pSpecializationInfo && st->pSpecializationInfo->mapEntryCount) RED1("specialization constants not implemented");
-            if (st->stage == VK_SHADER_STAGE_VERTEX_BIT) { pd.vertexFunction = m->fn; p->vs = m->si; }
+            if (st->stage == VK_SHADER_STAGE_VERTEX_BIT) { pd.vertexFunction = spec_fn(m, m->fn, st->pSpecializationInfo); p->vs = m->si; }
             else if (st->stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
                 if (dual && m->fn) {   // pipelines may be built on several threads
                     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu);
                     if (!m->tried_d) { m->tried_d = 1; m->fn_d = [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s_d", m->key]]; }
                     pthread_mutex_unlock(&mu);
                 }
-                pd.fragmentFunction = dual && m->fn_d ? m->fn_d : m->fn; p->fs = m->si;
+                pd.fragmentFunction = spec_fn(m, dual && m->fn_d ? m->fn_d : m->fn, st->pSpecializationInfo); p->fs = m->si;
             }
             else RED1("shader stage %#x not implemented", st->stage);
             strlcat(keys, s ? " " : "", sizeof keys); strlcat(keys, m->key, sizeof keys);
@@ -930,11 +1027,16 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
             if (fmt_has_stencil(df) && ds->stencilTestEnable) { dd.frontFaceStencil = stencil_d(&ds->front); dd.backFaceStencil = stencil_d(&ds->back); p->sref_f = ds->front.reference; p->sref_b = ds->back.reference; }
             if (ds->depthBoundsTestEnable) RED1("depth bounds test not implemented");
             p->dss = [g_dev newDepthStencilStateWithDescriptor:dd];
+            if (fmt_has_stencil(df) && ds->stencilTestEnable) p->dsd = dd;
         } else p->dss = g_dss_off;
         const VkPipelineDynamicStateCreateInfo *dy = ci->pDynamicState;
         for (uint32_t i = 0; dy && i < dy->dynamicStateCount; i++) {
             VkDynamicState s = dy->pDynamicStates[i];
-            if (s == VK_DYNAMIC_STATE_VIEWPORT) p->dyn_vp = 1; else if (s == VK_DYNAMIC_STATE_SCISSOR) p->dyn_sc = 1; else RED1("dynamic state %d not implemented (the imports have no matching set function)", s);
+            if (s == VK_DYNAMIC_STATE_VIEWPORT) p->dyn_vp = 1; else if (s == VK_DYNAMIC_STATE_SCISSOR) p->dyn_sc = 1;
+            else if (s == VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK) p->dyn_scm = 1; else if (s == VK_DYNAMIC_STATE_STENCIL_WRITE_MASK) p->dyn_swm = 1;
+            else if (s == VK_DYNAMIC_STATE_STENCIL_REFERENCE) p->dyn_sref = 1;
+            else if (s == VK_DYNAMIC_STATE_LINE_WIDTH) { }   // Metal draws lines one pixel wide, whatever the width (Super Mario 64 lists it)
+            else RED1("dynamic state %d not implemented", s);
         }
         const VkPipelineViewportStateCreateInfo *vs = ci->pViewportState;
         if (!p->dyn_vp && vs && vs->pViewports && vs->viewportCount) { p->vp = vp_of(&vs->pViewports[0]); p->has_vp = 1; }
@@ -954,7 +1056,7 @@ VKB(vkCreateGraphicsPipelines, VkResult, VkDevice d, VkPipelineCache c, uint32_t
 VKB(vkDestroyPipeline, void, VkDevice d, VkPipeline p, const VkAllocationCallbacks *a) { (void)d; (void)a; if (p) { p->pso = nil; p->dss = nil; free(p); } }
 
 // ---------- Command buffers: recording ----------
-enum { C_BRP = 1, C_ERP, C_PIPE, C_SETS, C_VB, C_IB, C_VP, C_SC, C_DRAWI, C_COPYB, C_COPYB2I, C_DRAW, C_PUSH, C_COPYI, C_COPYI2B, C_QRESET, C_QTS, C_QBEGIN, C_QEND };
+enum { C_BRP = 1, C_ERP, C_PIPE, C_SETS, C_VB, C_IB, C_VP, C_SC, C_DRAWI, C_COPYB, C_COPYB2I, C_DRAW, C_PUSH, C_COPYI, C_COPYI2B, C_QRESET, C_QTS, C_QBEGIN, C_QEND, C_CLRC, C_CLRDS, C_STENCIL };
 typedef struct { uint32_t op, size; } chdr;
 typedef struct { VkRenderPass rp; VkFramebuffer fb; VkRect2D area; uint32_t nclear; VkClearValue clear[]; } c_brp;
 typedef struct { VkPipeline p; } c_pipe;
@@ -971,6 +1073,8 @@ typedef struct { uint32_t off, size; uint8_t data[]; } c_push;
 typedef struct { VkImage src, dst; uint32_t n; VkImageCopy r[]; } c_copyi;
 typedef struct { VkImage src; VkBuffer dst; uint32_t n; VkBufferImageCopy r[]; } c_copyi2b;
 typedef struct { VkQueryPool q; uint32_t first, n; } c_query;
+typedef struct { VkImage im; VkClearValue v; uint32_t n; VkImageSubresourceRange r[]; } c_clr;   // vkCmdClearColorImage / vkCmdClearDepthStencilImage
+typedef struct { uint32_t what, faces, value; } c_stencil;   // what: 0 compare mask, 1 write mask, 2 reference; faces: VkStencilFaceFlags
 static void *rec(VkCommandBuffer cb, uint32_t op, size_t sz) {
     size_t need = (sizeof(chdr) + sz + 7) & ~(size_t)7;
     if (cb->n + need > cb->cap) {
@@ -1051,6 +1155,21 @@ VK(vkCmdCopyImage, void, VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkIm
 VK(vkCmdCopyImageToBuffer, void, VkCommandBuffer cb, VkImage src, VkImageLayout lay, VkBuffer dst, uint32_t n, const VkBufferImageCopy *r) {
     (void)lay; c_copyi2b *c = rec(cb, C_COPYI2B, sizeof *c + n * sizeof *r); c->src = src; c->dst = dst; c->n = n; memcpy(c->r, r, n * sizeof *r);
 }
+// Clears of whole image ranges outside a render pass: Super Mario 64 (Super Mario 3D All-Stars) clears its colour and depth-stencil targets this way each frame. They were
+// stubs, so its depth buffer kept old values and most depth-tested geometry failed (the title's Mario head, the logo)
+static void rec_clear(VkCommandBuffer cb, uint32_t op, VkImage im, const VkClearValue *v, uint32_t n, const VkImageSubresourceRange *r) {
+    c_clr *c = rec(cb, op, sizeof *c + n * sizeof *r); c->im = im; c->v = *v; c->n = n; memcpy(c->r, r, n * sizeof *r);
+}
+VK(vkCmdClearColorImage, void, VkCommandBuffer cb, VkImage im, VkImageLayout l, const VkClearColorValue *v, uint32_t n, const VkImageSubresourceRange *r) {
+    (void)l; VkClearValue cv = {.color = *v}; rec_clear(cb, C_CLRC, im, &cv, n, r);
+}
+VK(vkCmdClearDepthStencilImage, void, VkCommandBuffer cb, VkImage im, VkImageLayout l, const VkClearDepthStencilValue *v, uint32_t n, const VkImageSubresourceRange *r) {
+    (void)l; VkClearValue cv = {.depthStencil = *v}; rec_clear(cb, C_CLRDS, im, &cv, n, r);
+}
+VK(vkCmdSetLineWidth, void, VkCommandBuffer cb, float w) { (void)cb; (void)w; }   // lines are one pixel wide in Metal
+VK(vkCmdSetStencilCompareMask, void, VkCommandBuffer cb, VkStencilFaceFlags f, uint32_t m) { *(c_stencil *)rec(cb, C_STENCIL, sizeof(c_stencil)) = (c_stencil){0, f, m}; }
+VK(vkCmdSetStencilWriteMask, void, VkCommandBuffer cb, VkStencilFaceFlags f, uint32_t m) { *(c_stencil *)rec(cb, C_STENCIL, sizeof(c_stencil)) = (c_stencil){1, f, m}; }
+VK(vkCmdSetStencilReference, void, VkCommandBuffer cb, VkStencilFaceFlags f, uint32_t v) { *(c_stencil *)rec(cb, C_STENCIL, sizeof(c_stencil)) = (c_stencil){2, f, v}; }
 VK(vkCmdResetQueryPool, void, VkCommandBuffer cb, VkQueryPool q, uint32_t first, uint32_t n) { *(c_query *)rec(cb, C_QRESET, sizeof(c_query)) = (c_query){q, first, n}; }
 VK(vkCmdWriteTimestamp, void, VkCommandBuffer cb, VkPipelineStageFlagBits st, VkQueryPool q, uint32_t i) { (void)st; *(c_query *)rec(cb, C_QTS, sizeof(c_query)) = (c_query){q, i, 1}; }
 VK(vkCmdBeginQuery, void, VkCommandBuffer cb, VkQueryPool q, uint32_t i, VkQueryControlFlags f) { (void)f; *(c_query *)rec(cb, C_QBEGIN, sizeof(c_query)) = (c_query){q, i, 1}; }
@@ -1078,6 +1197,7 @@ typedef struct {
     // The current render pass: its descriptor (attachments created with deferred store actions) and the store actions it ends with; cut = its encoder was ended
     // for a copy in the middle of the pass and is resumed (loading the attachments) at the next draw
     MTLRenderPassDescriptor *rpd; MTLStoreAction st_col[8], st_d, st_s; int cut;
+    uint32_t sten[3][2]; int sten_set[3];   // dynamic stencil compare mask, write mask, reference (front, back), set by the command buffer; reapplied at the next draw
 } rs_t;
 #define DONE_RING 1024
 static uint64_t g_done_ns[DONE_RING];   // completion time of submit v at [v % DONE_RING] (timestamp query results)
@@ -1196,6 +1316,60 @@ static void bind_push(rs_t *s, const shinfo *si, int frag) {   // the push-const
         if (frag) [s->re setFragmentBytes:s->pc length:n atIndex:si->res[i].slot]; else [s->re setVertexBytes:s->pc length:n atIndex:si->res[i].slot];
     }
 }
+// A pipeline whose stencil masks are dynamic: its depth-stencil state with the command buffer's masks, made once per combination
+static id<MTLDepthStencilState> dss_of(rs_t *s, VkPipeline p) {
+    uint32_t cf = p->dyn_scm ? s->sten[0][0] : p->dsd.frontFaceStencil.readMask, cb = p->dyn_scm ? s->sten[0][1] : p->dsd.backFaceStencil.readMask;
+    uint32_t wf = p->dyn_swm ? s->sten[1][0] : p->dsd.frontFaceStencil.writeMask, wb = p->dyn_swm ? s->sten[1][1] : p->dsd.backFaceStencil.writeMask;
+    NSNumber *k = @((cf & 0xff) | (cb & 0xff) << 8 | (wf & 0xff) << 16 | (wb & 0xff) << 24);
+    if (!p->dss_masks) p->dss_masks = [NSMutableDictionary new];   // replay runs under the queue lock
+    id<MTLDepthStencilState> d = p->dss_masks[k];
+    if (d) return d;
+    MTLDepthStencilDescriptor *dd = [p->dsd copy];
+    dd.frontFaceStencil = [p->dsd.frontFaceStencil copy]; dd.backFaceStencil = [p->dsd.backFaceStencil copy];
+    dd.frontFaceStencil.readMask = cf; dd.backFaceStencil.readMask = cb; dd.frontFaceStencil.writeMask = wf; dd.backFaceStencil.writeMask = wb;
+    d = [g_dev newDepthStencilStateWithDescriptor:dd]; p->dss_masks[k] = d;
+    return d;
+}
+// vkCmdClear*Image: an empty render pass per level and layer that clears it (Vulkan allows these only outside a render pass)
+static void clear_image(rs_t *s, const c_clr *x, int ds) {
+    VkImage im = x->im; const fmt_t *f = im->f;
+    if (!im->tex) { RED1("clear of an image that was not created"); return; }
+    if (!(im->tex.usage & MTLTextureUsageRenderTarget)) { RED1("clear of image format %d without render-target usage not implemented", im->fmt); return; }
+    if (s->re) end_rp(s, 0);
+    end_blit(s);
+    for (uint32_t i = 0; i < x->n; i++) {
+        const VkImageSubresourceRange *r = &x->r[i];
+        uint32_t nl = r->levelCount == VK_REMAINING_MIP_LEVELS ? im->mips - r->baseMipLevel : r->levelCount;
+        uint32_t na = r->layerCount == VK_REMAINING_ARRAY_LAYERS ? im->layers - r->baseArrayLayer : r->layerCount;
+        for (uint32_t l = r->baseMipLevel; l < r->baseMipLevel + nl && l < im->mips; l++)
+            for (uint32_t a = r->baseArrayLayer; a < r->baseArrayLayer + na && a < im->layers; a++) {
+                MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+                if (!ds) {
+                    MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[0];
+                    c.texture = im->tex; c.level = l; c.slice = a; c.loadAction = MTLLoadActionClear; c.storeAction = MTLStoreActionStore;
+                    const VkClearColorValue *v = &x->v.color;
+                    c.clearColor = f->kind == K_INT ? (im->fmt == VK_FORMAT_R8_SINT || im->fmt == VK_FORMAT_R16_SINT || im->fmt == VK_FORMAT_R32_SINT ? MTLClearColorMake(v->int32[0], v->int32[1], v->int32[2], v->int32[3])
+                                                       : MTLClearColorMake(v->uint32[0], v->uint32[1], v->uint32[2], v->uint32[3]))
+                                                    : MTLClearColorMake(v->float32[0], v->float32[1], v->float32[2], v->float32[3]);
+                } else {
+                    if (fmt_has_depth(f) && (r->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT)) {
+                        d.depthAttachment.texture = im->tex; d.depthAttachment.level = l; d.depthAttachment.slice = a;
+                        d.depthAttachment.loadAction = MTLLoadActionClear; d.depthAttachment.storeAction = MTLStoreActionStore; d.depthAttachment.clearDepth = x->v.depthStencil.depth;
+                    }
+                    if (fmt_has_stencil(f) && (r->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+                        d.stencilAttachment.texture = im->tex; d.stencilAttachment.level = l; d.stencilAttachment.slice = a;
+                        d.stencilAttachment.loadAction = MTLLoadActionClear; d.stencilAttachment.storeAction = MTLStoreActionStore; d.stencilAttachment.clearStencil = x->v.depthStencil.stencil;
+                    }
+                    // An aspect left out keeps its contents
+                    if (d.depthAttachment.texture && fmt_has_stencil(f) && !d.stencilAttachment.texture) { d.stencilAttachment.texture = im->tex; d.stencilAttachment.level = l; d.stencilAttachment.slice = a; d.stencilAttachment.loadAction = MTLLoadActionLoad; d.stencilAttachment.storeAction = MTLStoreActionStore; }
+                    if (d.stencilAttachment.texture && fmt_has_depth(f) && !d.depthAttachment.texture) { d.depthAttachment.texture = im->tex; d.depthAttachment.level = l; d.depthAttachment.slice = a; d.depthAttachment.loadAction = MTLLoadActionLoad; d.depthAttachment.storeAction = MTLStoreActionStore; }
+                    if (!d.depthAttachment.texture && !d.stencilAttachment.texture) continue;
+                }
+                [[s->cb renderCommandEncoderWithDescriptor:d] endEncoding];
+                g_n_pass++;
+            }
+    }
+}
 static int pre_draw(rs_t *s) {
     if (!s->re && s->cut) resume_rp(s);
     VkPipeline p = s->pipe; id<MTLRenderCommandEncoder> re = s->re;
@@ -1206,11 +1380,16 @@ static int pre_draw(rs_t *s) {
         [re setCullMode:p->cull]; [re setFrontFacingWinding:p->wind]; [re setTriangleFillMode:p->fill]; [re setDepthClipMode:p->clip];
         [re setDepthBias:p->bias ? p->bias_c : 0 slopeScale:p->bias ? p->bias_s : 0 clamp:p->bias ? p->bias_cl : 0];
         [re setBlendColorRed:p->blend[0] green:p->blend[1] blue:p->blend[2] alpha:p->blend[3]];
-        [re setStencilFrontReferenceValue:p->sref_f backReferenceValue:p->sref_b];
+        s->sten_set[0] |= 4; s->sten_set[2] |= 4;   // reapply the dynamic stencil state for the new pipeline below
         if (p->has_vp && (!s->applied || !s->applied->has_vp || memcmp(&s->applied->vp, &p->vp, sizeof p->vp))) s->vp_dirty = 1;
         if (p->has_sc) s->sc_dirty = 1;
         s->applied = p;
     }
+    if (s->sten_set[2] & 4) {   // reference: the command buffer's when the pipeline has it dynamic (0 until set, as an unset Vulkan state is undefined)
+        s->sten_set[2] &= ~4;
+        [re setStencilFrontReferenceValue:p->dyn_sref ? s->sten[2][0] : p->sref_f backReferenceValue:p->dyn_sref ? s->sten[2][1] : p->sref_b];
+    }
+    if (s->sten_set[0] & 4) { s->sten_set[0] &= ~4; if ((p->dyn_scm || p->dyn_swm) && p->dsd) [re setDepthStencilState:dss_of(s, p)]; }
     if (s->vp_dirty) {
         MTLViewport v = p->has_vp ? p->vp : vp_of(&s->vp);
         [re setViewport:v]; s->vp_dirty = 0;
@@ -1240,6 +1419,15 @@ static void replay(rs_t *s, VkCommandBuffer cb) {
             case C_BRP: begin_rp(s, c); break;
             case C_ERP: end_rp(s, 1); s->cut = 0; s->rpd = nil; break;
             case C_PIPE: s->pipe = ((const c_pipe *)c)->p; break;
+            case C_CLRC: clear_image(s, c, 0); break;
+            case C_CLRDS: clear_image(s, c, 1); break;
+            case C_STENCIL: {
+                const c_stencil *x = c;
+                if (x->faces & VK_STENCIL_FACE_FRONT_BIT) s->sten[x->what][0] = x->value;
+                if (x->faces & VK_STENCIL_FACE_BACK_BIT) s->sten[x->what][1] = x->value;
+                s->sten_set[x->what < 2 ? 0 : 2] |= 4;
+                break;
+            }
             case C_SETS: {
                 const c_sets *x = c; uint32_t k = 0;
                 for (uint32_t i = 0; i < x->n && x->first + i < 8; i++) {
@@ -1272,6 +1460,7 @@ static void replay(rs_t *s, VkCommandBuffer cb) {
             case C_COPYB2I: {
                 const c_copyb2i *x = c; VkImage im = x->dst; const fmt_t *f = im->f;
                 if (!x->src->mem || !im->tex) { RED1("the upload buffer has no bound memory or the image was not created"); break; }
+                if (f->conv) { RED1("buffer → image copy into format %d (converted) not implemented", im->fmt); break; }
                 id<MTLBlitCommandEncoder> be = blit(s, h->op); id<MTLBuffer> sb = mem_buf(x->src->mem);
                 for (uint32_t i = 0; i < x->n; i++) {
                     const VkBufferImageCopy *r = &x->r[i];
@@ -1368,6 +1557,7 @@ VKB(vkQueueSubmit, VkResult, VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFe
     (void)q; dm_gfx_enter();   // blocks while the app is in the background (iOS allows no GPU work there)
     @autoreleasepool {
         pthread_mutex_lock(&g_qmu);
+        conv_refresh();
         id<MTLCommandBuffer> cb = [g_q commandBuffer];
         subq_t *sq = zalloc(sizeof *sq); sq->v = g_ev_val + 1;
         for (uint32_t i = 0; i < n; i++)   // occlusion queries need a visibility buffer before the first render pass is encoded
