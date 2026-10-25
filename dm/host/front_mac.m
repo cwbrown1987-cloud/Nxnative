@@ -96,9 +96,50 @@ static int key_bit(unsigned short code) {
     }
     return -1;
 }
+int dm_xc2_rate_cycle(void), dm_xc2_rate(void), dm_gfx_mfx(void), dm_gfx_mfx_toggle(void);
+// Number keys for a game's own in-game choices (Xenoblade Chronicles 2: key 2 cycles the frame rate, hle_fpslock.c); the window title shows the current one
+static void title_update(void) {
+    int r = dm_xc2_rate();
+    if (g_win && r) g_win.title = [NSString stringWithFormat:@"%s  ·  %d FPS（按 2 切换）  ·  画质：%@（按 3 切换）", DM_GAME_NAME, r, dm_gfx_mfx() ? @"MetalFX 放大" : @"原生 720p"];
+}
+
+// In-game box (key 1: shortcuts and frame rate → frame rate only → hidden), top right of the game picture, as MacNativeGames' Tears of the Kingdom shows its shortcuts; refreshed twice a second.
+// Only for a game with in-game choices (Xenoblade Chronicles 2)
+uint64_t mtl_present_count(void); void dm_gfx_present_dims(uint32_t d[5]);
+static NSTextField *g_hud; static int g_hud_mode;
+static NSString *hud_text(void) {
+    static uint64_t last_n; static double last_t, fps; double t = CACurrentMediaTime(); uint64_t n = mtl_present_count();
+    if (last_t > 0 && t - last_t >= 0.4) { fps = (n - last_n) / (t - last_t); last_n = n; last_t = t; } else if (last_t == 0) { last_n = n; last_t = t; }
+    NSString *f = [NSString stringWithFormat:@"FPS %.0f", fps];
+    if (g_hud_mode == 1) return f;   // FPS only
+    uint32_t d[5]; dm_gfx_present_dims(d);
+    NSString *res = d[0] ? [NSString stringWithFormat:@"渲染 %u×%u → 显示 %u×%u（%@）", d[0], d[1], d[2], d[3], d[4] ? @"MetalFX 放大" : @"普通拉伸"] : @"渲染 --";
+    return [NSString stringWithFormat:@"%@  ·  %@\n1  提示：全部 → 只显示 FPS → 隐藏\n2  帧率：%d（按键切换 30 / 60；标题和过场固定 30）\n3  画质：%@（按键切换）\n⌃⌘F  全屏", f, res, dm_xc2_rate(), dm_gfx_mfx() ? @"MetalFX 放大" : @"原生（普通拉伸）"];
+}
+static void hud_refresh(void) {
+    if (!g_hud) return;
+    g_hud.hidden = g_hud_mode == 2;
+    if (g_hud_mode == 2) return;
+    // The widest width so far: a box that shrank left the old, longer line's glyphs on the layer at its right edge
+    g_hud.stringValue = hud_text(); [g_hud sizeToFit];
+    NSRect b = g_hud.superview.bounds, f = g_hud.frame; static CGFloat wmax[2]; int wi = g_hud_mode == 1; if (f.size.width + 16 > wmax[wi]) wmax[wi] = f.size.width + 16; f.size.width = wmax[wi];   // never narrower than it has been f.size.height += 10;
+    f.origin = NSMakePoint(NSMaxX(b) - f.size.width - 12, NSMaxY(b) - f.size.height - 12); g_hud.frame = f; g_hud.needsDisplay = YES;
+}
+static void hud_setup(NSView *v) {
+    if (!dm_xc2_rate()) return;   // modules not loaded yet or not this game: tried again on the timer
+    g_hud = [NSTextField labelWithString:@""];
+    g_hud.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightMedium]; g_hud.textColor = NSColor.whiteColor;
+    g_hud.wantsLayer = YES; g_hud.layer.backgroundColor = [NSColor colorWithCalibratedWhite:0.04 alpha:0.72].CGColor; g_hud.layer.cornerRadius = 7;
+    g_hud.drawsBackground = NO; g_hud.alignment = NSTextAlignmentLeft; g_hud.maximumNumberOfLines = 0; g_hud.lineBreakMode = NSLineBreakByClipping;
+    g_hud.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    [v addSubview:g_hud]; hud_refresh();
+}
 static void on_key(NSEvent *e, int down) {
     if (!g_input_on) return;
     unsigned short c = e.keyCode;
+    if (down && !e.isARepeat && c == 18 && g_hud) { g_hud_mode = (g_hud_mode + 1) % 3; hud_refresh(); return; }   // key 1: the in-game box
+    if (down && !e.isARepeat && c == 19 && dm_xc2_rate_cycle()) { title_update(); hud_refresh(); return; }   // key 2
+    if (down && !e.isARepeat && c == 20 && dm_xc2_rate()) { dm_gfx_mfx_toggle(); title_update(); hud_refresh(); return; }   // key 3: MetalFX output upscale on / off
     switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }
     int b = key_bit(c);
     uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : 0;   // Space: shaken while held
@@ -234,6 +275,7 @@ void front_run(void (*guest)(void)) {
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
         win.title = @DM_GAME_NAME;   // the game profile's name (game name label)
+        g_win = win; title_update();
         // Fullscreen: without FullScreenPrimary the green button only zooms the window. The present path already scales
         // the game picture to fit the drawable with black bars around it, so fullscreen keeps the game's aspect ratio.
         win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
@@ -245,6 +287,7 @@ void front_run(void (*guest)(void)) {
         g_layer.contentsScale = win.backingScaleFactor;
         if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
         v.layer = g_layer; [(DmGameView *)v fitDrawable];
+        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *tm) { if (!g_hud) { hud_setup(v); title_update(); } else hud_refresh(); }];
         [win center];
         [win makeKeyAndOrderFront:nil];
         g_screen_fps = (int)(win.screen ?: NSScreen.mainScreen).maximumFramesPerSecond;

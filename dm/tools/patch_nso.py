@@ -67,6 +67,9 @@ else:
 #     independent (no PC-relative / branch / anything involving x18 or tpidr), asserted offline; when the host has no callback attached the gate block goes in and out once and returns
 #   FRAME_STEP = {build ID: function(ctx)}: the frame step stubs of a main ("Frame step in whole vsyncs" below)
 PATCH_FILES = [os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sdk_patches.py')] + sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../games/*/patches.py')))
+# a provisional profile outside the repository (DM_GAMES_DIR) may carry patches too; DM_PATCH_EXTRA names one more file (optional patches built into a second set of modules)
+PATCH_FILES += sorted(glob.glob(os.path.join(os.environ['DM_GAMES_DIR'], '*/patches.py'))) if os.environ.get('DM_GAMES_DIR') else []
+PATCH_FILES += [os.environ['DM_PATCH_EXTRA']] if os.environ.get('DM_PATCH_EXTRA') else []
 def load_patches():
     tables, where = {'CUTS': {}, 'OBS': {}, 'FRAME_STEP': {}}, {}
     for n, path in enumerate(PATCH_FILES):

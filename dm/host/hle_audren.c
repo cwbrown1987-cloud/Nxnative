@@ -281,7 +281,9 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
     static span_t (*gen20)(void *, void *, size_t); static size_t mu_off;
     static void (*tmax)(void *, uint32_t), (*setup)(void *, const void *, size_t), (*process)(void *), (*lock)(void *), (*unlock)(void *);
     if (!process) {
-        lock = gsym("_ZN2nn2os12SdkMutexType4LockEv"); unlock = gsym("_ZN2nn2os12SdkMutexType6UnlockEv");
+        // SDK 3.5 (Xenoblade Chronicles 2) has no SdkMutexType: its update lock is an nn::os::MutexType (update_lock below finds which)
+        lock = guest_sym("_ZN2nn2os12SdkMutexType4LockEv"); unlock = guest_sym("_ZN2nn2os12SdkMutexType6UnlockEv");
+        if (!lock) { lock = gsym("_ZN2nn2os9LockMutexEPNS0_9MutexTypeE"); unlock = gsym("_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE"); }
         gen20 = guest_sym("_ZN2nn5audio6server17AudioRenderSystem15GenerateCommandENS_4SpanISt4byteEE");
         if (!gen20) {
             mode = gsym("_ZNK2nn5audio6server17AudioRenderSystem16GetExecutionModeEv"); device = gsym("_ZNK2nn5audio6server17AudioRenderSystem18GetRenderingDeviceEv");
@@ -291,12 +293,14 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
         mu_off = gen20 ? 0x2d0 : 0x1f0; g_sink_id = gen20 ? 0x14 : 0x13;
         int os_mutex = 0;
         if (!gen20 && update_lock(&mu_off, &os_mutex) && os_mutex) { lock = gsym("_ZN2nn2os9LockMutexEPNS0_9MutexTypeE"); unlock = gsym("_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE"); }
+        if (!guest_sym("_ZN2nn2os12SdkMutexType4LockEv") && !os_mutex) die("audren: no SdkMutexType and the update lock of AudioRenderSystem::Update was not found");
         LOG("audren: AudioRenderSystem in the SDK %s layout (update lock %s at +%#zx)", gen20 ? "20" : "16", os_mutex ? "nn::os::MutexType" : "SdkMutexType", mu_off);
         tmax = gsym("_ZN2nn5audio3dsp20CommandListProcessor17SetProcessTimeMaxEj"); setup = gsym("_ZN2nn5audio3dsp20CommandListProcessor5SetupEPKvm");
         process = gsym("_ZN2nn5audio3dsp20CommandListProcessor7ProcessEv");
     }
     int md = gen20 ? *(int32_t *)(sys + 0x4c) : mode(sys), dv = gen20 ? *(int32_t *)(sys + 0x48) : device(sys);
-    if (md != 1 || dv != 1) return 0x40299;   // same as the original: manual rendering needs CPU + manual mode
+    if (md != 1 || dv != 1) { static int once; if (!once++) LOG("audren: not rendered: execution mode %d, rendering device %d (both must be 1)", md, dv); return 0x40299; }
+    { static int once; if (!once++) LOG("audren: first frame rendered by the host"); }   // same as the original: manual rendering needs CPU + manual mode
     pthread_mutex_lock(&g_render_mu);
     uint64_t t0 = now_ns();
     // Command generation must exclude the game thread's RequestUpdate (AudioRenderSystem::Update, which holds the mutex at mu_off): the original system thread (SendCommandToDsp) generates under the same lock. Processing (the CPU DSP) stays outside the lock, as in the original.
@@ -315,8 +319,20 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
     pthread_mutex_unlock(&g_render_mu);
     return RES_OK;
 }
+// Where the AudioRenderSystem sits inside AudioRendererImpl: +0x60 (SDK 16), +0x50 in SDK 3.5 (Xenoblade Chronicles 2; read at +0x60, the mode / device words were another
+// object's, both 0, and nothing was rendered). Read off the SDK's own ExecuteAudioRendererRendering, which starts by taking it: add x<n>, x0, #off within its first instructions
+static size_t ars_off(void) {
+    static size_t off;
+    if (!off) {
+        const uint32_t *f = guest_sym("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv");
+        off = 0x60;
+        for (int i = 0; f && i < 8; i++) if ((f[i] & 0xffc003e0u) == 0x91000000u && (f[i] & 31) != 31) { off = (f[i] >> 10) & 0xfff; break; }   // add xd, x0, #imm12
+        LOG("audren: AudioRenderSystem at AudioRendererImpl +%#zx", off);
+    }
+    return off;
+}
 HLE_FORCE("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv", "render one frame manually: SDK generates commands + CPU processing, the host takes the DeviceSink output",
-          Result, h_ar_ImplExec, uint8_t *impl) { return render_once(impl + 0x60, g_frame, &g_frame_n); }   // the AudioRenderSystem sits at +0x60 inside AudioRendererImpl
+          Result, h_ar_ImplExec, uint8_t *impl) { return render_once(impl + ars_off(), g_frame, &g_frame_n); }
 // SDK 20 (The Legend of Zelda: Breath of the Wild 1.9.0): the public ExecuteAudioRendererRendering (sdk+0x221e90) calls the AudioRendererImpl version through the vtable (sdk+0x22ca88, just x0 += 0x60 and a jump through the PLT to here),
 // so the takeover above is never reached. The original generates commands here without the update lock; with the render thread on the original and the game thread's RequestUpdate rendering catch-up frames ("nothing rendered since the last update"),
 // both sides wrote the same command buffer at once and CommandListProcessor::Process sometimes read a half-written command list and crashed (once at 60 s and once at 134 s in the shrine). Taken over here, so rendering goes through the host's locked render as well

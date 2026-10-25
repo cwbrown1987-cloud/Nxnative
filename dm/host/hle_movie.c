@@ -503,6 +503,14 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
 // SDK 4's constructor has no priority argument (Dark Souls Remastered, NintendoSDK_movie 4.5.0). Without this take-over the SDK built its own decoder and the host's Configure read it as a host one (a call through a null pointer)
 HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE", "movie decoder (SDK 4, no priority): host implementation", void, h_movie_Decoder4,
           void **self, int type, int fmt, int mode) { h_movie_Decoder(self, type, fmt, mode, 0); }
+// SDK 3.5 numbers the video output formats differently: Torna asks for format 3 and hands NV12-sized buffers (1280 × 720 × 1.5), so its 3 is the later SDKs' NV12 (4)
+static int sdk3_fmt(int type, int fmt) { return type >= 1 && type <= 3 && fmt == 3 ? MD_FMT_NV12 : fmt; }
+// SDK 3.5's constructor has neither mode nor priority (Xenoblade Chronicles 2 3.0.0, NintendoSDK_movie 3.5.0: Torna's opening movie): the CPU-buffer mode of the later SDKs.
+// Its subsdk0 also exports the base-object form (C2), which the complete-object one may call
+HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatE", "movie decoder (SDK 3.5, no mode, no priority): host implementation", void, h_movie_Decoder3,
+          void **self, int type, int fmt) { h_movie_Decoder(self, type, sdk3_fmt(type, fmt), 0, 0); }
+HLE_FORCE("_ZN5movie7DecoderC2ENS_11DecoderTypeENS_19DecoderOutputFormatE", "movie decoder (SDK 3.5, base object): host implementation", void, h_movie_Decoder3b,
+          void **self, int type, int fmt) { h_movie_Decoder(self, type, sdk3_fmt(type, fmt), 0, 0); }
 static void md_free(void **self) {
     mdec_t *d = md_of(self); if (!d) return;
     md_defer_drop(d);
@@ -711,7 +719,7 @@ HLE_FORCE("_ZN5movie7Decoder19GetOutputBufferSizeEPiS1_", "movie decoder: output
         MD_TRACE(d, 11, "GetOutputBufferSize → %d (PCM)", *size); return 0;
     }
     int w, h, stride, slice; md_dims(d, &w, &h, &stride, &slice);
-    *size = stride * slice * 3 / 2; *mode = d->mode;   // the SDK fills the second output with the decoder mode
+    *size = d->fmt == MD_FMT_ABGR ? w * h * 4 : stride * slice * 3 / 2; *mode = d->mode;   // the SDK fills the second output with the decoder mode; RGBA in a CPU buffer (SDK 3.5: Xenoblade Chronicles 2's Torna) is w × h × 4
     MD_TRACE(d, 11, "GetOutputBufferSize → %d (%d×%d)", *size, w, h);
     return 0;
 }
@@ -753,6 +761,14 @@ HLE_FORCE("_ZN5movie7Decoder15GetOutputBufferEiPNS_6BufferE", "movie decoder: ge
         return 0;
     }
     int w, h, stride, slice; md_dims(d, &w, &h, &stride, &slice);
+    if (d->fmt == MD_FMT_ABGR) {   // RGBA rows of the picture width in a CPU buffer (SDK 3.5 has no native-texture mode: Xenoblade Chronicles 2's Torna opening)
+        size_t n = (size_t)d->w * d->h * 4, cap = G.cap(buf); uint8_t *p = G.data(buf);
+        if (!p || cap < n) { LOG("[RED] movie: client RGBA output buffer is %zu bytes, a frame needs %zu", cap, n); G.set_range(buf, 0, 0); return 0x100b; }
+        if (d->out[i].pic && d->out[i].frm) memcpy(p, d->out[i].frm, n); else memset(p, 0, n);
+        G.set_range(buf, 0, (int)n);
+        MD_TRACE(d, 12, "GetOutputBuffer index %d → RGBA %zu bytes%s", i, n, d->out[i].pic ? "" : " (black frame)");
+        return 0;
+    }
     size_t need = (size_t)stride * slice * 3 / 2, cap = G.cap(buf);
     uint8_t *p = G.data(buf);
     if (!p || cap < need) { LOG("[RED] movie: client output buffer is %zu bytes, a frame needs %zu", cap, need); G.set_range(buf, 0, 0); return 0x100b; }
