@@ -607,13 +607,43 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     if (n < 0 || n > 6) { LOG("[RED] ProgramSetShaders stage count %d", n); return 0; }
     mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
     // The keys are computed here (see prog_key in nvn_obj.h): the control section is only guaranteed valid during this call; the code area lives in a memory pool and stays valid while the program is in use
-    static int dump = -1; if (dump < 0) dump = getenv("DM_NVN_SHDUMP") != NULL;
+    static const char *dump_dir; static int dump_init;
+    if (!dump_init) { dump_dir = getenv("DM_NVN_SHDUMP"); dump_init = 1; }
     prog_keys_t *k = pk_get(p, 1);
     k->ok = 0;
     for (int i = 0; i < n; i++) {
-        if (keys_hash(&sd[i], 1, k->key[i])) k->ok |= (uint8_t)(1u << i);
-        // DM_NVN_SHDUMP (debugging): keep a copy of the control section so the replay layer can save shaders missing from the map (never freed)
-        if (dump && sd[i].control) { void *c = malloc(0x880); memcpy(c, sd[i].control, 0x880); o->sd[i].control = c; }
+        int hashed = keys_hash(&sd[i], 1, k->key[i]);
+        if (hashed) k->ok |= (uint8_t)(1u << i);
+
+        // DM_NVN_SHDUMP=directory: save every runtime shader while both the
+        // control section and code area are valid. Files use the same key as
+        // shader_map.tsv and dmsh_build.py.
+        if (dump_dir && hashed && sd[i].control && sd[i].data) {
+            uint32_t ncode = 0;
+            memcpy(&ncode, (const uint8_t *)sd[i].control + 0x704, 4);
+            if (ncode && ncode < (1u << 24)) {
+                char key[17], path[1024];
+                for (int q = 0; q < 8; q++) snprintf(key + q * 2, 3, "%02x", k->key[i][q]);
+                snprintf(path, sizeof path, "%s/%s.ctl", dump_dir, key);
+                if (access(path, F_OK) != 0) {
+                    FILE *f = fopen(path, "wb");
+                    int ctl_ok = f && fwrite(sd[i].control, 1, 0x880, f) == 0x880;
+                    if (f) fclose(f);
+
+                    snprintf(path, sizeof path, "%s/%s.code", dump_dir, key);
+                    f = fopen(path, "wb");
+                    int code_ok = f && fwrite((const void *)(uintptr_t)sd[i].data, 1, ncode, f) == ncode;
+                    if (f) fclose(f);
+
+                    if (ctl_ok && code_ok)
+                        LOG("nvn: captured runtime shader %s (%#x bytes)", key, ncode);
+                }
+            }
+        }
+
+        // Keep a copy for the replay layer as before: the caller may free the
+        // original control section as soon as ProgramSetShaders returns.
+        if (dump_dir && sd[i].control) { void *c = malloc(0x880); memcpy(c, sd[i].control, 0x880); o->sd[i].control = c; }
     }
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
