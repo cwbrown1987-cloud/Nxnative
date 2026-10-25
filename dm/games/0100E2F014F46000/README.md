@@ -2,7 +2,7 @@
 
 Update 1.0.2 (v131072) over the base game, SDK 10.9.0. Team Ninja's engine on NVN. Modules `main`, `subsdk0` (NintendoSDK_movie) and `sdk`.
 
-On the Mac: reached Chapter 1 gameplay with movement and camera control, at about 60 fps on an Apple M5 Max. Not tested on the iPhone.
+Status: plays on the iPhone (A18 Pro, iOS 27.2, 2346x1320), at about 59.5 fps (16.81 ms frame interval, 7.25 ms GPU time); the performance overlay reported 1.71 GB of Metal allocations and 1.08 GB of app memory. On the Mac: Chapter 1 gameplay with movement and camera control, at about 60 fps on an Apple M5 Max.
 
 ## What it needs
 
@@ -24,9 +24,9 @@ The current split has 1,296 GLSLC programs (467 vertex and 829 pixel): 1,283 fro
 
 SDK 10.9.0 calls `nn::fs::ReadFile(FileHandle, offset, buffer, length, ReadOption)`. The SDK implementation expects its own `FileAccessor`, but the host's handle is a file descriptor. `hle_fs.c` takes over that overload and uses the host's exact-read implementation, which rejects short reads. `t_fs` covers offset/length reads, short reads and an invalid handle.
 
-## Mac route
+## Mac routes
 
-The route used for verification reached Chapter 1 gameplay, where Ryu, the environment and HUD were visible and the left/right stick controls were usable. The opening, later chapters, save creation/loading and iPhone gameplay remain unverified.
+The route used for verification reached Chapter 1 gameplay, where Ryu, the environment and HUD were visible and the left/right stick controls were usable. The opening, later chapters and save creation/loading remain unverified.
 
 ## Found on this game
 
@@ -36,4 +36,4 @@ The route used for verification reached Chapter 1 gameplay, where Ryu, the envir
 ## Open
 
 - The `pso_manifest.tsv` is empty; it has not been recorded over a full play route.
-- Only Chapter 1 gameplay has been checked on the Mac. No iPhone, save/load or later-chapter testing has been done.
+- Only Chapter 1 gameplay has been checked on the Mac. On the iPhone, gameplay and performance have been checked, but save/load and later chapters have not.
