@@ -1,33 +1,30 @@
 # NxNative Converter
 
-A small Mac app over `scripts/build_ipa_from_nsp.py --platform mac-app`: it turns one game's folder into a native Mac app ([A Mac app](../docs/development.md#a-mac-app)) without the command line.
+A native Mac app (SwiftUI, macOS 26 or later) over `scripts/build_ipa_from_nsp.py --platform mac-app`: it turns one game's folder into a native Mac app ([A Mac app](../docs/development.md#a-mac-app)) without the command line. It needs only Xcode to build: the key check uses the system's CommonCrypto.
 
-1. **Prerequisites.** It lists what the script needs, each ticked or crossed: Apple silicon, this repository and its shader translator, Xcode and its Metal toolchain, make and clang, .NET SDK 10, zstd, spirv-cross, a Python with lz4, capstone, fontTools and zstd, and macOS's codesign, sips and iconutil. glslang (OpenGL games) and nsz (`.nsz` / `.xcz` files) are optional. Tools are looked up as the script looks them up: its `TOOL_PATHS` first, then `PATH`, so a tick means the script finds the same tool. A crossed item has a **Fix in Terminal** button that runs the install command in a Terminal window.
-2. **Game files.** Choose the game's folder (the base game, plus its update and DLC if you have them) and `prod.keys` (taken from the folder when it is there). **Validate** decrypts each NCA's header with `header_key`, works out the keys its key generation needs, decrypts the title key from the NSP's ticket (or the key area), and decrypts the start of a section to check it reads as a file system. It reads a few KB per file and takes under a second; no key value is shown or written anywhere, only key names.
-3. **Convert.** **Build Mac app** runs the script with `--progress json` and shows its stages, then checks that the app's launcher is executable and that `codesign --verify --deep --strict` passes. The app is signed ad-hoc unless you pick a signing identity in Settings (`--mac-sign`).
+- **Convert.** Choose the game's folder (the base game, plus its update and DLC if you have them) and `prod.keys` (taken from the folder when it is there, else the default keys file from Settings). The converter checks the files against the keys in under a second: it decrypts each NCA's header with `header_key`, the title key from the NSP's ticket with `titlekek_XX` (or the key area with `key_area_key_*_XX`), and the first bytes of a section, which must read as PFS0 or RomFS. NSZ and XCZ files get the header and key checks; the build checks their data. No key value is shown, logged or stored, only key names. **Build Mac app** runs the script with `--progress json`, shows its seven stages, then checks that the app's launcher is executable and that `codesign --verify --deep --strict` passes. The app goes beside the game files, or to the output folder you choose.
+- **Builds.** Every app the converter built, with the engine commit it was built on. The engine is the nxnative checkout the script runs from; the bundle carries no commit, so each build is recorded in `~/Library/Application Support/NxNative Converter/builds.json`. **Rebuild** moves the app to `app-backups/<name> (<commit>, <time>).app` in its folder (a rename, no space taken), runs the full script into the same path (stages with unchanged inputs are reused, so a host-only engine change rebuilds the host and repacks), and puts the old app back if the build fails. **Previous builds** lists those kept copies, to open, restore or move to the Trash. One build per game folder runs at a time (`.nxnative-converter.lock`).
+- **Toolchain.** Each tool the script needs, found as the script finds it: its own `TOOL_PATHS` first, then `PATH`, so a tick means the script finds the same tool. The shader translator is started, not just found: its launcher finds .NET only through `DOTNET_ROOT`, which the converter sets to the folder of the `dotnet` the script uses. A missing tool's **Fix** runs its install command in Terminal. The engine section shows the checkout's commit, **Check for updates** fetches its branch's upstream and **Update engine** fast-forwards to it. **Copy diagnostics** copies the findings (paths and versions, no key values).
+- **Settings.** Appearance, a notification when a build ends, opening the app after a build, the signing identity (`--mac-sign`; ad-hoc by default), the default output folder and keys file, reusing cached stages (off deletes the stage keys in `<id>_build`, so every stage runs again), keeping previous builds (off moves the replaced app to the Trash), log detail (Detailed adds the tools' own logs to Copy log) and the game's build cache.
 
-**Engine and Rebuild.** The engine is the checkout the script runs from, and its git commit is the version a game is built with. The Engine section shows that commit and its branch, **Check for updates** fetches the branch's upstream, and **Update engine** fast-forwards to it (not with uncommitted changes in the checkout). Every build is recorded with its commit in `builds.json`, so the game apps in the chosen folder are listed with the engine each was built on: current, older, or unknown for an app built before the converter recorded engines. **Rebuild** moves that app to `app-backups/<name> (<old commit>, <time>).app` in the folder (a rename, so it takes no space), then runs the full conversion into the same path; the script reuses every stage whose inputs are unchanged, so a host-only engine change rebuilds the host and repacks. If the build fails, the old app is put back.
-
-Settings (repository, Python, signing identity, last folder and keys path) are kept in `~/Library/Application Support/NxNative Converter/settings.json`. The repository is found from the setting, then the checkout the app was built in, then `~/Developer/nxnative`, `~/nxnative` and similar. Python is the setting, then `~/Library/Application Support/NxNative Converter/venv`, then the checkout's `.venv`, then each `python3` on `PATH`, the first with the modules winning.
+Settings are in `~/Library/Application Support/NxNative Converter/settings.json`. The repository is found from the setting, then the checkout the app was built in, then `~/Developer/nxnative`, `~/nxnative` and similar. Python is the setting, then `~/Library/Application Support/NxNative Converter/venv`, then the checkout's `.venv`, then each `python3` on `PATH`, the first with the modules winning.
 
 ## Build
 
-Needs Rust (`rustup`):
-
 ```
 app/bundle.sh
-open "app/target/NxNative Converter.app"
+open "app/.build/NxNative Converter.app"
 ```
 
 The same steps run without the window, which is how it is tested:
 
 ```
-app/target/release/nxnative-converter --check
-app/target/release/nxnative-converter --validate "<game folder>" "<prod.keys>"
-app/target/release/nxnative-converter --convert "<game folder>" "<prod.keys>" [--sign "<identity>"]
-app/target/release/nxnative-converter --verify "<game>.app"
-app/target/release/nxnative-converter --engine "<game folder>"
-app/target/release/nxnative-converter --rebuild "<game folder>/<game>.app" "<prod.keys>" [--sign "<identity>"]
+app/.build/release/NxNativeConverter --check
+app/.build/release/NxNativeConverter --validate "<game folder>" "<prod.keys>"
+app/.build/release/NxNativeConverter --convert "<game folder>" "<prod.keys>" [--sign "<identity>"]
+app/.build/release/NxNativeConverter --rebuild "<game folder>/<game>.app" "<prod.keys>" [--sign "<identity>"]
+app/.build/release/NxNativeConverter --engine "<game folder>"
+app/.build/release/NxNativeConverter --verify "<game>.app"
 ```
 
-`NXC_SNAPSHOT=<file.png>` saves a picture of the window a few seconds after it opens and quits (with `NXC_PAGE=builds`, `toolchain` or `settings` for another page, and `NXC_AUTOBUILD=1` to build the chosen folder first), for checking the layout without a screen capture.
+For checking the window: `NXC_SNAPSHOT=<file.png>` saves a picture of it a few seconds after it opens, writes its window number to `<file.png>.wid` for `screencapture -l`, and quits (`NXC_PAGE=builds`, `toolchain` or `settings` for another page; `NXC_AUTOBUILD=1` builds the chosen folder first). `NXC_SUPPORT_DIR=<folder>` keeps settings and build records there instead, to test beside a copy in use.
