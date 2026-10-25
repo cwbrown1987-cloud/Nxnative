@@ -1,6 +1,8 @@
 // Metal execution layer of the NVN null device, see nvn_mtl.h.
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <MetalFX/MetalFX.h>
+#undef I   // MetalFX brings <complex.h>, whose I clashes with locals named I
 #import <QuartzCore/CAMetalDisplayLink.h>
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -1331,6 +1333,7 @@ static _Atomic uint64_t g_ser_gen = 1;
 // SMBW rebuilds its transient render targets on new objects every frame and never Finalizes them, so building one per serial leaked about 13 MB of GPU memory per frame. Textures here are kept resident by the sharing table,
 // and when the serial table replaces / deletes them it only drops its reference (defer_obj_unref), never removing them from the residency set. Entries go when their pool is finalized (mtl_alias_drop_pool)
 // or another texture takes over their storage (alias_take_over).
+static int mtl_fmt_depth(MTLPixelFormat f);
 typedef struct { uint64_t pool; int64_t off; nvn_texdesc d; } alias_key;
 static nvn_hmap g_alias = {.klen = sizeof(alias_key)};
 static nvn_hmap g_alias_seen = {.klen = sizeof(alias_key)};   // key → g_fence + 1 at its last lookup or creation (alias_take_over spares entries looked up lately)
@@ -2084,6 +2087,10 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         return mt;
     }
     alias_key ak; memset(&ak, 0, sizeof ak); ak.pool = (uint64_t)(uintptr_t)t->pool; ak.off = t->off; ak.d = t->d;
+    // A depth-stencil texture and the texture made over the same storage to sample it differ only in IMAGE (Xenoblade Chronicles 2, SDK 3.5: the depth target has flags 0x8, the texture its
+    // deferred lighting samples 0x8 | IMAGE). Metal cannot write a depth format from a shader anyway, so IMAGE changes nothing about the Metal texture: both share one, or the lighting read
+    // a never-written texture and every model came out black
+    { uint32_t mpf = 0; uint8_t msw[4]; if ((ak.d.flags & NVN_TEXTURE_FLAGS_IMAGE) && nvn_fmt_to_mtl(ak.d.format, &mpf, msw) && mpf && mtl_fmt_depth((MTLPixelFormat)mpf)) ak.d.flags &= ~NVN_TEXTURE_FLAGS_IMAGE; }
     pthread_mutex_lock(&g_smu); __unsafe_unretained id shared = hm_get_id(&g_alias, &ak); if (shared) nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1)); pthread_mutex_unlock(&g_smu);
     if (shared) { tex_put(t->serial, shared); return shared; }
     id<MTLTexture> mt = tex_linear(t);
@@ -2097,6 +2104,18 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
     if (getenv("DM_NVN_TEXCPU") && t->pool && !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) MLOG("non-swizzled texture on a CPU-visible pool ser=%llu %ux%ux%u format %#x target %d levels %u texture flags %#x pool flags %#x storage %p", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, t->d.flags, t->pool->flags, (void *)t->mem);
     res_add(mt);
+    if (getenv("DM_NVN_ALIASDBG")) {   // diagnostic: another texture already on this storage with a different description
+        pthread_mutex_lock(&g_smu);
+        for (uint32_t i = 0; i < g_alias.cap; i++) {
+            if (!g_alias.vals[i]) continue;
+            alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+            if (k.pool == ak.pool && k.off == ak.off && memcmp(&k.d, &ak.d, sizeof k.d))
+                MLOG("[aliasdbg] ser=%llu pool+%#llx: new tgt %d fmt %#x flags %#x %ux%ux%u lv %u stride %u blk %d / existing tgt %d fmt %#x flags %#x %ux%ux%u lv %u stride %u blk %d",
+                     (unsigned long long)t->serial, (unsigned long long)ak.off, ak.d.target, ak.d.format, ak.d.flags, ak.d.width, ak.d.height, ak.d.depth, ak.d.levels, ak.d.stride, ak.d.pkg_block_h,
+                     k.d.target, k.d.format, k.d.flags, k.d.width, k.d.height, k.d.depth, k.d.levels, k.d.stride, k.d.pkg_block_h);
+        }
+        pthread_mutex_unlock(&g_smu);
+    }
     pthread_mutex_lock(&g_smu);
     if (!g_alias_set) g_alias_set = CFSetCreateMutable(NULL, 0, NULL);
     alias_take_over(&ak);
@@ -8460,6 +8479,45 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     [en endEncoding];
     return 1;
 }
+
+// ---------- MetalFX output upscale (Mac, key 3 in the game window: front_mac.m): the frame the game presents is scaled to the window's pixels by MetalFX's spatial scaler before the
+// present pass draws it, instead of the present pass's bilinear stretch (Xenoblade Chronicles 2 renders at most 720p; a Retina window is two to three times that). After MacNativeGames'
+// Tears of the Kingdom output stage (totk_mfx_up.m): a fence signalled after a queue barrier makes MetalFX read the finished frame. DM_MFX=1 starts with it on
+static _Atomic uint32_t g_pres_dim[5];   // the last present: the game's picture w / h, the size it is shown at in the window w / h, MetalFX used (the in-game box, front_mac.m)
+void dm_gfx_present_dims(uint32_t d[5]) { for (int i = 0; i < 5; i++) d[i] = g_pres_dim[i]; }
+static _Atomic int g_mfx = -1;
+static id<MTL4FXSpatialScaler> g_mfx_sc; static id<MTLTexture> g_mfx_out; static id<MTLFence> g_mfx_fence; static id<MTL4Compiler> g_mfx_comp;
+static NSUInteger g_mfx_key[5]; static int g_mfx_bad;
+int dm_gfx_mfx(void) { if (g_mfx < 0) { const char *e = getenv("DM_MFX"); g_mfx = e && atoi(e) ? 1 : 0; } return g_mfx; }
+int dm_gfx_mfx_toggle(void) { int v = !dm_gfx_mfx(); g_mfx = v; MLOG("MetalFX output upscale %s", v ? "on" : "off"); return v; }
+static id<MTLTexture> mfx_up(id<MTL4CommandBuffer> cb, id<MTLTexture> src, NSUInteger cw, NSUInteger ch, NSUInteger ow, NSUInteger oh) {
+    if (g_mfx_bad || !dm_gfx_mfx() || ow < cw + cw / 20 || oh < ch + ch / 20) return nil;
+    NSUInteger key[5] = {cw, ch, ow, oh, src.pixelFormat};
+    if (!g_mfx_sc || memcmp(key, g_mfx_key, sizeof key)) {
+        NSError *e = nil;
+        if (![MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev]) { MLOG("[RED] MetalFX: no Metal 4 spatial scaler on this GPU"); g_mfx_bad = 1; return nil; }
+        if (!g_mfx_comp) g_mfx_comp = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&e];
+        if (!g_mfx_fence) g_mfx_fence = [g_dev newFence];
+        MTLFXSpatialScalerDescriptor *d = [MTLFXSpatialScalerDescriptor new];
+        d.colorTextureFormat = src.pixelFormat; d.outputTextureFormat = src.pixelFormat;
+        d.inputWidth = cw; d.inputHeight = ch; d.outputWidth = ow; d.outputHeight = oh; d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+        id<MTL4FXSpatialScaler> sc = g_mfx_comp ? [d newSpatialScalerWithDevice:g_dev compiler:g_mfx_comp] : nil;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:ow height:oh mipmapped:NO];
+        td.usage = sc ? sc.outputTextureUsage | MTLTextureUsageShaderRead : MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> out = sc ? [g_dev newTextureWithDescriptor:td] : nil;
+        if (!sc || !out) { MLOG("[RED] MetalFX: cannot build a %lux%lu → %lux%lu scaler for format %lu", (unsigned long)cw, (unsigned long)ch, (unsigned long)ow, (unsigned long)oh, (unsigned long)src.pixelFormat); g_mfx_bad = 1; return nil; }
+        res_add(out); [g_res commit];
+        g_mfx_sc = sc; g_mfx_out = out; memcpy(g_mfx_key, key, sizeof key);
+        MLOG("MetalFX output upscale %lux%lu → %lux%lu", (unsigned long)cw, (unsigned long)ch, (unsigned long)ow, (unsigned long)oh);
+    }
+    id<MTL4ComputeCommandEncoder> en = [cb computeCommandEncoder];
+    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+    [en updateFence:g_mfx_fence afterEncoderStages:MTLStageDispatch];
+    [en endEncoding];
+    g_mfx_sc.colorTexture = src; g_mfx_sc.outputTexture = g_mfx_out; g_mfx_sc.inputContentWidth = cw; g_mfx_sc.inputContentHeight = ch; g_mfx_sc.fence = g_mfx_fence;
+    [g_mfx_sc encodeToCommandBuffer:cb];
+    return g_mfx_out;
+}
 static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int uv_i) {
     NSUInteger cx = 0, cy = 0, cw = src.width, ch = src.height;
     if (crop && (crop[2] || crop[3])) {
@@ -8570,7 +8628,18 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [g_q4 waitForDrawable:dr];
     id<MTL4CommandBuffer> cb = g_present_cb[alloc_i];
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
-    if (!present_encode_m4(cb, src, dr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
+    { NSUInteger iw = crop && crop[2] ? (NSUInteger)crop[2] : src.width, ih = crop && crop[3] ? (NSUInteger)crop[3] : src.height;
+      double fs0 = fmin((double)dr.texture.width / iw, (double)dr.texture.height / ih);
+      g_pres_dim[0] = (uint32_t)iw; g_pres_dim[1] = (uint32_t)ih; g_pres_dim[2] = (uint32_t)llround(iw * fs0); g_pres_dim[3] = (uint32_t)llround(ih * fs0); g_pres_dim[4] = 0; }
+    // MetalFX output upscale: only a frame presented whole from its corner (the crop, if any, at 0,0), scaled to fit the drawable as the present pass would
+    id<MTLTexture> psrc = src; const int *pcrop = crop; int ucrop[4];
+    if (dm_gfx_mfx() && (!crop || (!crop[0] && !crop[1]))) {
+        NSUInteger cw = crop && crop[2] ? (NSUInteger)crop[2] : src.width, ch = crop && crop[3] ? (NSUInteger)crop[3] : src.height;
+        double fs = fmin((double)dr.texture.width / cw, (double)dr.texture.height / ch);
+        id<MTLTexture> up = mfx_up(cb, src, cw, ch, (NSUInteger)llround(cw * fs), (NSUInteger)llround(ch * fs));
+        if (up) { g_pres_dim[4] = 1; psrc = up; ucrop[0] = ucrop[1] = 0; ucrop[2] = (int)up.width; ucrop[3] = (int)up.height; pcrop = ucrop; }
+    }
+    if (!present_encode_m4(cb, psrc, dr.texture, pcrop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
     [cb endCommandBuffer];
     MTL4CommitOptions *o = [MTL4CommitOptions new];
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
@@ -8728,6 +8797,8 @@ static void *link_main(void *arg) {   // Display link thread: started when switc
     g_link_started = 0;
     return NULL;
 }
+static _Atomic int g_link_one_tick;
+void mtl_present_link_mode(int m) { if (m >= 0 && m <= 2) g_dm_present_link = m; g_link_one_tick = m == 2; }   // the host picks the display link rate at run time (1 = 60 Hz, 2 = up to 120 Hz; Xenoblade Chronicles 2 above 60 fps)
 static void link_sync(void) {   // Called every frame by the game's present thread: aligns the display link object's state to g_dm_present_link and the power-saving mode (can change at run time)
     static int applied; int want = g_dm_present_link;
     if (want < 0 || want > 2) { g_dm_present_link = applied == 3 ? 1 : applied; return; }
@@ -8889,7 +8960,7 @@ int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) {
     // A frame presented with interval N blocks the game for N vsyncs on the Switch, as the display callback holds it N ticks: games that scale their time step by the interval (BotW's VFR: interval / 2)
     // ran at double speed while they produced interval-2 frames every 60 Hz tick (iPhone log: Link sprinting with B, the interval flapping 1 ↔ 2)
     if (vsyncs < 1) vsyncs = 1;
-    const uint64_t step = g_link_mode == 3 ? (uint64_t)(vsyncs + 1) / 2 : (uint64_t)vsyncs * (g_link_mode == 2 ? 2 : 1);
+    const uint64_t step = g_link_mode == 3 ? (uint64_t)(vsyncs + 1) / 2 : (uint64_t)vsyncs * (g_link_mode == 2 && !g_link_one_tick ? 2 : 1);   // g_link_one_tick: the game steps by real time and wants one frame per 120 Hz tick (Xenoblade Chronicles 2 at 120 fps)
     pthread_mutex_lock(&g_link_mu);
     if (g_link_tick_n >= started_tick + step) { started_tick = g_link_tick_n; pthread_mutex_unlock(&g_link_mu); return 1; }
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);

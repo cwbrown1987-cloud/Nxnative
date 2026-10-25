@@ -50,7 +50,52 @@ static const struct { const char *build, *what; uint64_t ptr_off; uint32_t field
 
 static int rd(uint64_t a, void *out, size_t n) { vm_size_t got = 0; return a >= 0x1000 && vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)out, &got) == KERN_SUCCESS && got == n; }
 
+// Xenoblade Chronicles 2 3.0.0 (main FEEE7AFA8A1541BD): the frame rate the player picks in the game (key 2, front_mac.m on_key; DM_XC2_FPS at start), carried out by the stubs of the
+// profile's patches.py (FPSLocker's config for this build): the host writes the effective target (state +0x4c; 30 while a cutscene plays, u8 main+0xbd8f40 = 1, as FPSLocker does: cutscenes
+// are timed in frames), the dynamic-resolution budget (+0x48: (1 / fps) / vsyncs x 0.96) and the game's present interval (two u32 at main+0xb75c40: vsyncs per frame, 1 from 60 fps up)
+// 0 = the game's own 30. Above 60 was tried (present tick, display link at 120 Hz one tick per frame, the game's present interval 1): the game still produced 60 frames a second, its
+// main thread waiting on its workers and the render thread on GPU fences; whatever holds it is inside the engine, so only 30 and 60 are offered
+static const int k_xc2_rates[] = {0, 60, 0, 0};
+static int g_xc2 = -1, g_xc2_rate; static uint8_t *g_xc2_main;
+static void xc2_find(void) {
+    if (g_xc2 >= 0 || !g_nmod) return;   // modules not loaded yet (the window comes first): ask again later
+    g_xc2 = 0;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main") && !strcmp(g_mod[i].build_id, "feee7afa8a1541bd67aed1a0061fbb57")) { g_xc2_main = g_mod[i].base; g_xc2 = 1; }
+    if (g_xc2 && !dm_fps_state) { LOG("[RED] xc2: main without its frame-time stubs (patches.py): frame rate fixed at 30"); g_xc2 = 0; }
+    if (!g_xc2) return;
+    const char *e = getenv("DM_XC2_FPS"); int t = e ? atoi(e) : 0;   // not DM_FPS_TARGET: that one turns on the generic frame step (state +0), which this game does not use
+    g_xc2_rate = t == 30 ? 0 : t;
+    for (int k = 0; k < 2; k++) if (k_xc2_rates[k] == g_xc2_rate) goto ok;
+    g_xc2_rate = 0;
+ok:
+    LOG("xc2: frame rate %s (key 2 switches 30 / 60)", g_xc2_rate ? "set by the host" : "the game's own 30");
+}
+static void xc2_tick(void) {
+    xc2_find();
+    if (g_xc2 != 1) return;
+    // The stubs stay off (the game's own 30) through boot: the global the step goes to ([main+0xb900d0]) points to another object then, and stepping it made a worker thread assert
+    // on NaNs at frame 3. 300 presents (10 s at 30) are well before the title screen
+    static int presents; if (presents < 300) { presents++; float z = 0; memcpy(dm_fps_state + 0x4c, &z, 4); float dr0 = 1.0f / 30.0f / 2.0f * 0.96f; memcpy(dm_fps_state + 0x48, &dr0, 4); return; }
+    int movie = g_xc2_main[0xbd8f40] == 1, fps = movie ? 30 : g_xc2_rate;
+    uint32_t vs = fps ? (fps >= 60 ? 1 : 60 / fps) : 2;
+    float eff = (float)fps, dr = (1.0f / (fps ? (float)fps : 30.0f)) / (float)vs * 0.96f;
+    memcpy(dm_fps_state + 0x4c, &eff, 4); memcpy(dm_fps_state + 0x48, &dr, 4);
+    uint32_t *pi = (uint32_t *)(g_xc2_main + 0xb75c40);   // left alone until the game has set it (all ones before) and while the game keeps its own rate
+    if (getenv("DM_XC2_NOVS") == NULL && pi[0] != 0xffffffffu && (fps || movie) && (pi[0] != vs || pi[1] != vs)) { pi[0] = vs; pi[1] = vs; }
+    // Above 60 the host's present tick follows the rate (a fixed 60 Hz otherwise)
+    static int last = -1; if (fps != last) { void nvn_present_config(int hz, int display_mode); nvn_present_config(fps > 60 ? fps : 60, 0); void mtl_present_link_mode(int m); mtl_present_link_mode(fps > 60 ? 2 : 1); LOG("xc2: %d fps%s, present tick %d Hz", fps ? fps : 30, movie ? " (cutscene)" : "", fps > 60 ? fps : 60); last = fps; }
+}
+// key 2 in the game window: the next frame rate; returns it (30 for the game's own) or 0 when this game has no frame-rate choice
+int dm_xc2_rate_cycle(void) {
+    xc2_find(); if (g_xc2 != 1) return 0;
+    int k = 0; while (k < 2 && k_xc2_rates[k] != g_xc2_rate) k++;
+    g_xc2_rate = k_xc2_rates[(k + 1) % 2];
+    return g_xc2_rate ? g_xc2_rate : 30;
+}
+int dm_xc2_rate(void) { xc2_find(); return g_xc2 == 1 ? (g_xc2_rate ? g_xc2_rate : 30) : 0; }
+
 void dm_fps_lock_tick(void) {
+    xc2_tick();
     static int state = -2, rows[NLOCKS], nrow, nlog[NLOCKS], target; static uint8_t *base; static const char *src;
     if (state == -1) return;
     if (state == -2) {

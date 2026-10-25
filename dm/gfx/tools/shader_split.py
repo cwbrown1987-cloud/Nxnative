@@ -46,6 +46,7 @@
 import collections, concurrent.futures as cf, hashlib, json, os, re, struct, subprocess, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../games')); import game as _game
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import uepak
+import xc2_ard
 GAME = _game.load()   # the current game profile (DM_GAME, required): source group rules and the table header note
 GROUPS, NOTE = GAME.pairs('shader_groups'), GAME.get('shader_note')
 # The sources are what the game files hold, with no profile switch: GLSLC outputs in main (glslc_shaders), the outputs the game compiles at run time when a capture is there (DM_GLSLC_CAPTURE,
@@ -1466,7 +1467,7 @@ def ps_inputs(code):
     """Generic attributes a pixel shader reads: SPH words 6–13 are the input map, 8 bits for each of the 32 attributes (Ryujinx ShaderHeader.ImapTypes), non-zero = read; the translated MSL inputs are exactly user(locn<attribute>)"""
     return {i for i in range(32) if struct.unpack_from('<I', code, 0x30 + 4 * (6 + (i >> 2)))[0] >> ((i & 3) * 8) & 0xff}
 
-SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
+SINGLE_STAGE = ('#SPCH@', '#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
 # MonoGame's effects, whose passes may name no vertex shader and keep the one bound (Celeste: 10 of its 13 effects draw through SpriteBatch's vertex shader, which is in main); Next Level Games'
 # archives (Luigi's Mansion 3 makes 5,317 programs of one stage each at boot); PlatinumGames' shader objects (Bayonetta 3: one stage each, pg_shader); control sections loose in main
 # (Advance Wars 1+2: Re-Boot Camp's Bink shaders, raw_shaders), which no file pairs; and YEBIS's effect file (tfxo_shaders)
@@ -1519,6 +1520,32 @@ def var_pairs(found):
         if '#var' in where: var[where][st] = skey(ctl, code)
     return {(v['vs'], v['ps']) for v in var.values() if 'vs' in v and 'ps' in v}
 
+XC2_ARD = 'xc2_ard'
+XC2_EXT = ('.wishp', '.wismt', '.wiefb', '.evpa', '.wismda', '.wismhd', '.wimdo')
+def xc2_jobs(files, parts=64):
+    """Monolith Soft's bf2.ard data archive with its bf2.arh index (Xenoblade Chronicles 2: every file of the game is in it); its entries with Spch shader packages, in ranges of about equal
+    stored length. → ([(path, rel, (XC2_ARD, entries)), ...], the .ard paths)"""
+    ar = [(p, r, [e for e in xc2_ard.read_arh(p[:-4] + '.arh') if e[5] and e[5].lower().endswith(XC2_EXT)]) for p, r in files if p.endswith('.ard') and os.path.exists(p[:-4] + '.arh')]
+    jobs, step = [], max(1, sum(e[1] for _, _, es in ar for e in es) / parts)
+    for p, r, es in ar:
+        cur, size = [], 0
+        for e in es:
+            cur.append(tuple(e)); size += e[1]
+            if size >= step: jobs.append((p, r, (XC2_ARD, tuple(cur)))); cur, size = [], 0
+        if cur: jobs.append((p, r, (XC2_ARD, tuple(cur))))
+    return jobs, {p for p, _, _ in ar} | {p[:-4] + '.arh' for p, _, _ in ar}
+
+def xc2_shaders(path, rel, ents, out):
+    """Entries of a bf2.ard (xc2_jobs), each inflated with its xbc1 streams and read for Spch programs (xc2_ard.spch_programs): one stage each, keyed by control section + code area"""
+    with open(path, 'rb') as f:
+        for e in ents:
+            for so, d in xc2_ard.xbc1_streams(xc2_ard.read_entry(f, e)):
+                for h, c, ctl, code in xc2_ard.spch_programs(d):
+                    st = glslc_stage(ctl, code)
+                    where = f'/{rel}{e[5]}#SPCH@{so:#x}+{c - h:#x}'
+                    if st and not check(where, st, ctl, code): out.append((where, st, ctl, code))
+                    else: print(f'[RED] {where}: not a usable control section + code area; left out', flush=True)
+
 def scan_file(args):
     """→ (relative path, {key: …}, pairs, extra); extra = this file's Unity type trees, or 'defer' (no type tree, scanned again in the second pass)"""
     path, rel = args[:2]
@@ -1534,6 +1561,16 @@ def scan_file(args):
         return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and head[:8] == ONEPACK:   # a range of Trinity packs (trpfs_jobs)
         trinity_shaders(path, rel, args[2], found)
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if len(args) == 2 and path.lower().endswith(XC2_EXT):   # a loose Monolith file (Xenoblade Chronicles 2's DLC folders): its xbc1 streams read for Spch programs
+        d = open(path, 'rb').read()
+        for so, b in xc2_ard.xbc1_streams(d):
+            for h, c, ctl, code in xc2_ard.spch_programs(b):
+                st = glslc_stage(ctl, code); where = f'/{rel}#SPCH@{so:#x}+{c - h:#x}'
+                if st and not check(where, st, ctl, code): found.append((where, st, ctl, code))
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if len(args) > 2 and args[2][0] == XC2_ARD:   # entries of Xenoblade Chronicles 2's bf2.ard (xc2_jobs)
+        xc2_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and args[2][0] == UE_LEGACY:   # files of a legacy Unreal pak (ue_legacy_jobs)
         ue_legacy_shaders(path, rel, args[2][1], found)
@@ -1618,6 +1655,11 @@ def main():
     for i, (romfs, mainnso) in enumerate(zip(romfs_v, main_v)):
         tag = os.path.basename(os.path.dirname(os.path.abspath(romfs))) if i else ''
         files += sorted((os.path.join(dp, f), (tag + '/' if tag else '') + os.path.relpath(os.path.join(dp, f), romfs)) for dp, _, fs in os.walk(romfs) for f in fs)
+        if not i:   # add-on content read like the RomFS (DM_SHADER_EXTRA_DIRS, ':'-separated; the NSP script passes the extracted DLC): Xenoblade Chronicles 2's Torna holds 2,834 shaders of its own in aoc1.ard
+            aoc = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(romfs)))), 'aoc')   # <work>/extract/<version>/RomFS → <work>/aoc/<index> (the NSP script's DLC)
+            extra = os.environ.get('DM_SHADER_EXTRA_DIRS') or ':'.join(sorted(os.path.join(aoc, x) for x in os.listdir(aoc) if os.path.isdir(os.path.join(aoc, x)))) if os.path.isdir(aoc) or os.environ.get('DM_SHADER_EXTRA_DIRS') else ''
+            for xd in filter(None, extra.split(':')):
+                files += sorted((os.path.join(dp, f), 'aoc/' + os.path.basename(xd.rstrip('/')) + '/' + os.path.relpath(os.path.join(dp, f), xd)) for dp, _, fs in os.walk(xd) for f in fs)
         img = nso_image(mainnso)
         if not i:
             import unityfs
@@ -1651,9 +1693,10 @@ def main():
     bd_jobs, bdts = bdt_jobs(files)   # Dark Souls Remastered's dvdbnd archives: the entries of each .bdt by its .bhd5 index, in ranges
     arc_jobs, arcs = smash_arc_jobs(files)   # Super Smash Bros. Ultimate's data.arc: its current files, in ranges
     pz_jobs, pkzs = pkz_jobs(files)   # Bayonetta 3's PKZ archives, Oodle Kraken decoded by the game's own decoder in the Mac host
+    xc_jobs, xcs = xc2_jobs(files)   # Xenoblade Chronicles 2's bf2.ard
     ck_jobs, cpks = cpk_jobs(files)   # Bayonetta 2's CRI CPK archives (CRILAYLA entries)
-    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs
-    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks]
+    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + xc_jobs + ck_jobs
+    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in xcs and p not in cpks]
     with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, {}, zdicts)) as ex:
         results += list(ex.map(scan_file, big)) + list(ex.map(scan_file, files, chunksize=16))
     trees, defer = {}, []
