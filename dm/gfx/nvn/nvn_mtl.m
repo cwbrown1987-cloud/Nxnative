@@ -2663,6 +2663,9 @@ static id<MTL4RenderCommandEncoder> rp_begin(void) { return rp_begin_ex(0); }
 static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only);
 static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) { AP_B; id<MTL4RenderCommandEncoder> e = rp_begin_ex_(clear_only); AP_E(1); return e; }
 static void bare_dims(NSUInteger *w, NSUInteger *h);
+// Colour attachments of the open render pass written in it so far (bit per slot): cleared by its load action or a clear drawn in it, or drawn into (fb_note_draw). Memory still holds
+// their content from before the pass, so a draw that samples one reads it stale (see fb_prepare)
+static uint8_t g_fb_wrote;
 static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     if (g_enc) return g_enc;
     memset(g_zskip_cand_ok, 0, sizeof g_zskip_cand_ok);
@@ -2849,6 +2852,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }   // the copy encoder the shadows' blocks were moved in with (bcrt_attach)
     ser_gate();
     g_enc = enc_r_begin_pass(pd);
+    g_fb_wrote = 0; for (int i = 0; i < R.rt.n && i < 8; i++) if (R.clear_c[i] && pd.colorAttachments[i].texture) g_fb_wrote |= (uint8_t)(1u << i);
     args_dirty_all();
     g_stat_pass++;
     if (enc_label_on()) { id<MTLTexture> lt = pd.colorAttachments[0].texture ?: pd.depthAttachment.texture ?: pd.stencilAttachment.texture; g_el_w = (int)lt.width; g_el_h = (int)lt.height; g_el_draws = 0; g_el_key[0] = 0; }
@@ -3841,6 +3845,10 @@ static void swrite_note(NvProg *pr) {
     if (!pr || g_pass_swrite) return;
     for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
         for (int i = 0; i < sh->rf.nb; i++) if (sh->rf.b[i].rw && (sh->rf.b[i].kind == NVN_RB_IMG || sh->rf.b[i].kind == NVN_RB_IMGA || sh->rf.b[i].kind == NVN_RB_SBUFP)) { g_pass_swrite = 1; return; } }
+}
+static void fb_note_draw(NvProg *pr) {   // the colour attachments this draw writes: a channel of the slot's write mask on, and an output of the fragment shader (when its outputs are known)
+    NvShader *fs = pr ? pr->sh[1] : nil;
+    for (int i = 0; i < R.rt.n && i < 8; i++) if (((S.chmask.mask >> (4 * i)) & 0xf) && (!fs || !fs->rf.color_known || (fs->rf.color_mask >> i & 1))) g_fb_wrote |= (uint8_t)(1u << i);
 }
 static void udc_note_draw(NvProg *pr) {
     if (!tbdr_on()) {   // without the TBDR set only the duplicate-slot report below is live (the zero-source skip and the unwritten-attachment store are part of the set): skip the per-draw scans
@@ -6682,14 +6690,20 @@ void ms_after(void) {
 // on Metal, writing and sampling the same attachment within one render pass is undefined: the Mac happens to read correctly, while the iPhone (A20 Pro) now and then reads whole 16x16 blocks as (1,0,1) and FXAA carries them into the picture - the magenta squares in 1-1
 // (measured with DM_NVN_MAGSCAN: the squares first appear on this attachment, and still appear with the particle dropped).
 // The fix: before this draw opens its render pass, end the current render pass (the attachment lands in memory), copy that level and layer into a snapshot texture in the replay stream, make this draw sample the snapshot; later draws reopen the render pass as usual (loading the attachment).
-// Only single-level 2D views that are exactly the attachment's level and layer are handled; other shapes are reported once and left as they were. Done only for the fragment shaders the game profile's feedback_snap lists (see fb_want)
+// Only single-level 2D views that are exactly the attachment's level and layer are handled; other shapes are reported once and left as they were.
+// Done for every draw that samples an attachment the open render pass has already written (g_fb_wrote): memory still holds the content from before the pass, so Metal reads it stale wherever the
+// GPU runs, where the Switch reads what the earlier draws wrote. Super Mario 3D All-Stars' launcher converts each movie frame into its texture with agl's YUV program and then corrects its
+// gamma in place with a second draw in the same pass that samples it (agl_common 021631192bc452b6): it read the zeros the gamma draw had stored the frame before, so every movie stayed
+// transparent and the menu's backgrounds showed the clear colour (flat lavender) where its artwork belongs. Other draws that sample an attachment of their pass are done for the fragment shaders
+// the game profile's feedback_snap lists (see fb_want)
 // Which fragment shaders get it: the game profile's feedback_snap (key prefixes, space-separated); DM_NVN_FB_SNAP=0 none, all every shader, <keys,...> another list. The cost of doing all:
 // Breath of the Wild has over a thousand draws a frame sampling the G-buffer of their own pass (frame time 16.6 -> 36.6 ms) and Mario Wonder's submit time went 1.4 -> 4.0 ms, so only shaders seen to break are listed
-static char g_fb_keys[16][20]; static int g_fb_nk = -1, g_fb_all;
+static char g_fb_keys[16][20]; static int g_fb_nk = -1, g_fb_all, g_fb_off; static uint64_t g_fb_stale;   // g_fb_off: DM_NVN_FB_SNAP=0, no snapshots at all; g_fb_stale: snapshots of attachments written earlier in their pass
 static int fb_want(const char *key) {
     if (g_fb_nk < 0) { g_fb_nk = 0; const char *e = getenv("DM_NVN_FB_SNAP"), *src = e && *e ? e : DM_GAME_FEEDBACK_SNAP;
         if (!strcmp(src, "all")) g_fb_all = 1;
-        else if (strcmp(src, "0")) for (const char *q = src; *q && g_fb_nk < 16;) { size_t n = strcspn(q, ", "); if (n) { if (n > 16) n = 16; memcpy(g_fb_keys[g_fb_nk], q, n); g_fb_keys[g_fb_nk++][n] = 0; } q += n; q += strspn(q, ", "); }
+        else if (!strcmp(src, "0")) g_fb_off = 1;
+        else for (const char *q = src; *q && g_fb_nk < 16;) { size_t n = strcspn(q, ", "); if (n) { if (n > 16) n = 16; memcpy(g_fb_keys[g_fb_nk], q, n); g_fb_keys[g_fb_nk++][n] = 0; } q += n; q += strspn(q, ", "); }
         if (g_fb_all || g_fb_nk) MLOG("same-pass feedback sampling snapshot: %s%s", g_fb_all ? "all fragment shaders" : src, e && *e ? " (DM_NVN_FB_SNAP)" : " (profile key feedback_snap)"); }
     if (g_fb_all) return 1;
     for (int i = 0; i < g_fb_nk; i++) if (!strncmp(key, g_fb_keys[i], strlen(g_fb_keys[i]))) return 1;
@@ -6708,13 +6722,15 @@ static id<MTLTexture> fb_snap_tex(MTLPixelFormat pf, NSUInteger w, NSUInteger h)
 static void fb_prepare(NvProg *pr) {
     g_draw_seq++; g_fb_n = 0;
     if (g_fb_rebind) { args_dirty_all(); g_fb_rebind = 0; }   // the previous draw had a substituted binding: re-encode with the original bindings this time
-    if (!pr || !pr->sh[1] || !R.rt.n || g_fz.active || g_defer_replaying || !fb_want(pr->sh[1]->key)) return;
+    if (!pr || !pr->sh[1] || !R.rt.n || g_fz.active || g_defer_replaying) return;
+    int listed = fb_want(pr->sh[1]->key); uint8_t stale = g_enc && !g_fb_off ? g_fb_wrote : 0;   // attachments written earlier in the open pass
+    if (!listed && !stale) return;
     NvShader *fs = pr->sh[1];
     for (int i = 0; i < fs->rf.nb && g_fb_n < 4; i++) { const nvn_rbind *b = &fs->rf.b[i]; if (b->kind != NVN_RB_TEX || b->reg >= 128) continue;
         int tid = (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff); if (!tid) continue;
         pthread_mutex_lock(&g_rmu); uint64_t ser = tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t.serial : 0; pthread_mutex_unlock(&g_rmu);
         if (!ser) continue;
-        for (int k = 0; k < R.rt.n && k < 8 && g_fb_n < 4; k++) { if (!R.rt.color[k] || R.rt.color[k]->serial != ser) continue;
+        for (int k = 0; k < R.rt.n && k < 8 && g_fb_n < 4; k++) { if (!R.rt.color[k] || R.rt.color[k]->serial != ser || (!listed && !(stale >> k & 1))) continue;
             uint64_t aser; int lv, sl; rt_sub(&R.rt, k, &aser, &lv, &sl);
             pthread_mutex_lock(&g_rmu); void *tv = NULL; tex_fast_rid(tid, &tv); id<MTLTexture> t = (__bridge id<MTLTexture>)tv; pthread_mutex_unlock(&g_rmu);
             if (!t) continue;
@@ -6734,10 +6750,10 @@ static void fb_prepare(NvProg *pr) {
             if (!use) { RED_ONCE(81, "same-pass feedback sampling: cannot create the snapshot view (format %lu); left as is", (unsigned long)t.pixelFormat); continue; }
             if (g_fb_use[g_fb_n] && g_fb_use[g_fb_n] != use) defer_obj_unref(g_fb_use[g_fb_n]);
             g_fb_src[g_fb_n] = t; g_fb_use[g_fb_n] = use; g_fb_rid[g_fb_n] = use.gpuResourceID._impl; g_fb_n++;
-            g_fb_count++;
+            g_fb_count++; if (!listed) g_fb_stale++;
             if (g_fb_count == 1 || g_fb_count == 10 || g_fb_count == 1000 || g_fb_count % 100000 == 0)
-                MLOG("same-pass feedback sampling: snapshot #%llu (frame %llu pass %llu, shader %s slot %d samples attachment %d ser=%llu %lux%lu format %lu)", (unsigned long long)g_fb_count, (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass + !g_enc,
-                     fs->key, b->reg, k, (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long)base.pixelFormat);
+                MLOG("same-pass feedback sampling: snapshot #%llu, %llu of them of an attachment written earlier in its pass (frame %llu pass %llu, shader %s slot %d samples attachment %d ser=%llu %lux%lu format %lu%s)", (unsigned long long)g_fb_count, (unsigned long long)g_fb_stale,
+                     (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass + !g_enc, fs->key, b->reg, k, (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long)base.pixelFormat, listed ? ", feedback_snap" : "");
             PD("N %llu same-pass feedback sampling: attachment %d ser=%llu level %d layer %d copied into a snapshot; this draw samples the snapshot", g_stat_pass + !g_enc, k, (unsigned long long)ser, lv, sl);
         } }
     if (g_fb_n) { g_fb_seq = g_draw_seq; args_dirty_all(); g_fb_rebind = 1; }
@@ -7408,6 +7424,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
 #endif
     udc_note_draw(pr);
     swrite_note(pr);
+    fb_note_draw(pr);
     if (g_geo_program) {
         enc_r_draw_indexed_indirect(en, mp, MTLIndexTypeUInt32, g_geo_indices, g_geo_index_bytes, g_geo_args);
         return;
@@ -8048,6 +8065,7 @@ static void clear_tex_tri(id<MTLTexture> t, unsigned lv, unsigned l0, const p_cl
     }
 }
 static void clr_note(int slot, int depth, int stencil) {   // as udc_note_draw for a draw: the attachment was written (zero-source skip, unwritten-attachment store)
+    if (slot >= 0 && slot < 8) g_fb_wrote |= (uint8_t)(1u << slot);
     if (slot >= 0 && R.rt.color[slot]) { zskip_del(R.rt.color[slot]->serial); g_zskip_cand_ok[slot] = 0; }
     for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i];
         if ((t->depth == 0 && slot >= 0 && t->idx == slot) || (t->depth == 1 && depth) || (t->depth == 2 && stencil)) { t->wrote = 1; t->wwhy = 2; } }
