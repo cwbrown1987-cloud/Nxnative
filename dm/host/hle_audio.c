@@ -318,12 +318,65 @@ static Result au_start_at(void *g, void *lr) {
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE", "start playback", Result, h_au_Start, void *g) { return au_start_at(g, __builtin_return_address(0)); }
-static void au_stop_at(void *g, void *lr) {   // lr NULL: the stop inside Close, not logged separately
+// StopAudioOut must return every pending buffer to the client. Once the
+// backend has stopped, no consumer remains to release them naturally.
+// FMOD waits on the release event before it terminates its audio thread.
+static void release_pending_on_stop(aout *a) {
+    int released = 0;
+
+    pthread_mutex_lock(&a->m);
+
+    uint32_t qh = atomic_load_explicit(&a->q_head, memory_order_relaxed);
+    uint32_t qt = atomic_load_explicit(&a->q_tail, memory_order_acquire);
+    uint32_t rh = atomic_load_explicit(&a->rel_head, memory_order_acquire);
+    uint32_t rt = atomic_load_explicit(&a->rel_tail, memory_order_relaxed);
+
+    while (qh != qt) {
+        if (rt - rh >= RELMAX)
+            die("AudioOut released queue overflow while stopping");
+
+        a->rel[rt & (RELMAX - 1)] = a->q[qh & (QMAX - 1)];
+        rt++;
+        qh++;
+        released++;
+    }
+
+    atomic_store_explicit(&a->rel_tail, rt, memory_order_release);
+    atomic_store_explicit(&a->q_head, qh, memory_order_release);
+    a->pos = 0;
+
+    pthread_mutex_unlock(&a->m);
+
+    if (released) {
+        LOG("audio #%d Stop returned %d pending buffers", a->id, released);
+
+        if (a->event)
+            notify_release(a);
+
+        if (a->rel_sem)
+            dispatch_semaphore_signal(a->rel_sem);
+    }
+}
+static void au_stop_at(void *g, void *lr) {
     aout *a = ao(g);
     pthread_mutex_lock(&g_aos_lock);
     int was = atomic_exchange_explicit(&a->state, STATE_STOPPED, memory_order_acq_rel);
+
+    uint32_t qh = atomic_load_explicit(&a->q_head, memory_order_acquire);
+    uint32_t qt = atomic_load_explicit(&a->q_tail, memory_order_acquire);
+    uint32_t rh = atomic_load_explicit(&a->rel_head, memory_order_acquire);
+    uint32_t rt = atomic_load_explicit(&a->rel_tail, memory_order_acquire);
+
+    LOG("[AUDIOSTOPDBG] audio #%d pending=%u released=%u pos=%llu event=%p",
+        a->id,
+        qt - qh,
+        rt - rh,
+        (unsigned long long)a->pos,
+        a->event);
+
     if (lr) au_note(a, was == STATE_STARTED ? "Stop" : "Stop (already stopped)", lr);
-    backend_stop(a);   // the AudioUnit, or the silent sink (including one that took over during suspension)
+    backend_stop(a);
+    release_pending_on_stop(a);
     pthread_mutex_unlock(&g_aos_lock);
 }
 HLE_FORCE("_ZN2nn5audio12StopAudioOutEPNS0_8AudioOutE", "stop playback", void, h_au_Stop, void *g) { au_stop_at(g, __builtin_return_address(0)); }

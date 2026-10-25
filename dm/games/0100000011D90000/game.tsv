@@ -1,0 +1,34 @@
+# Pokémon Brilliant Diamond 1.0.0, Unity 2019.4.27f1, SDK 11.4.3
+
+# ---- Identity ----
+title_id	0100000011D90000
+program_id	0100000011D90000
+
+# ---- App ----
+name	Pokémon Brilliant Diamond
+ipa	PokMonBrilliantDiamond.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v0	1.0.0	main=f87fc6075104ec4d9642a4aa6bb22216	subsdk0=507f19d1240d09d00992248e8a0fd77e	sdk=2d369d9999e3e10e665106f840ffff9b
+package	v0
+shader_versions	v0
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 sdk
+romfs_marker	Data/resources.assets
+zip_store	.assets:.dat:.en:.fr:.ge:.h:.it:.jp:.ko:.ress:.si:.sp:.tr:.metallib
+
+# ---- Memory ----
+# the NPDM declares 16 MB of system resource (virtual address memory) and main sets a heap: a 5 GB block with a large alias region; the heap check sizes the heap region from the heap the game asks for
+mem_reserve	0x140000000
+mem_alias	0x118000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 16 MB of system resource
+sys_resource	0x1000000
+
+# ---- Shader split ----
+shader_groups	/Data/=data
+shader_note	Pokémon Brilliant Diamond shaders
