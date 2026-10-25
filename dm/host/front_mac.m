@@ -17,6 +17,7 @@
 #include "haptics_apple.h"
 #include <signal.h>
 #include <math.h>
+#pragma clang section bss="" data=""   // process-lifetime statics, not reset by a program switch (dm_run.h): the Mac front end
 
 static CAMetalLayer *g_layer;
 static uint64_t g_btn;
@@ -233,7 +234,7 @@ void front_run(void (*guest)(void)) {
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
-        win.title = @DM_GAME_NAME;   // the game profile's name (game name label)
+        win.title = @(DM_GAME_NAME);   // the game profile's name (game name label)
         // Fullscreen: without FullScreenPrimary the green button only zooms the window. The present path already scales
         // the game picture to fit the drawable with black bars around it, so fullscreen keeps the game's aspect ratio.
         win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
@@ -253,7 +254,7 @@ void front_run(void (*guest)(void)) {
         // Main menu: AppKit runs ⌘ shortcuts only through menu items, so ⌘Q quits and ⌃⌘F toggles fullscreen from here (AppKit shows the item as Globe-F and keeps ⌃⌘F as a hidden twin)
         NSMenu *bar = [NSMenu new], *app = [NSMenu new], *wm = [[NSMenu alloc] initWithTitle:@"Window"];
         [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:app];
-        [app addItemWithTitle:@"Quit " DM_GAME_NAME action:@selector(terminate:) keyEquivalent:@"q"];
+        [app addItemWithTitle:[@"Quit " stringByAppendingString:@(DM_GAME_NAME)] action:@selector(terminate:) keyEquivalent:@"q"];
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         NSApp.mainMenu = bar;
@@ -292,6 +293,10 @@ void front_run(void (*guest)(void)) {
         [NSApp run];
     }
 }
+
+// Offline HTML pages (web_apple.m): the page's view covers the game view and resizes with it; it is the first responder while shown (front_web_show), and the game view again after
+void front_web_attach(NSView *box) { NSView *v = g_win.contentView; box.frame = v.bounds; [v addSubview:box]; }
+void front_web_detach(NSView *box) { if (box.window && box.window.firstResponder != box.window.contentView) [box.window makeFirstResponder:box.window.contentView]; }
 
 // Software keyboard input box (front.h): the main thread shows an NSAlert + text field and the guest thread waits synchronously for the result. Not shown in windowless mode (returns -1, the caller treats it as cancel)
 extern int g_swkbd_min_chars;   // hle_swkbd.c: this input's minimum length from ShowKeyboardArg; the applet keeps OK disabled until the text is long enough

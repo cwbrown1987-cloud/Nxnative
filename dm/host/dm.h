@@ -1,5 +1,6 @@
 // Common header of the native Switch host (multi-module).
 #pragma once
+#include "dm_run.h"   // per-run statics (progswitch.c)
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -62,6 +63,9 @@ module_t *nro_find(const uint8_t sha256[32]);   // the mapped NRO with this hash
 int nro_refused(const uint8_t sha256[32]);      // an NRO the pack refused (an online SDK, nro.tsv "refused")
 void nro_load(module_t *m);     // relocate an NRO against the loaded modules and bind the earlier modules' imports it defines (the caller runs its init)
 void nro_unload(module_t *m);   // take an NRO out of the lookups and bind the imports that pointed into it again
+void nro_load_alone(module_t *m);   // relocate an NRO against itself only, outside the lookups (a JIT plugin, hle_jit.c)
+const char *dm_jit_serve_dir(void);   // where a served nn::jit image is (loader.c; NULL: the plugin runs)
+uint8_t *dm_jit_layout_base(void);    // the image's layout reservation: the code memory at its start, the modules after it
 void *module_sym(module_t *m, const char *name);
 int dm_sdk_major(void);   // SDK major version from the sdk module's version string (loader.c); 0 = unknown
 #define DM_SDK_OLD(major) ((major) > 0 && (major) <= 10)   // SDK 10 and older: NVN API 53, the shared-font address points at the TTF itself
@@ -112,3 +116,8 @@ void dm_gfx_enter(void); void dm_gfx_leave(void);   // hle_nvn.c: the gate dm_gf
 void dm_gfx_shot_at(long k, const char *path);
 void dm_shot_written(const char *path, int ok);   // The graphics side finished writing a screenshot to disk (diag.c: DM_TICK_HOLD=E:SHOT unfreezes on this)
 void dm_host_shutdown(const char *why);   // Graceful exit (crash.c): stop background threads and audio, drain graphics, then _exit(0); used by SIGTERM and the iOS App termination callback   // graphics side: screenshot of the k-th frame after the current presented frame (nvn_mtl.m)
+void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg);   // the same, then runs then(arg) in place of _exit (hle_oe.c: the next program of DM_PROGRAMS)
+// The end of a run (an in-process program switch, progswitch.c): dm_terminating is 1 once every guest thread is to leave; host code that a guest thread runs, holding no
+// host lock, leaves through dm_thread_term_check (hle_thread.c) where it would otherwise wait in host code for something that no longer comes
+int dm_terminating(void);
+void dm_thread_term_check(void);

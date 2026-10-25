@@ -5,7 +5,7 @@ Writes <out dir>/<name>.nro for each registered NRO found and <out dir>/nro.tsv 
 An online SDK (ONLINE_SDKS: Epic Online Services, by its export EOS_Platform_Create) is listed with the name 'refused' and not written: the host refuses to load it.
 <nrr name> picks one NRR (default: every NRR; Super Smash Bros. Ultimate 13.0.5 ships 14, one per release, cross2_130004.nrr the newest, with the 98 current hashes).
 The game passes nn::ro::LoadModule the NRO's bytes; the host finds the rewritten copy by that SHA-256 (hle_ro.c), so the names here are only labels: nro<index> in hash order.
-Where: a loose file whose bytes at +0x10 are NRO0 (Hades and Hades II ship their EOS SDK so); the .nro files among the current files of an archive with an index (Super Smash Bros. Ultimate's data.arc,
+Where: a loose file whose bytes at +0x10 are NRO0 (Hades and Hades II ship their EOS SDK so); a Hagi .nrolz file (Super Mario 3D All-Stars' Sunshine: its recompiled PowerPC code, LZ4); the .nro files among the current files of an archive with an index (Super Smash Bros. Ultimate's data.arc,
 read by dm/gfx/tools/smash_arc.py: 98 NROs, while the NRRs of every older release also register 666 superseded copies the archive still holds, which are left out); else a scan of the
 other RomFS files for stored NROs and zstd frames that inflate to one (on data.arc: all 764 registered hashes in 7 minutes)."""
 import hashlib, mmap, os, struct, sys
@@ -38,6 +38,15 @@ def nro_size(h):   # an NRO header's total size, or 0 when the bytes are not one
     if len(h) < 0x40 or h[0x10:0x14] != b'NRO0': return 0
     n = struct.unpack_from('<I', h, 0x18)[0]
     return n if 0x40 < n < 1 << 30 else 0
+
+
+def nrolz(head, p):   # a Hagi .nrolz file (Super Mario 3D All-Stars' Sunshine: data/gekko/<game>/nx/<game>.nrolz): the NRO's size big-endian, then the NRO as one LZ4 block; the NRO or None
+    n = struct.unpack_from('>I', head)[0]
+    if not 0x40 < n < 1 << 30: return None
+    import lz4.block
+    try: body = lz4.block.decompress(open(p, 'rb').read()[4:], uncompressed_size=n)
+    except Exception: return None
+    return body if nro_size(body) == n else None
 
 
 def frame(mm, p, zstd):
@@ -104,6 +113,9 @@ def main():
             if nro_size(head) == sz:
                 body = open(p, 'rb').read(); h = hashlib.sha256(body).digest()
                 if h in want: found[h] = (os.path.relpath(p, romfs), 'loose', body)
+            elif f.endswith('.nrolz') and (body := nrolz(head, p)):
+                h = hashlib.sha256(body).digest()
+                if h in want: found[h] = (os.path.relpath(p, romfs), 'nrolz', body)
             elif head[:8] == smash_arc.MAGIC:
                 # an archive with an index (Super Smash Bros. Ultimate's data.arc): the .nro files among its current files. Its superseded copies, which every older release's NRR still
                 # registers (764 hashes in 14 NRRs, 98 current), are never loaded and are left out

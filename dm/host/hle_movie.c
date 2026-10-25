@@ -138,6 +138,9 @@ static void md_event(mdec_t *d, int i) {   // 0 input 1 output 2 format 3 error
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size);
 static pthread_mutex_t g_dfmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_dfcv = PTHREAD_COND_INITIALIZER;
 static struct { void *d; int ev; uint64_t due; } g_dfq[64]; static int g_ndfq, g_dfthr;
+// Live decoders (their guest objects), so the end of the run can free the ones the game did not destroy (dm_movie_end_run)
+#define MD_LIVE 64
+static void **g_live[MD_LIVE]; static int g_nlive; static pthread_mutex_t g_live_mu = PTHREAD_MUTEX_INITIALIZER;
 static void md_defer_body(void *arg);
 static void md_defer_at(void *d, int ev, uint64_t due) {
     pthread_mutex_lock(&g_dfmu);
@@ -158,6 +161,7 @@ static void md_defer_body(void *arg) {
     (void)arg;
     pthread_mutex_lock(&g_dfmu);
     for (;;) {
+        if (dm_terminating()) { pthread_mutex_unlock(&g_dfmu); dm_thread_term_check(); pthread_mutex_lock(&g_dfmu); }   // the run ends: this guest thread leaves (dm_movie_wake)
         uint64_t now = now_ns(), next = 0; int k = -1;
         for (int i = 0; i < g_ndfq && k < 0; i++) { if (g_dfq[i].due <= now) k = i; else if (!next || g_dfq[i].due < next) next = g_dfq[i].due; }
         if (k >= 0) {
@@ -498,12 +502,14 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
     if (pthread_create(&d->wk, &a, md_worker, d)) die("movie: failed to create the decoder thread");
     pthread_attr_destroy(&a);
     self[1] = d;
+    pthread_mutex_lock(&g_live_mu); if (g_nlive < MD_LIVE) g_live[g_nlive++] = self; pthread_mutex_unlock(&g_live_mu);
     LOG("[movie] decoder %p: type %d output %d mode %d priority %d", (void *)self, type, fmt, mode, prio);
 }
 // SDK 4's constructor has no priority argument (Dark Souls Remastered, NintendoSDK_movie 4.5.0). Without this take-over the SDK built its own decoder and the host's Configure read it as a host one (a call through a null pointer)
 HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE", "movie decoder (SDK 4, no priority): host implementation", void, h_movie_Decoder4,
           void **self, int type, int fmt, int mode) { h_movie_Decoder(self, type, fmt, mode, 0); }
 static void md_free(void **self) {
+    pthread_mutex_lock(&g_live_mu); for (int i = 0; i < g_nlive; i++) if (g_live[i] == self) { g_live[i] = g_live[--g_nlive]; break; } pthread_mutex_unlock(&g_live_mu);
     mdec_t *d = md_of(self); if (!d) return;
     md_defer_drop(d);
     self[1] = NULL;
@@ -781,3 +787,11 @@ HLE_FORCE("_ZN5movie7Decoder24ReleaseOutputBufferIndexEi", "movie decoder: relea
     return 0;
 }
 HLE_FORCE("_ZN5movie7Decoder12GetLastErrorEv", "movie decoder: last error (none)", int, h_movie_LastErr, void **self) { (void)self; return 0; }
+// End of the run (an in-process program switch, progswitch.c). dm_movie_wake: the deferred-event thread, a guest thread waiting in host code, is woken to leave.
+// dm_movie_end_run, with no guest thread left: every decoder the game did not destroy is freed (its worker and libvpx's threads end, its VideoToolbox session closes)
+void dm_movie_wake(void) { pthread_mutex_lock(&g_dfmu); pthread_cond_broadcast(&g_dfcv); pthread_mutex_unlock(&g_dfmu); }
+void dm_movie_end_run(void) {
+    int n = 0;
+    for (;;) { pthread_mutex_lock(&g_live_mu); void **self = g_nlive ? g_live[0] : NULL; pthread_mutex_unlock(&g_live_mu); if (!self) break; md_free(self); n++; }
+    if (n) LOG("end of the run: %d movie decoder(s) freed", n);
+}

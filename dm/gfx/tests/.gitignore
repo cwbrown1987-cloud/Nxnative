@@ -82,3 +82,7 @@ t_stencil_view
 t_stencil_view.dSYM/
 t_pso_archive
 t_pso_archive.dSYM/
+t_fb_stale
+t_fb_stale.dSYM/
+t_vk_clear
+t_vk_clear.dSYM/

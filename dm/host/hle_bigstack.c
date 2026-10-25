@@ -15,8 +15,8 @@ int dm_guest_as_contains(uintptr_t a);   // hle_svc.c
 
 #define BS_SIZE (512u << 10)
 #define BS_GUARD 16384u
-static pthread_key_t g_bs_key;
-static pthread_once_t g_bs_once = PTHREAD_ONCE_INIT;
+DM_PROCESS static pthread_key_t g_bs_key;   // process-lifetime (dm_run.h): a thread that outlives a run keeps its big stack under the same key
+DM_PROCESS static pthread_once_t g_bs_once = PTHREAD_ONCE_INIT;
 static void bs_free(void *top) { if (top) munmap((uint8_t *)top - BS_SIZE - BS_GUARD, BS_SIZE + BS_GUARD); }
 static void bs_init(void) { if (pthread_key_create(&g_bs_key, bs_free)) die("big stack pthread_key_create"); }
 

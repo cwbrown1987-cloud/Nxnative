@@ -5,8 +5,8 @@
 #define TLR_SIZE 0x200
 #define THREAD_OBJ_SIZE 0x400
 extern void dm_gate(void);            // entry.S: common gate entry
-static pthread_key_t g_keyown;   // raw pointers of the TLS block / thread-local region this thread allocated (see the end of guest_thread_init)
-static pthread_once_t g_keyown_once = PTHREAD_ONCE_INIT;
+DM_PROCESS static pthread_key_t g_keyown;   // raw pointers of the TLS block / thread-local region this thread allocated (see the end of guest_thread_init); process-lifetime (dm_run.h)
+DM_PROCESS static pthread_once_t g_keyown_once = PTHREAD_ONCE_INIT;
 static void own_free(void *p) { void **own = p; free(own[0]); free(own[1]); free(own); }
 static void own_key_init(void) { if (pthread_key_create(&g_keyown, own_free)) die("cannot create the free key for thread-local blocks"); }
 void guest_thread_init(void) {

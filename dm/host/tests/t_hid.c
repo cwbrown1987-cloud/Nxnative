@@ -18,6 +18,7 @@ void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; }
 void hle_signal_system_event(void *g) { g_signalled = g; g_signals++; }
 int hle_signal_bound_system_event(void *g) { g_signalled = g; g_signals++; return 1; }
 void dm_gfx_texlist(int target) { (void)target; }
+void dm_oe_execute_from_host(int index) { (void)index; }   // hle_oe.c: DM_CTL "program <n>", not driven here
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
 void dm_ctl_peek(uint64_t a, int n) { (void)a; (void)n; }
 void dm_ctl_memdump(uint64_t a, uint64_t n, const char *path) { (void)a; (void)n; (void)path; }
@@ -146,10 +147,38 @@ static void t_vibration(void) {
     CHECK(!h_hid_VibPermit(), "disconnecting the last output disables vibration");
 }
 
+// A library applet in front (the offline web page, hle_web.c): the game reads nothing while it holds the input, presses made meanwhile are not delivered afterwards,
+// and the applet's own reader sees every controller and short taps between two of its reads
+static void t_applet(void) {
+    g_mode = 1; ids((uint32_t[]){0, NPAD_HANDHELD}, 2); dm_pad_players(1);
+    uint64_t b; int32_t a[4];
+    dm_input_peek(&b, a);   // drops the latches of earlier tests
+    dm_input_hold(1);
+    dm_pad_set(DM_BTN_A, 1000, 0, 0, 0);
+    CHECK(buttons_of(NPAD_NO1, STYLE_FULLKEY) == 0 && lx_of(NPAD_NO1) == 0, "held input: the game reads no buttons and centred sticks");
+    dm_input_peek(&b, a);
+    CHECK(b == DM_BTN_A && a[0] == 1000, "the applet reads the controller while it holds the input");
+    dm_pad_set(0, 0, 0, 0, 0); dm_input_set(DM_BTN_DOWN, 0, 0, 0, 0); dm_input_set(0, 0, 0, 0, 0);
+    dm_input_peek(&b, a);
+    CHECK(b == DM_BTN_DOWN, "a tap between two applet reads is reported once");
+    dm_input_peek(&b, a);
+    CHECK(b == 0, "and then released");
+    dm_pad_set_player(1, DM_BTN_B, 0, -2000, 0, 0);
+    dm_input_peek(&b, a);
+    CHECK(b == DM_BTN_B && a[1] == -2000, "the applet reads every player's controller");
+    dm_pad_set_player(1, 0, 0, 0, 0, 0);
+    dm_input_hold(0);
+    CHECK(buttons_of(NPAD_NO1, STYLE_FULLKEY) == 0, "presses made while held are not delivered to the game afterwards");
+    dm_pad_set(DM_BTN_X, 0, 0, 0, 0);
+    CHECK(buttons_of(NPAD_NO1, STYLE_FULLKEY) == DM_BTN_X, "released: the game reads the controller again");
+    dm_pad_set(0, 0, 0, 0, 0);
+}
+
 int main(void) {
     t_slots();
     t_npads();
     t_vibration();
+    t_applet();
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

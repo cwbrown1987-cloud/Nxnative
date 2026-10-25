@@ -73,6 +73,7 @@ The guest address space, heaps, pools, virtual address memory and the allocators
   - [Hollow Knight: Silksong](../../dm/games/010013C00E930000/README.md) (SDK 20.5.8): `sdk+0x145bfc` / `+0x145c68` ([Unity 6 takes its memory with no StandardAllocator and no heap](#unity-6-takes-its-memory-with-no-standardallocator-and-no-heap)).
   - [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) (SDK 20.5.22, the same `sdk` build as [Breath of the Wild](../../dm/games/01007EF00011E000/README.md) 1.9.0): constructor `sdk+0x145cfc`, `+0x145d0c` / `+0x145d78`; no alignment cut (`VammManager::AllocateAddressRegion`, `sdk+0x145df0`, aligns regions to 64 KB or 2 MB only). Its resource heaps live in address regions after the node area: at the first descent from the Great Sky Island the alias region's high-water mark was +2.25 GB of its 2.375 GB with 1.00 GB mapped, and the game took a memory shortage (its frame check at `main+0x1fd32ec` logs `MSF` / `R` / `Rf` and plays the memory-shortage Blood Moon, which puts Link back at the start; GitHub issue #70, 7 of 8 Mac runs from the issue's save). With an 8 GB alias region the mark went on to +2.50 GB; with the cut it stays at +1.75 GB, and neither showed the shortage.
   - [BALL x PIT](../../dm/games/010086A022444000/README.md) (SDK 20.5.19): `sdk+0x145d0c` / `+0x145d78`, the SDK 20.5.22 build's offsets.
+  - [Super Mario 3D All-Stars: Super Mario Sunshine](../../dm/games/010049900F546002/README.md) (SDK 9.5.1, the `sdk` build Super Mario 64 shares): the constructor (`sdk+0xd2de0`) has the `orr` form (`+0xd2df0` / `+0xd2e8c`). Hagi maps the GameCube's 32-bit address space in one 4 GB + 2 MB region, which failed in the 4.25 GB alias region after the 1 GB node area ("Initialization of subsystem MEMORY failed"); with the cuts and a cut of Hagi's own stack region its regions end at +4.16 GB, in a 6 GB block, the most iOS gives one reservation.
 
 ### Size-aligned regions exhaust the alias address space
 
@@ -95,6 +96,7 @@ The guest address space, heaps, pools, virtual address memory and the allocators
   - [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md) (SDK 8.2.1): alignment at `sdk+0x336d5c`, cut as DRAGON QUEST XI S's SDK 7.3.2 build.
   - [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) (SDK 15.3.2, Celeste's `sdk` build): `AllocateAddressRegion`'s alignment at `sdk+0x12e2e0`, as Absolum's did.
   - [Pikmin 4](../../dm/games/0100B7C00933A000/README.md) (SDK 10.4.8): the 10.4.1 build's offsets.
+  - [Super Mario 3D All-Stars: Super Mario Sunshine](../../dm/games/010049900F546002/README.md) (SDK 9.5.1): `VammManager::AllocateAddressRegion` (`sdk+0xd2ef0`) aligns Hagi's 4 GB + 2 MB region to 1 GB (`+0xd2fec`), up to 1 GB lost before it, which its 6 GB layout cannot spare beside the heap.
 - **Note:** FINAL FANTASY RESONANCE's SDK 20.5.17 build aligns regions of 2 MB and more to 2 MB only (`VammManager::AllocateAddressRegion`, `sdk+0x145e00`), so it needs no alignment cut.
 
 ### Unity 6 takes its memory with no StandardAllocator and no heap

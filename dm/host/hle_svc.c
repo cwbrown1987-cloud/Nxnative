@@ -17,6 +17,7 @@
 // with an 8 GB reservation, builds from developer accounts that cannot sign that entitlement (free accounts) would exit at this step.
 #define RESERVE DM_GAME_MEM_RESERVE   // SMBW: the heap needs only 1.47 GB, so the block stays at 5 GB (the total proven on a real device; a single 6 GB block can be reserved, but Metal etc. still need address space)
 static uint8_t *g_as;              // ASLR region base = the whole block
+static size_t g_as_len;            // its size as reserved (RESERVE follows the running program's profile in an app of several programs)
 static uint8_t *g_heap; static _Atomic size_t g_heap_cur; static size_t g_heap_cap;
 // The address range lies entirely within the currently opened (readable and writable) part of the guest heap: such reads need no kernel trap to check, memcpy directly (used where guest memory is read every tick, such as diag.c tk_rd)
 int dm_guest_heap_readable(uint64_t a, size_t n) { uint64_t b = (uint64_t)(uintptr_t)g_heap; size_t cur = g_heap_cur; return g_heap && a >= b && n <= cur && a - b <= cur - n; }
@@ -36,6 +37,7 @@ static void mem_init_once(void) {
         die("guest address-space profile has invalid native boundaries");
     g_as = mmap(NULL, RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (g_as == MAP_FAILED) die("reserve guest AS");
+    g_as_len = RESERVE;
     // Fixed partition (all inside the reserved block): alias 2.875 GB, stack 256 MB, heap the remaining 1.625 GB.
     // In newer SDKs the AddressRegionManager always takes 0x3fe00000 (~1 GB) at the start of the alias region as its node area (sdk 0x134728) before handing out regions; with a 512 MB alias region the very first AllocateAddressRegion fails (0x1803).
     // SMBW also defines a 1792000 KB (1.75 GB) VirtualAddressMemory in HeapDef (System/HeapSize): it is subtracted from the memory pool before the heap is opened (SetHeapSize asks for only 0x5be00000),
@@ -504,4 +506,10 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (!g_seen[num & 0xff]) { g_seen[num & 0xff] = 1; LOG("SVC %#x x0=%#llx x1=%#llx x2=%#llx (placeholder returns success)", num, regs[0], regs[1], regs[2]); }
         regs[0] = 0; return 0;
     }
+}
+// End of the run (an in-process program switch, progswitch.c), with no guest thread left and every subsystem done with guest memory: the guest address space goes,
+// heap, alias region and thread stacks with it, before the next program reserves its own (iOS allows one such reservation at a time)
+void dm_svc_end_run(void) {
+    if (g_as) { if (munmap(g_as, g_as_len)) LOG("[RED] end of the run: the guest address space could not be unmapped (errno %d)", errno); else LOG("end of the run: guest address space %p +%#zx unmapped", g_as, g_as_len); }
+    free(g_alias_bits);
 }

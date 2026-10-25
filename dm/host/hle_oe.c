@@ -2,9 +2,13 @@
 // oe::Initialize is in hle_sdkinit.c, not here.
 // Environment switches: DM_OPMODE=0 handheld / 1 console (default: the profile's op_mode, console unless set; console corresponds to the console-mode render profile); DM_LANG=language code (default en-US; the iOS app sets it from the IPA's DMLanguage, main.m).
 #include "hle.h"
+#include "front.h"
+#include "progswitch.h"
 
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
 #include <stdatomic.h>
+#include <errno.h>
+#include <unistd.h>
 static _Atomic int g_opmode = -1;
 int dm_opmode(void) {
     int m = g_opmode;
@@ -81,15 +85,131 @@ HLE_FORCE("_ZN2nn2oe15EnableRecordingEv", "video recording switch; the host has 
 // Applet resource user ID (ARUID, the number am assigns to this process): the host has no am, and the SDK's own getter returns 0. SDK 20's OpenAudioRenderer (the CPU rendering + manual execution path, sdk+0x221730)
 //   aborts when it gets 0 (The Legend of Zelda: Breath of the Wild 1.9.0); SDK 16 did not check. Report a fixed non-zero ID, used only as an identifier
 HLE_FORCE("_ZN2nn6applet23GetAppletResourceUserIdEv", "applet resource user ID; the host returns a fixed non-zero value", uint64_t, h_applet_Aruid, void) { return 0x80; }
-// Launch parameter (present only when another program launched this one with one; returns bool): the host never passes one
-HLE_FORCE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", "launch parameter: none", unsigned, h_oe_PopLaunchParam, size_t *out, void *buf, size_t n) { (void)buf; (void)n; if (out) *out = 0; return 0; }
+// Launch parameter (present only when another program launched this one with one; returns bool, popped once as on Horizon). DM_LAUNCH_PARAM=<file>: its bytes are the parameter, as the
+// launching program passed them to oe::ExecuteProgram (Super Mario 3D All-Stars' menu hands each game 16 bytes: its LanguageCode and two volumes; Sunshine started without one quits at boot)
+HLE_FORCE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", "launch parameter: the bytes of DM_LAUNCH_PARAM's file, once; none without it", unsigned, h_oe_PopLaunchParam, size_t *out, void *buf, size_t n) {
+    static _Atomic int popped; const char *f = getenv("DM_LAUNCH_PARAM");
+    if (out) *out = 0;
+    if (!f || atomic_exchange(&popped, 1)) return 0;
+    FILE *fp = fopen(f, "rb");
+    if (!fp) { LOG("[RED] oe::TryPopLaunchParameter: cannot open DM_LAUNCH_PARAM %s", f); return 0; }
+    size_t got = buf ? fread(buf, 1, n, fp) : 0; fclose(fp);
+    LOG("oe::TryPopLaunchParameter: %zu bytes from %s", got, f);
+    if (out) *out = got;
+    return 1;
+}
 // Tears of the Kingdom (SDK 20.5.22): the index of the program that launched this one in a multi-program application. The SDK asks the applet proxy, which the host never opens
 // (null read in applet::GetPreviousProgramIndex right after the window setup); -1 = launched from the home menu
 HLE_FORCE("_ZN2nn2oe23GetPreviousProgramIndexEv", "previous program index: launched from HOME, -1", int, h_oe_PrevProgram, void) { return -1; }
-// Launch another program of a multi-program application (Octopath Traveler 0 imports it); on hardware it does not return. The host has only this program: logged, and the game carries on
-HLE_FORCE("_ZN2nn2oe14ExecuteProgramEiPKvm", "launch another program of the application: the host runs only this one (logged)", void, h_oe_ExecProgram, int index, const void *param, size_t n) {
-    (void)param; LOG("[RED] oe::ExecuteProgram(%d, %zu bytes of parameters): the host runs only this program; the game carries on", index, n);
+// The programs of a multi-program application on the Mac: DM_PROGRAMS=<file> (build_ipa_from_nsp.py writes it beside program 0's work folder) has one row per packed program,
+// "<index>\t<KEY=VALUE>\t…": exe= its host, arg= its rewritten modules, cwd= its run folder, and its environment (DM_ROOT, DM_ROMFS, DM_SAVE, DM_MSL_DIR, …). oe::ExecuteProgram
+// then ends this program as Horizon does and starts the named one in its place: execve of its host after the graceful exit, with this environment less every key a row sets,
+// then the row's keys and DM_LAUNCH_PARAM=<cwd>/launch_param.bin holding the parameters. One run command plays Super Mario 3D All-Stars' menu, the game it starts, and back
+typedef struct { const char *exe, *arg, *cwd, *param; char **env; int index; } prog_plan;
+static int row_has_key(const char *row, const char *kv) {   // the row (tab-separated, its index first) sets the key of kv ("KEY=…")
+    size_t kl = strcspn(kv, "=");
+    for (const char *f = strchr(row, '\t'); f && f[1]; f = strchr(f + 1, '\t')) if (!strncmp(f + 1, kv, kl) && f[1 + kl] == '=') return 1;
+    return 0;
 }
+// 1 and the plan for program index (out), 0 when no row names it. tsv: the file's text (lines that do not start with a digit are comments); envp: this process's environment
+static int prog_plan_make(const char *tsv, int index, char *const *envp, prog_plan *out) {
+    memset(out, 0, sizeof *out);
+    char *text = strdup(tsv), *rows[64]; int nr = 0, hit = -1;   // text stays allocated: the plan points into it until the execve
+    for (char *ln = strtok(text, "\n"); ln && nr < 64; ln = strtok(NULL, "\n")) {
+        size_t n = strlen(ln); if (n && ln[n - 1] == '\r') ln[--n] = 0;
+        if (*ln < '0' || *ln > '9') continue;
+        if (atoi(ln) == index) hit = nr;
+        rows[nr++] = ln;
+    }
+    if (hit < 0) { free(text); return 0; }
+    size_t ne = 0; while (envp && envp[ne]) ne++;
+    char **env = calloc(ne + 66, sizeof *env); size_t k = 0;
+    for (size_t i = 0; i < ne; i++) {   // this environment, less the old launch parameter and every key a program's row sets (the old program's own, such as DM_AOC_DIR)
+        int set = !strncmp(envp[i], "DM_LAUNCH_PARAM=", 16);
+        for (int r = 0; r < nr && !set; r++) set = row_has_key(rows[r], envp[i]);
+        if (!set) env[k++] = envp[i];
+    }
+    int field = 0;
+    for (char *f = strtok(rows[hit], "\t"); f; f = strtok(NULL, "\t")) {
+        if (!field++) continue;   // the index
+        if (!strncmp(f, "exe=", 4)) out->exe = f + 4;
+        else if (!strncmp(f, "arg=", 4)) out->arg = f + 4;
+        else if (!strncmp(f, "cwd=", 4)) out->cwd = f + 4;
+        else if (strchr(f, '=') && k < ne + 64) env[k++] = f;
+    }
+    if (!out->exe || !out->arg || !out->cwd) { free(env); free(text); memset(out, 0, sizeof *out); return 0; }
+    char *pp = malloc(strlen(out->cwd) + 20); sprintf(pp, "%s/launch_param.bin", out->cwd); out->param = pp;
+    char *pe = malloc(strlen(pp) + 17); sprintf(pe, "DM_LAUNCH_PARAM=%s", pp); env[k++] = pe; env[k] = NULL;
+    out->env = env; out->index = index;
+    return 1;
+}
+static void prog_exec(void *p) {
+    const prog_plan *P = p; char *argv[] = {(char *)P->exe, (char *)P->arg, NULL};
+    if (chdir(P->cwd)) LOG("[RED] oe::ExecuteProgram: cannot enter %s", P->cwd);
+    execve(P->exe, argv, P->env);
+    LOG("[RED] oe::ExecuteProgram: cannot start %s (errno %d)", P->exe, errno);
+}
+// DM_PROGRAM_SWITCH=inproc (progswitch.c): the plan's environment becomes this process's once the run's statics are reset -- every variable the plan does not carry is
+// dropped and the plan's are set, as execve would have started the host -- with DM_PROGRAM naming the program for the table of profiles, and its run folder as the
+// working folder. Returns its modules folder
+static const char *prog_env_apply(void *p) {
+    const prog_plan *P = p; extern char **environ;
+    for (int again = 1; again; ) {
+        again = 0;
+        for (char **e = environ; *e && !again; e++) {
+            size_t kl = strcspn(*e, "="); int keep = 0;
+            for (char **k = P->env; *k && !keep; k++) keep = !strncmp(*k, *e, kl) && (*k)[kl] == '=';
+            if (!keep) { char key[256]; snprintf(key, sizeof key, "%.*s", (int)kl, *e); unsetenv(key); again = 1; }
+        }
+    }
+    for (char **k = P->env; *k; k++) { const char *eq = strchr(*k, '='); char key[256]; snprintf(key, sizeof key, "%.*s", (int)(eq - *k), *k); setenv(key, eq + 1, 1); }
+    char ix[16]; snprintf(ix, sizeof ix, "%d", P->index); setenv("DM_PROGRAM", ix, 1);
+    if (chdir(P->cwd)) LOG("[RED] program switch: cannot enter %s", P->cwd);
+    return P->arg;
+}
+static void prog_exec_fallback(void *p) { dm_host_shutdown_then("ExecuteProgram", prog_exec, p); }
+// The iOS app sets the next program's environment itself (main.m); NULL = it cannot
+__attribute__((weak)) const char *front_program_env(void *index) { (void)index; return NULL; }
+static const char *prog_name(int index);
+static void exec_out_fallback(void *p) { int index = (int)(intptr_t)p; front_program_handoff(index, prog_name(index)); dm_host_shutdown("ExecuteProgram"); }   // D-1's hand-off
+static const char *prog_name(int index) {   // the profile's name of program index in an app of several programs (game.py header-multi), NULL otherwise
+#ifdef DM_GAME_MULTI
+    for (size_t i = 0; i < sizeof dm_games / sizeof *dm_games; i++) if (dm_games[i].program == index) return dm_games[i].name;
+#endif
+    (void)index; return NULL;
+}
+// Launch another program of a multi-program application (Octopath Traveler 0 imports it); on hardware it does not return: this process ends and the other program starts with the
+// parameters as its launch parameter (TryPopLaunchParameter). With DM_PROGRAMS the host starts it itself (above). With DM_EXEC_OUT=<file> (the iOS app's Documents, main.m) it writes
+// the program index (4 bytes, little-endian) and the parameters to that file and exits, and whoever starts it next starts that program (Super Mario 3D All-Stars' menu hands each
+// game 16 bytes, its LanguageCode and two volumes); the front end first names the program and schedules a notification that opens the app again (front_program_handoff). Without either the host has only this program: logged, and the game carries on
+HLE_FORCE("_ZN2nn2oe14ExecuteProgramEiPKvm", "launch another program of the application: DM_PROGRAMS starts it in this process's place, DM_EXEC_OUT records it and the process ends; else logged", void, h_oe_ExecProgram, int index, const void *param, size_t n) {
+    char hex[3 * 32 + 1] = ""; for (size_t i = 0; i < n && i < 32; i++) snprintf(hex + 3 * i, 4, " %02x", ((const uint8_t *)param)[i]);
+    const char *pf = getenv("DM_PROGRAMS");
+    if (pf && *pf) {
+        DM_PROCESS static prog_plan P;   // process-lifetime: an in-process switch applies it after the run's statics are reset
+        char *tsv = NULL; FILE *fp = fopen(pf, "rb");
+        if (fp) { fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); tsv = calloc(1, (size_t)sz + 1); if (fread(tsv, 1, (size_t)sz, fp) != (size_t)sz) { free(tsv); tsv = NULL; } fclose(fp); }
+        extern char **environ;
+        if (!tsv || !prog_plan_make(tsv, index, environ, &P)) { LOG("[RED] oe::ExecuteProgram(%d, %zu bytes of parameters:%s): DM_PROGRAMS %s has no program %d; the game carries on", index, n, hex, pf, index); free(tsv); return; }
+        FILE *po = fopen(P.param, "wb");
+        if (!po || (n && fwrite(param, n, 1, po) != 1) || fclose(po)) { LOG("[RED] oe::ExecuteProgram(%d): cannot write %s; the game carries on", index, P.param); if (po) fclose(po); return; }
+        LOG("oe::ExecuteProgram(%d, %zu bytes of parameters:%s): this program ends, %s %s starts in %s", index, n, hex, P.exe, P.arg, P.cwd);
+        if (prog_name(index)) { dm_switch_req r = {index, prog_env_apply, &P, prog_exec_fallback, &P}; if (dm_program_switch_request(&r)) return; }   // this host holds the program's profile
+        dm_host_shutdown_then("ExecuteProgram", prog_exec, &P);
+        return;
+    }
+    const char *f = getenv("DM_EXEC_OUT");
+    if (!f || !*f) { LOG("[RED] oe::ExecuteProgram(%d, %zu bytes of parameters:%s): the host runs only this program; the game carries on (DM_PROGRAMS or DM_EXEC_OUT=<file> hands it over)", index, n, hex); return; }
+    FILE *fp = fopen(f, "wb"); int32_t ix = index;
+    if (!fp || fwrite(&ix, 4, 1, fp) != 1 || (n && fwrite(param, n, 1, fp) != 1) || fclose(fp)) { LOG("[RED] oe::ExecuteProgram(%d): cannot write DM_EXEC_OUT %s; the game carries on", index, f); if (fp) fclose(fp); return; }
+    LOG("oe::ExecuteProgram(%d, %zu bytes of parameters:%s) → %s; this program ends", index, n, hex, f);
+    if (prog_name(index)) { dm_switch_req r = {index, front_program_env, (void *)(intptr_t)index, exec_out_fallback, (void *)(intptr_t)index}; if (dm_program_switch_request(&r)) return; }
+    front_program_handoff(index, prog_name(index));   // the iOS app: "Starting <name>…", then a notification that opens it again (front_ios.m)
+    dm_host_shutdown("ExecuteProgram");
+}
+// DM_CTL "program <n>" (hle_hid.c): oe::ExecuteProgram(n) with no parameters, as if the running program had called it, from the control thread (headless runs: the
+// way back to Super Mario 3D All-Stars' menu is a web page the stand-in does not show)
+void dm_oe_execute_from_host(int index) { h_oe_ExecProgram(index, NULL, 0); }
 HLE_FORCE("_ZN2nn2oe16DisableRecordingEv", "video recording switch; the host has no system recording", void, h_oe_DisableRec, void) {}
 // Silence the game's sound in system video captures (through am; FINAL FANTASY RESONANCE imports both): the host records nothing
 HLE_FORCE("_ZN2nn2oe13MuteRecordingEv", "mute the sound of system video recording; the host has no system recording", void, h_oe_MuteRec, void) {}
@@ -193,8 +313,9 @@ HLE_FORCE("_ZN2nn2oe22PopNotificationMessageEv", "system notification queue (blo
     uint32_t m = 0;
     for (;;) {
         pthread_mutex_lock(&g_mq_lock);
-        while (!g_mqn) pthread_cond_wait(&g_mq_cond, &g_mq_lock);
+        while (!g_mqn && !dm_terminating()) pthread_cond_wait(&g_mq_cond, &g_mq_lock);
         pthread_mutex_unlock(&g_mq_lock);
+        dm_thread_term_check();
         if (h_oe_TryPopMsg(&m)) return m;   // another thread may have taken it in between: wait again
     }
 }
@@ -231,3 +352,5 @@ HLE_FORCE("_ZN2nn2oe17GetPseudoDeviceIdEPNS_4util4UuidE", "pseudo device ID; a f
     static const uint8_t k[16] = {0x78, 0x62, 0x6c, 0x00, 0x53, 0x57, 0x4e, 0x41, 0x54, 0x49, 0x56, 0x45, 0x31, 0x30, 0x30, 0x31};
     memcpy(uuid, k, 16);
 }
+// The end of the run (progswitch.c): a guest thread waiting for a notification is woken to leave
+void dm_oe_wake(void) { pthread_mutex_lock(&g_mq_lock); pthread_cond_broadcast(&g_mq_cond); pthread_mutex_unlock(&g_mq_lock); }

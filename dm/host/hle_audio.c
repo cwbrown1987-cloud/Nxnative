@@ -37,6 +37,7 @@ typedef struct {
     _Atomic uint64_t cb_n;             // device callbacks of this output (the watchdog's evidence that the device still plays it)
     uint64_t wd_n, wd_t;               // watchdog: callback count last seen and when it last moved (under g_aos_lock)
     int stalled, retry_ms; uint64_t retry_at;   // the device stopped calling back (or would not start): the silent sink stands in and the watchdog retries the AudioUnit at retry_at, backing off
+    void *key;                         // the guest AudioOut (or the host output's key) it is filed under in the object map
 } aout;
 
 // Registry of open outputs: suspended / resumed all at once by the front-end lifecycle (going to background).
@@ -232,9 +233,11 @@ static void au_go(aout *a, uint64_t now) {
 // The time is read under g_aos_lock: au_go stamps wd_t under it too, and a watchdog time read before the lock was older than the stamp of an AudioUnit the return from the background had just
 // started (DRAGON QUEST VII Reimagined on an iPhone: "has not called back for 18446744073662 ms", a restart of a running AudioUnit)
 enum { WD_TICK_MS = 50, WD_STALL_MS = 200 };
+static _Atomic int g_wd_quit, g_wd_up;   // the run ends (dm_audio_end_run); the watchdog is running
 static void *au_watchdog(void *p) {
     (void)p; uint64_t last = now_ns();
     for (;;) {
+        if (atomic_load(&g_wd_quit)) { atomic_store(&g_wd_up, 0); return NULL; }
         usleep(WD_TICK_MS * 1000);
         pthread_mutex_lock(&g_aos_lock);
         uint64_t t = now_ns(), gap = t - last; last = t;
@@ -258,7 +261,7 @@ static void *au_watchdog(void *p) {
     }
     return NULL;
 }
-static void au_watchdog_start(void) { pthread_t t; if (!pthread_create(&t, NULL, au_watchdog, NULL)) pthread_detach(t); }
+static void au_watchdog_start(void) { pthread_t t; atomic_store(&g_wd_up, 1); if (!pthread_create(&t, NULL, au_watchdog, NULL)) pthread_detach(t); else atomic_store(&g_wd_up, 0); }
 
 // AudioOutParameter = { int32 sampleRate; uint16 channelCount; uint16 _r; ... }, 0 = system default (48 kHz / 2 channels)
 HLE_FORCE("_ZN2nn5audio27InitializeAudioOutParameterEPNS0_17AudioOutParameterE", "audio output parameter defaults", void, h_au_InitParam, uint8_t *p) { memset(p, 0, 8); }
@@ -286,7 +289,7 @@ static Result au_open_at(void *g, void *ev, const char *name, const uint8_t *par
     a->notify_sem = dispatch_semaphore_create(0); a->id = atomic_fetch_add(&nopen, 1);
     pthread_create(&a->notify_th, NULL, event_notify, a);
     if (ev) hle_bind_system_event(ev, 1);   // Buffer release event: bind a kernel event on the guest thread (auto-clear), afterwards signaled by the audio thread
-    objmap_put(g, a);
+    objmap_put(g, a); a->key = g;
     pthread_mutex_lock(&g_aos_lock);
     int slot = -1; for (int i = 0; i < AOMAX; i++) if (!g_aos[i]) { slot = i; break; }
     if (slot < 0) die("more than %d AudioOuts open at once", AOMAX);
@@ -462,4 +465,19 @@ void dm_audio_reset(void) {
     }
     LOG("audio outputs set up again after the media services reset");
     pthread_mutex_unlock(&g_aos_lock);
+}
+// End of the run (an in-process program switch, progswitch.c), with no guest thread left: every output still open is closed (its AudioUnit disposed, its notify thread
+// joined, the audio renderer's host output among them, whose render thread leaves without closing it) and the watchdog stops, before the run's statics are reset
+void dm_audio_end_run(void) {
+    int n = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_aos_lock); aout *a = NULL; for (int i = 0; i < AOMAX && !a; i++) a = g_aos[i]; pthread_mutex_unlock(&g_aos_lock);
+        if (!a) break;
+        void *key = a->key; int host = a->rel_sem != NULL;
+        au_close(key, NULL); n++;
+        if (host) free(key);   // a host output's key (dm_pcmout_open), as dm_pcmout_close frees it
+    }
+    atomic_store(&g_wd_quit, 1);
+    for (int i = 0; i < 100 && atomic_load(&g_wd_up); i++) usleep(WD_TICK_MS * 100);
+    LOG("end of the run: %d audio output(s) closed%s", n, atomic_load(&g_wd_up) ? ", [RED] the watchdog did not stop" : "");
 }

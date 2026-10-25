@@ -1,6 +1,7 @@
 // Bootstrap: after loading the modules, initialize the SDK runtime in the real order of nn::init::Start (sdk+0x2b0470) in the SDK, then enter nnMain.
 #include "dm.h"
 #include "front.h"
+#include "progswitch.h"
 #include <stdatomic.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
@@ -12,11 +13,26 @@ static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("missing symbo
 
 // Game arguments: argv[0] is fixed to "game", and whatever follows "--" is appended as is (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
 static char *g_argv[64] = {"game"}; static int g_argc = 1;
+#ifdef DM_GAME_MULTI
+// An app holding several programs of a multi-program application (game.py header-multi, Super Mario 3D All-Stars on the iPhone): the profile of the program DM_PROGRAM names
+// (main.m sets it from the last oe::ExecuteProgram), program 0 without it
+const dm_game_t *dm_game_cur(void) {
+    static const dm_game_t *g;
+    if (!g) {
+        const char *e = getenv("DM_PROGRAM"); int p = e ? atoi(e) : 0; const dm_game_t *f = &dm_games[0];
+        for (size_t i = 0; i < sizeof dm_games / sizeof *dm_games; i++) if (dm_games[i].program == p) f = &dm_games[i];
+        g = f;
+    }
+    return g;
+}
+#endif
 
+static sigjmp_buf g_main_jb;
 static void guest_main(void) {
     guest_thread_init();
     { void dm_oodle_serve_maybe(int); dm_oodle_serve_maybe(0); }   // DM_OODLE_SERVE tool mode: the game's own Oodle decoder over stdin / stdout (hle_oodle.c, exits when the input ends)
     uint32_t hmain = svc_thread_main_init();   // Main thread handle: x0 of nnosInitialize (stored in an sdk global, used by ThreadManagerImplByHorizon); x1 = pointer to the argument area
+    dm_thread_set_exit_point(&g_main_jb);      // where this thread comes back to when the run ends (guest_entry)
     // Copy Start step by step: _init_libc1 = __nnmusl_init_locks (initializes the stdio etc. locks as recursive locks; skipping it self-deadlocks on nested locking in putc) + __init_ssp.
     // The three callbacks passed in by rtld: A only sets an rtld flag (skipped), B = each module's DT_INIT (before nnMain), C = destructors (not done)
     ((fn0)req("_init_libc0"))();
@@ -92,7 +108,12 @@ static void host_preload(int argc, char **argv) {
         for (char *t = strtok(s, " "); t && g_argc < 63; t = strtok(NULL, " ")) g_argv[g_argc++] = t;
         LOG("game arguments from the game profile: %s", DM_GAME_ARGS);
     }
-    if (!n) { static const char *def[] = DM_GAME_MODULES; for (int k = 0; k < DM_GAME_NMOD && n < MAX_MOD; k++) names[n++] = def[k]; }   // default module list from the game profile's modules (Mario: main sdk)
+#ifdef DM_GAME_MULTI
+    const char *const *def = DM_GAME_MODULES_ARR;   // an app of several programs: the running program's (dm_game_cur)
+#else
+    static const char *def[] = DM_GAME_MODULES;
+#endif
+    if (!n) { for (int k = 0; k < DM_GAME_NMOD && n < MAX_MOD; k++) names[n++] = def[k]; }   // default module list from the game profile's modules (Mario: main sdk)
     load_modules(argv[1], names, n);
     dm_sdk_major();   // logs the SDK version, which SDK-dependent behaviour follows (loader.c)
     uint64_t ta = now_ns();
@@ -121,7 +142,25 @@ void dm_host_preload_start(int argc, char **argv) {
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);
     if (pthread_create(&g_pre.th, &a, preload_thread, NULL)) die("dm_host_preload_start: cannot start the thread");
 }
+// The guest main thread's host frame. An in-process program switch (DM_PROGRAM_SWITCH=inproc, progswitch.c) ends the run: this thread comes back here from wherever
+// it was (sigsetjmp), waits while the run is taken down and its statics are reset, and boots the next program on the same host thread: its modules, then guest_main
+// Objects the run autoreleased on this thread go when the run ends: outside an explicit pool they would wait for the thread's exit, which never comes, and a pool the
+// siglongjmp left is popped with the run's
+void *objc_autoreleasePoolPush(void); void objc_autoreleasePoolPop(void *pool);
+static void guest_entry(void) {
+    for (;;) {
+        void *pool = objc_autoreleasePoolPush();
+        if (!sigsetjmp(g_main_jb, 1)) { guest_main(); objc_autoreleasePoolPop(pool); return; }
+        dm_thread_main_left();
+        objc_autoreleasePoolPop(pool);
+        int argc; char **argv;
+        if (!dm_program_switch_park(&argc, &argv)) return;
+        host_preload(argc, argv);
+        { void dm_fps_state_apply(void); dm_fps_state_apply(); }
+    }
+}
 int main(int argc, char **argv) {
+    dm_runstate_snapshot();   // the run's statics as they are at process start (progswitch.c); the iOS app takes it first in its own main (main.m)
     if (getenv("DM_PRELOAD")) dm_host_preload_start(argc, argv);   // Exercise the early-start path on Mac (on iOS it is called from the App's main())
     if (atomic_load(&g_pre.started)) {
         pthread_join(g_pre.th, NULL);
@@ -131,6 +170,6 @@ int main(int argc, char **argv) {
         LOG("host loading already finished early in the background (dm_host_preload_start)");
     } else host_preload(argc, argv);
     { void dm_fps_state_apply(void); dm_fps_state_apply(); }   // frame rate and render scale into the frame step state page (loader.c): the iOS launcher sets them after the loading began
-    front_run(guest_main);
+    front_run(guest_entry);
     return 0;
 }

@@ -28,6 +28,8 @@ _Static_assert(sizeof(NpadState) == 0x28, "NpadState");
 // Front-end publishing: the keyboard / touch path (dm_input_set) and player 1's physical controller path (dm_pad_set) are ORed; each further player has a controller path of its own
 // (dm_pad_set_player). Press edges are latched until the game's next read so short presses are not lost
 static _Atomic uint64_t g_btn, g_axes, g_latch, g_pad_btn[DM_PLAYERS], g_pad_axes[DM_PLAYERS], g_pad_latch[DM_PLAYERS];
+static _Atomic uint64_t g_peek_latch;   // presses since the last dm_input_peek (the applet's reader)
+static _Atomic int g_hold;              // an applet holds the input (dm_input_hold)
 static _Atomic int64_t g_sampling = 1 << 16;   // starts high so the history entries below the newest keep positive sampling numbers
 static uint64_t pack(int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     return (uint64_t)(uint16_t)lx | (uint64_t)(uint16_t)ly << 16 | (uint64_t)(uint16_t)rx << 32 | (uint64_t)(uint16_t)ry << 48;
@@ -46,13 +48,25 @@ static void shake_note(void) {
     else { uint64_t t0 = atomic_load(&g_shake_t0); atomic_store(&g_shake_end, t0 + ((t - t0) / SHAKE_CYCLE_NS + 1) * SHAKE_CYCLE_NS); }
 }
 void dm_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
-    uint64_t old = atomic_exchange(&g_btn, buttons); atomic_fetch_or(&g_latch, buttons & ~old); atomic_store(&g_axes, pack(lx, ly, rx, ry));
+    uint64_t old = atomic_exchange(&g_btn, buttons); atomic_fetch_or(&g_latch, buttons & ~old); atomic_fetch_or(&g_peek_latch, buttons & ~old); atomic_store(&g_axes, pack(lx, ly, rx, ry));
     shake_note();
 }
 void dm_pad_set_player(int p, uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     if (p < 0 || p >= DM_PLAYERS) return;
-    uint64_t old = atomic_exchange(&g_pad_btn[p], buttons); atomic_fetch_or(&g_pad_latch[p], buttons & ~old); atomic_store(&g_pad_axes[p], pack(lx, ly, rx, ry));
+    uint64_t old = atomic_exchange(&g_pad_btn[p], buttons); atomic_fetch_or(&g_pad_latch[p], buttons & ~old); atomic_fetch_or(&g_peek_latch, buttons & ~old); atomic_store(&g_pad_axes[p], pack(lx, ly, rx, ry));
     if (!p) shake_note();
+}
+static int32_t pick(int32_t a, int32_t b);
+static int32_t ax(uint64_t v, int i);
+void dm_input_hold(int on) {
+    if (atomic_exchange(&g_hold, on) == on) return;
+    atomic_store(&g_latch, 0); for (int p = 0; p < DM_PLAYERS; p++) atomic_store(&g_pad_latch[p], 0);   // a press made for the applet is not the game's
+}
+void dm_input_peek(uint64_t *buttons, int32_t axes[4]) {
+    uint64_t b = atomic_load(&g_btn) | atomic_exchange(&g_peek_latch, 0), k = atomic_load(&g_axes);
+    for (int i = 0; i < 4; i++) axes[i] = ax(k, i);
+    for (int p = 0; p < DM_PLAYERS; p++) { b |= atomic_load(&g_pad_btn[p]); uint64_t v = atomic_load(&g_pad_axes[p]); for (int i = 0; i < 4; i++) axes[i] = pick(axes[i], ax(v, i)); }
+    *buttons = b & 0xffffull;
 }
 void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) { dm_pad_set_player(0, buttons, lx, ly, rx, ry); }
 uint64_t dm_input_samples(void) { return (uint64_t)atomic_load(&g_sampling); }
@@ -63,16 +77,18 @@ uint64_t dm_input_samples(void) { return (uint64_t)atomic_load(&g_sampling); }
 typedef struct { double at, hold; uint64_t btn; int32_t lx, ly, rx, ry; int frame, tap; float tx, ty; } key_step;   // tap: a touch at (tx, ty), normalized
 #define KEY_STEPS 1024
 static key_step g_steps[KEY_STEPS]; static int g_nsteps;
+static _Atomic int g_in_quit, g_in_up;   // the run ends (dm_hid_end_run); scripted input threads running (DM_KEYS, DM_CTL)
 static void *keys_main(void *arg) {
     (void)arg; struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (int i = 0; i < g_nsteps; i++) {
-        for (;;) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); double el = (t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) / 1e9;
+    for (int i = 0; i < g_nsteps && !atomic_load(&g_in_quit); i++) {
+        for (;;) { if (atomic_load(&g_in_quit)) break; struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); double el = (t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) / 1e9;
                    if (g_steps[i].frame ? (double)dm_guest_frame() >= g_steps[i].at : el >= g_steps[i].at) break; usleep(5000); }
         LOG("DM_KEYS: %s%.2f press %#llx (hold %.2f s)", g_steps[i].frame ? "frame " : "", g_steps[i].at, (unsigned long long)g_steps[i].btn, g_steps[i].hold);
         if (g_steps[i].tap) { dm_touch t = {0, g_steps[i].tx, g_steps[i].ty}; dm_touch_set(&t, 1); }
         dm_pad_set(g_steps[i].btn, g_steps[i].lx, g_steps[i].ly, g_steps[i].rx, g_steps[i].ry); usleep((useconds_t)(g_steps[i].hold * 1e6)); dm_pad_set(0, 0, 0, 0, 0);
         if (g_steps[i].tap) dm_touch_set(NULL, 0);
     }
+    atomic_fetch_sub(&g_in_up, 1);
     return NULL;
 }
 // The keys of one step, "key[+key]" (the hold and repeat already cut off), into st
@@ -117,7 +133,8 @@ void hid_keys_init(void) {
     // that mixes them keeps its listed order
     int mixed = 0; for (int i = 1; i < g_nsteps; i++) mixed |= g_steps[i].frame != g_steps[0].frame;
     if (!mixed) for (int i = 1; i < g_nsteps; i++) { key_step s = g_steps[i]; int j = i; while (j > 0 && g_steps[j - 1].at > s.at) { g_steps[j] = g_steps[j - 1]; j--; } g_steps[j] = s; }
-    pthread_t th; if (g_nsteps && !pthread_create(&th, NULL, keys_main, NULL)) { pthread_detach(th); LOG("DM_KEYS: %d steps", g_nsteps); }
+    pthread_t th; if (g_nsteps) atomic_fetch_add(&g_in_up, 1);
+    if (g_nsteps && !pthread_create(&th, NULL, keys_main, NULL)) { pthread_detach(th); LOG("DM_KEYS: %d steps", g_nsteps); }
 }
 
 // DM_CTL=<file> (Mac, for driving a game step by step from a shell): the host reads the lines appended to the file (polled every 100 ms) and acts on each at once:
@@ -128,17 +145,22 @@ void hid_keys_init(void) {
 //   to a file (a buffer texture's storage, which the pass dump's tbuf lines print, holds what the GPU wrote: buffer textures are views of the pool), "texlist <NVN target>" logs the
 //   registered textures of that target (2 = 3D) with storage address and block-linear layout (nvn_mtl.m dm_gfx_texlist), "texraw <serial> <path>"
 //   saves a host texture's level 0 raw (nvn_mtl.m dm_gfx_texraw), "drag <x0> <y0> <x1> <y1> [seconds=0.3]" moves one finger in a straight line between the two normalized picture
-//   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "#…" is ignored.
+//   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "program <n>" makes oe::ExecuteProgram(n) with no parameters
+//   (hle_oe.c dm_oe_execute_from_host: a multi-program application's way back to its menu, headless), "#…" is ignored.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
+// Where DM_CTL is read up to lives for the process (dm_run.h): after an in-process program switch the next run's thread goes on from there, so a line is acted on once
+// (after an execve the new process reads the file from its start, so a driver empties it first)
+DM_PROCESS static long g_ctl_off;
 static void *ctl_main(void *arg) {
-    const char *path = arg; long off = 0; char line[1100];
-    for (;;) {
+    const char *path = arg; long off = g_ctl_off; char line[1100];
+    while (!atomic_load(&g_in_quit)) {
         FILE *f = fopen(path, "r");
         if (f && !fseek(f, off, SEEK_SET)) {
-            while (fgets(line, sizeof line, f)) {
+            while (!atomic_load(&g_in_quit) && fgets(line, sizeof line, f)) {
                 size_t n = strlen(line); if (!n || line[n - 1] != '\n') break;   // a line still being written: read it next time
-                off += (long)n; line[--n] = 0; if (n && line[n - 1] == '\r') line[--n] = 0;
+                off += (long)n; g_ctl_off = off; line[--n] = 0; if (n && line[n - 1] == '\r') line[--n] = 0;
                 if (!n || line[0] == '#') continue;
+                if (!strncmp(line, "program ", 8)) { void dm_oe_execute_from_host(int index); LOG("DM_CTL: oe::ExecuteProgram(%d)", atoi(line + 8)); dm_oe_execute_from_host(atoi(line + 8)); continue; }
                 if (!strncmp(line, "shot ", 5)) { dm_gfx_shot_at(1, line + 5); LOG("DM_CTL: screenshot of the next frame → %s", line + 5); continue; }
                 if (!strncmp(line, "texlist ", 8)) { void dm_gfx_texlist(int target); dm_gfx_texlist(atoi(line + 8)); continue; }
                 if (!strncmp(line, "texraw ", 7)) { void dm_gfx_texraw(uint64_t serial, const char *path); char *e2; uint64_t s = strtoull(line + 7, &e2, 10); while (*e2 == ' ') e2++; dm_gfx_texraw(s, e2); continue; }
@@ -166,13 +188,14 @@ static void *ctl_main(void *arg) {
             }
         }
         if (f) fclose(f);
-        usleep(100000);
+        if (!atomic_load(&g_in_quit)) usleep(100000);
     }
+    atomic_fetch_sub(&g_in_up, 1); free(arg);
     return NULL;
 }
 static void ctl_start(void) {
     const char *e = getenv("DM_CTL"); if (!e || !*e) return;
-    pthread_t th; if (!pthread_create(&th, NULL, ctl_main, strdup(e))) { pthread_detach(th); LOG("DM_CTL: reading key presses and screenshot requests from %s", e); }
+    atomic_fetch_add(&g_in_up, 1); pthread_t th; if (pthread_create(&th, NULL, ctl_main, strdup(e))) atomic_fetch_sub(&g_in_up, 1); else { pthread_detach(th); LOG("DM_CTL: reading key presses and screenshot requests from %s", e); }
 }
 
 static uint32_t connected_id(void) { return dm_opmode() == 0 ? NPAD_HANDHELD : NPAD_NO1; }
@@ -234,6 +257,7 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
         b |= atomic_load(&g_pad_btn[p]) | atomic_exchange(&g_pad_latch[p], 0);
         uint64_t v = atomic_load(&g_pad_axes[p]); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(v, i));
     }
+    if (atomic_load(&g_hold)) { b = 0; memset(a, 0, sizeof a); }   // an applet is in front: the game reads nothing (the latches were taken all the same)
     s->lx = a[0]; s->ly = a[1]; s->rx = a[2]; s->ry = a[3];
     b &= 0xffffull;
     if (s->lx < -STICK_THRESH) b |= 1u << 16;
@@ -536,3 +560,9 @@ PALMA_FAIL("_ZN2nn3hid37SetPalmaDataBaseIdentificationVersionERKNS0_21PalmaConne
 PALMA_FAIL("_ZN2nn3hid19SuspendPalmaFeatureERKNS0_21PalmaConnectionHandleERKNS_4util10BitFlagSetILi32ENS0_12PalmaFeatureEEE", "feature suspension", h_hid_PalmaSuspend, const void *h, const void *f)
 PALMA_FAIL("_ZN2nn3hid16ReadPalmaPlayLogERKNS0_21PalmaConnectionHandleERKt", "play log read", h_hid_PalmaLogRead, const void *h, const uint16_t *i)
 PALMA_FAIL("_ZN2nn3hid17ResetPalmaPlayLogERKNS0_21PalmaConnectionHandleERKt", "play log reset", h_hid_PalmaLogReset, const void *h, const uint16_t *i)
+// End of the run (an in-process program switch, progswitch.c): the scripted input threads stop (the next run starts them again, reading DM_KEYS and DM_CTL from their start)
+void dm_hid_end_run(void) {
+    atomic_store(&g_in_quit, 1);
+    for (int i = 0; i < 400 && atomic_load(&g_in_up) > 0; i++) usleep(5000);   // a press being held finishes first (DM_CTL "A~0.2")
+    if (atomic_load(&g_in_up) > 0) LOG("[RED] end of the run: a scripted input thread did not stop");
+}

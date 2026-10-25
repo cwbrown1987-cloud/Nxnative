@@ -80,8 +80,9 @@ static pthread_cond_t g_gfz_cv = PTHREAD_COND_INITIALIZER; static _Atomic int g_
 void guest_clock_read_wait(void) {
     if (!atomic_load(&g_gfz_bg) || atomic_load(&dm_host_work)) return;
     pthread_mutex_lock(&g_gfz_mu);
-    while (g_gfz_reasons & 2u) pthread_cond_wait(&g_gfz_cv, &g_gfz_mu);
+    while ((g_gfz_reasons & 2u) && !dm_terminating()) pthread_cond_wait(&g_gfz_cv, &g_gfz_mu);
     pthread_mutex_unlock(&g_gfz_mu);
+    dm_thread_term_check();
 }
 void guest_clock_freeze_for(int reason, int on) {
     pthread_mutex_lock(&g_gfz_mu);
@@ -159,3 +160,5 @@ HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEm", "passed straight to the SD
     pthread_once(&g_sa_once, sa_init);
     return g_sa_big_align && size >= 0x10000 ? g_sa_alloc_al(self, size, 0x10000) : g_sa_alloc(self, size);
 }
+// The end of the run (progswitch.c): a guest thread held by the background clock freeze is woken to leave
+void dm_os_wake(void) { pthread_mutex_lock(&g_gfz_mu); pthread_cond_broadcast(&g_gfz_cv); pthread_mutex_unlock(&g_gfz_mu); }

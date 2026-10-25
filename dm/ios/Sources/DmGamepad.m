@@ -22,6 +22,7 @@
 #include "front.h"
 #include "game_profile.h"
 #include "haptics_apple.h"
+#pragma clang section bss="" data=""   // process-lifetime statics, not reset by a program switch (dm_run.h): the iOS front end
 
 enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN, B_N };
 enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_SWAP, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)
@@ -292,6 +293,23 @@ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); 
 - (BOOL)gameBegin:(UITouch *)t {
     for (int i = 0; i < 16; i++) if (!_game[i]) { _game[i] = t; [_owner setObject:@(C_GAME | (uint64_t)i << 8) forKey:t]; return YES; }
     return NO;
+}
+// While an offline HTML page is shown over the picture (web_apple.m front_web_touch), a touch no control would take goes to the page instead of the game's touch screen:
+// the gamepad lets it through. The same order as touchesBegan: locked keys, the layout button, the diamond, the D-pad, the left stick, the right third (3D)
+int front_web_touch(void);
+- (BOOL)controlAt:(CGPoint)p {
+    if (_padOff) return NO;
+    if (!_tap && [self btnAt:p] >= 0) return YES;
+    if ([self inSwap:p]) return YES;
+    if (_tap) return NO;
+    if (dist(p, self.faceCenter) / (self.faceGap + self.faceR * 1.6) <= 1) return YES;
+    if (_full && dist(p, self.dpadCenter) / (self.dpadR * K_DPAD_GRAB) < 1) return YES;
+    if (!_stick[0] && dist(p, self.stickHome) / ([self stickR:0] * K_STICK_GRAB) < 1) return YES;
+    return _full && !_stick[1] && [self inRightArea:p];
+}
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *v = [super hitTest:p withEvent:e];
+    return v == self && front_web_touch() && ![self controlAt:p] ? nil : v;
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
     BOOL game = NO;

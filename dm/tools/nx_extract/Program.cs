@@ -8,6 +8,7 @@
 // The base game may also be a cartridge dump (.xci, Monster Hunter Rise): its secure partition holds the NCAs, which carry their keys in the key area (no ticket).
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using LibHac.Common;
@@ -26,13 +27,33 @@ static class P {
     [DllImport("libc", SetLastError = true)] static extern int clonefile(string src, string dst, uint flags);
 
     static int Main(string[] a) {
+        // Numbers as the scripts parse them ("32.9 MB"): under a French locale the summary lines read "32,9 MB" and build_ipa_from_nsp.py's extracted() found 0 files
+        CultureInfo.DefaultThreadCurrentCulture = CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
         bool manifest = Array.IndexOf(a, "--manifest") >= 0; a = Array.FindAll(a, s => s != "--manifest");
         g_allow = Array.IndexOf(a, "--allow-damaged") >= 0; a = Array.FindAll(a, s => s != "--allow-damaged");
+        int prog = 0, pi = Array.IndexOf(a, "--program");   // --program <index>: another program of a multi-program application (Super Mario 3D All-Stars: the menu is 0, each game 1-3)
+        if (pi >= 0) { prog = int.Parse(a[pi + 1]); a = Array.FindAll(a, s => s != "--program" && s != a[pi + 1]); }
+        bool list = Array.IndexOf(a, "--list") >= 0; a = Array.FindAll(a, s => s != "--list");
+        int hi = Array.IndexOf(a, "--html");   // --html <out dir>: the RomFS of the program's HtmlDocument (Manual) NCAs, the offline HTML pages it shows through the web applet, one folder per NCA
+        if (hi >= 0) {
+            string hout = a[hi + 1]; a = Array.FindAll(a, s => s != "--html" && s != hout);
+            KeySet hk = ExternalKeyReader.ReadKeyFile(a[0]); var hp = OpenNsp(hk, a[1]);
+            ulong tid = Pick(hp, NcaContentType.Program).Header.TitleId + (ulong)prog; int k = 0;
+            foreach (Nca n in hp) if (n.Header.ContentType == NcaContentType.Manual && n.Header.TitleId == tid)
+                Copy(n.OpenFileSystem(NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid), Path.Combine(hout, $"html{k++}"), null);
+            return 0;
+        }
+        if (list) {   // --list: every NCA of the NSP (title ID, content type, size)
+            KeySet lk = ExternalKeyReader.ReadKeyFile(a[0]);
+            foreach (Nca n in OpenNsp(lk, a[1])) Console.WriteLine($"{n.Header.TitleId:x16}\t{n.Header.ContentType}\t{n.Header.NcaSize / 1048576.0:F1} MB");
+            return 0;
+        }
         if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir>"); return 2; }
         KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
         if (a[1] == "--aoc") return Aoc(ks, a[2], a[3]);
         var basePkg = OpenNsp(ks, a[1]); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
         Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the base NSP");
+        if (prog != 0) baseProg = Pick(basePkg, NcaContentType.Program, baseProg.Header.TitleId + (ulong)prog) ?? throw new Exception($"no Program NCA of program index {prog} in the base NSP");
         Nca updProg = updPkg == null ? null : Pick(updPkg, NcaContentType.Program, baseProg.Header.TitleId) ?? throw new Exception("no Program NCA of the base game's program in the update NSP");
         Nca ctrl = Pick(updPkg ?? basePkg, NcaContentType.Control, baseProg.Header.TitleId);
         Console.WriteLine($"title {baseProg.Header.TitleId:x16}" + (updProg != null ? $", update {updProg.Header.TitleId:x16}" : ""));

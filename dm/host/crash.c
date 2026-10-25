@@ -11,6 +11,7 @@
 #include <mach/mach.h>
 #include <stdatomic.h>
 #include <time.h>
+#pragma clang section bss="" data=""   // process-lifetime statics, not reset by a program switch (dm_run.h): signal handlers and the hooks other files register live for the process
 
 static _Atomic uint64_t g_watch_last_ns;
 static _Atomic uint64_t g_watch_count;
@@ -99,7 +100,9 @@ void dm_backtrace(uint64_t fp) {
 static int (*g_fault_hook[MAX_FAULT_HOOK])(void *addr, int is_write, void *uc);
 static void (*g_write_prep[MAX_FAULT_HOOK])(void *addr, size_t len);
 static int g_nfault_hook, g_nwrite_prep;
+// A hook registered again is kept once: these tables live for the process, and every program run of an in-process switch registers its hooks anew (dm_run.h)
 void dm_fault_hook_register(int (*fn)(void *addr, int is_write, void *uc)) {
+    for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i] == fn) return;
     if (g_nfault_hook >= MAX_FAULT_HOOK) die("too many page fault hooks");
     g_fault_hook[g_nfault_hook++] = fn;
 }
@@ -107,6 +110,7 @@ static void (*g_res_report)(uint32_t tick, const char *why);   // Resource count
 void dm_res_report_register(void (*fn)(uint32_t tick, const char *why)) { g_res_report = fn; }
 void (*dm_res_report_cb(void))(uint32_t, const char *) { return g_res_report; }
 void dm_guest_write_prep_register(void (*fn)(void *addr, size_t len)) {
+    for (int i = 0; i < g_nwrite_prep; i++) if (g_write_prep[i] == fn) return;
     if (g_nwrite_prep >= MAX_FAULT_HOOK) die("too many host pre-write hooks");
     g_write_prep[g_nwrite_prep++] = fn;
 }
