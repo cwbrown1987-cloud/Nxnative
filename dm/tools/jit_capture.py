@@ -139,10 +139,26 @@ def load(dirs, masks):
     return recs
 
 
+class Unplaced(AssertionError):   # a session's code refers to code memory that none of its own records holds
+    def __init__(self, session, off): super().__init__(f'code offset {off:#x} of session {session:#x} lies in no captured request'); self.session = session
+
+
 def build(dirs, out_dir=None, profile=None):
     masks = key_masks(profile); ocs = out_codes(profile)
     recs = load(dirs, masks)
-    if not recs: sys.exit('[RED] no captures')
+    # The host skips a request already captured in the folder, so a session whose code memory is somewhere no earlier one had it (one that started after an in-process program
+    # switch, DM_PROGRAM_SWITCH=inproc) may hold only its later requests, whose code calls into boot code it did not capture itself: it is left out, and the rest builds
+    while True:
+        if not recs: sys.exit('[RED] no captures')
+        try: return build_from(recs, masks, ocs, out_dir)
+        except Unplaced as e:
+            n = sum(r['session'] == e.session for rl in recs.values() for r in rl)
+            only = sum(all(r['session'] == e.session for r in rl) for rl in recs.values())
+            print(f'[RED] capture session {e.session:#x} left out ({e}): its {n} requests, {only} of them captured in no other session', file=sys.stderr)
+            recs = {k: v for k, v in ((k, [r for r in rl if r['session'] != e.session]) for k, rl in recs.items()) if v}
+
+
+def build_from(recs, masks, ocs, out_dir):
     any_r = next(iter(recs.values()))[0]
     rx_size = any_r['regs']['jit_rx'][1]; ro_size = any_r['regs']['jit_ro'][1]
     # Canonical layout: the code memory at 0, then every module in load order (the order of the capture's regions), 16 KB aligned, a front patch area in front of its base
@@ -174,7 +190,7 @@ def build(dirs, out_dir=None, profile=None):
     def map_rx(session, off):
         for c, n, i in spans[session]:
             if c <= off < c + n or (n == 0 and off == c): return i + off - c
-        raise AssertionError(f'code offset {off:#x} of session {session:#x} lies in no captured request')
+        raise Unplaced(session, off)
     def canon(r, v):   # canonical offset of a host address of record r, or None for a constant
         name, off = region_of(r['regs'], v)
         if name is None: return None

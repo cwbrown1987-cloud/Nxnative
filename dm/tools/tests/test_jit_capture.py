@@ -1,6 +1,8 @@
 """jit_capture.py: captures from two runs in different layouts make one position-independent image (address sequences become adrp / add to the canonical layout, a request
 moved off its captured offset keeps its branches out of the block, output words that are host addresses become relocations), and keys follow the profile's request bytes."""
+import contextlib
 import hashlib
+import io
 import importlib.util
 from pathlib import Path
 import shutil
@@ -77,6 +79,21 @@ class JitCapture(unittest.TestCase):
             w = struct.unpack_from('<I', img, p + 16)[0]; disp = (((w & 0x3ffffff) ^ 0x2000000) - 0x2000000) * 4
             self.assertEqual(p + 16 + disp, 0, 'the branch back to the boot code')
             self.assertEqual(struct.unpack_from('<I', img, p + 20)[0], b(8), 'a branch inside the request is unchanged')
+
+    def test_session_without_its_boot(self):
+        # A session that started after an in-process program switch: its code memory elsewhere, its boot request skipped (already in the folder), only a play request
+        # of its own, which calls into boot code it did not capture. It is left out, and the image is the one the two whole sessions make
+        a = self.session('a', 0x10_0000_0000, 0x20_0000_0000, 0x80001000)
+        b_ = self.session('b', 0x10_0400_0000, 0x20_0800_0000, 0x80002000)
+        c = self.tmp / 'c'; c.mkdir(); rx = 0x20_1000_0000
+        regs = [('main', 0x10_0800_0000, MAIN), ('jit_rx', rx, RX), ('jit_ro', 0x7000000000, RO), ('jit_tmem', 0x7100000000, 0x4000)]
+        record(c, 4, 0x100, mov64(17, rx + 0x10) + [b(-0x100 - 16), RET], struct.pack('<II', 3, 0), regs, data=struct.pack('<II', 0x80003000, 1), key='dyn80003000')
+        whole, part = self.tmp / 'whole', self.tmp / 'part'
+        self.assertEqual(jc.build([str(a), str(b_)], str(whole)), 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err): self.assertEqual(jc.build([str(a), str(b_), str(c)], str(part)), 0)
+        self.assertIn(f'capture session {rx:#x} left out', err.getvalue())
+        for f in ('jit.img', 'jit.out', 'jit.tsv'): self.assertEqual((part / f).read_bytes(), (whole / f).read_bytes(), f)
 
     def test_output_needs_second_capture(self):
         a = self.session('a', 0x10_0000_0000, 0x20_0000_0000, 0x80001000)
