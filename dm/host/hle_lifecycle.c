@@ -22,9 +22,12 @@ void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg) {
 }
 void dm_host_shutdown(const char *why) { dm_host_shutdown_then(why, NULL, NULL); }
 __attribute__((weak)) void front_program_handoff(int index, const char *name) { (void)index; (void)name; }   // front.h: the iOS front end names the next program and schedules its notification
+DM_PROCESS static int g_term_installed;   // the SIGTERM source lives for the process: every program run of an in-process switch calls this again (dm_run.h)
 void dm_term_install(void) {
+    if (g_term_installed) return;
+    g_term_installed = 1;
     signal(SIGTERM, SIG_IGN);                       // do not take the default action: hand over to the GCD signal source to wrap up on an ordinary thread
-    static dispatch_source_t src;
+    DM_PROCESS static dispatch_source_t src;
     src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
     dispatch_source_set_event_handler(src, ^{ dm_host_shutdown("SIGTERM"); });
     dispatch_resume(src);

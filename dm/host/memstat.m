@@ -16,6 +16,7 @@
 #include <os/proc.h>
 #endif
 #include "dm.h"
+#pragma clang section bss="" data=""   // process-lifetime statics, not reset by a program switch (dm_run.h): its sampling threads start from constructors and live for the process
 
 void svc_guest_range(uint8_t **base, size_t *size);
 enum { C_GUEST, C_CODE, C_MALLOC, C_GPU, C_STACK, C_FILE, C_OTHER, NC };

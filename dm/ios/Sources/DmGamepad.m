@@ -22,6 +22,7 @@
 #include "front.h"
 #include "game_profile.h"
 #include "haptics_apple.h"
+#pragma clang section bss="" data=""   // process-lifetime statics, not reset by a program switch (dm_run.h): the iOS front end
 
 enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN, B_N };
 enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_SWAP, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)

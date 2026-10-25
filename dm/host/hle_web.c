@@ -135,7 +135,7 @@ static void web_return(void *rv) {   // the ended page's result into the return 
     msg_clear(); g_web_state = 0; g_web_real = 0; hle_clear_system_event(g_ev_web);
     pthread_mutex_unlock(&g_web_mu);
 }
-static void web_wait_end(void) { pthread_mutex_lock(&g_web_mu); while (g_web_state == 1 || g_web_state == 2) pthread_cond_wait(&g_web_cv, &g_web_mu); pthread_mutex_unlock(&g_web_mu); }
+static void web_wait_end(void) { pthread_mutex_lock(&g_web_mu); while ((g_web_state == 1 || g_web_state == 2) && !dm_terminating()) pthread_cond_wait(&g_web_cv, &g_web_mu); pthread_mutex_unlock(&g_web_mu); dm_thread_term_check(); }
 
 // The page as a session the game drives while it runs (Super Mario 3D All-Stars' Sunshine: its launcher pause menu, launcher_pause_menu.htdocs, started hidden at boot and shown with
 // Appear when the player suspends; Super Mario 64 imports the same). The SDK's own Start creates a library applet (null read in applet::StartLibraryAppletImmediately)
@@ -144,7 +144,7 @@ HLE_FORCE("_ZN2nn3web17OfflineWebSessionD1Ev", "offline HTML session (host web v
 HLE_FORCE("_ZN2nn3web17OfflineWebSession17GetWorkBufferSizeEv", "offline HTML session work buffer: the SDK's size (0xd0), unused by the host", size_t, h_webs_WorkSize, void) { return 0xd0; }
 HLE_FORCE("_ZN2nn3web17OfflineWebSession10InitializeEPvm", "offline HTML session (host web view): the work buffer is not used", void, h_webs_Init, void *s, void *buf, size_t n) { (void)s; (void)buf; (void)n; }
 HLE_FORCE("_ZN2nn3web17OfflineWebSession8FinalizeEv", "offline HTML session: a page still open is closed", void, h_webs_Fini, void *s) {
-    (void)s; pthread_mutex_lock(&g_web_mu); int open = g_web_state != 0; pthread_mutex_unlock(&g_web_mu);
+    (void)s; pthread_mutex_lock(&g_web_mu); int open = g_web_state == 1 || g_web_state == 2; pthread_mutex_unlock(&g_web_mu);
     if (open) { dm_web_ended(2, NULL); web_return(NULL); }
 }
 HLE_FORCE("_ZN2nn3web17OfflineWebSession5StartEPPNS_2os15SystemEventTypeERKNS0_22ShowOfflineHtmlPageArgE", "start an offline HTML page in the host's web view (the stand-in without the page)",
@@ -207,3 +207,6 @@ HLE_FORCE("_ZN2nn3web19ShowOfflineHtmlPageEPNS0_26OfflineHtmlPageReturnValueERKN
     web_wait_end(); web_return(rv);
     return RES_OK;
 }
+// The end of the run (progswitch.c): a guest thread waiting for a page to end is woken to leave; dm_web_end_run then takes the page away
+void dm_web_wake(void) { pthread_mutex_lock(&g_web_mu); pthread_cond_broadcast(&g_web_cv); pthread_mutex_unlock(&g_web_mu); }
+void dm_web_end_run(void) { int open; pthread_mutex_lock(&g_web_mu); open = g_web_state == 1 || g_web_state == 2; pthread_mutex_unlock(&g_web_mu); if (open) { front_web_close(); LOG("end of the run: the web page was closed"); } }

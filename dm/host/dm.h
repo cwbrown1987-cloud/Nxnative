@@ -1,5 +1,6 @@
 // Common header of the native Switch host (multi-module).
 #pragma once
+#include "dm_run.h"   // per-run statics (progswitch.c)
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -116,3 +117,7 @@ void dm_gfx_shot_at(long k, const char *path);
 void dm_shot_written(const char *path, int ok);   // The graphics side finished writing a screenshot to disk (diag.c: DM_TICK_HOLD=E:SHOT unfreezes on this)
 void dm_host_shutdown(const char *why);   // Graceful exit (crash.c): stop background threads and audio, drain graphics, then _exit(0); used by SIGTERM and the iOS App termination callback   // graphics side: screenshot of the k-th frame after the current presented frame (nvn_mtl.m)
 void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg);   // the same, then runs then(arg) in place of _exit (hle_oe.c: the next program of DM_PROGRAMS)
+// The end of a run (an in-process program switch, progswitch.c): dm_terminating is 1 once every guest thread is to leave; host code that a guest thread runs, holding no
+// host lock, leaves through dm_thread_term_check (hle_thread.c) where it would otherwise wait in host code for something that no longer comes
+int dm_terminating(void);
+void dm_thread_term_check(void);

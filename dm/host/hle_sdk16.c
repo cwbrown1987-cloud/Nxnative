@@ -218,11 +218,13 @@ HLE_FORCE("_ZN2nn3nfp29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_
 // against the screen's vsyncs, two in some display-link ticks and none in others (iPhone: about one tick in seven, a stutter the frame-rate counter showed as 50 to 60)
 void dm_host_helper_qos(qos_class_t q);   // hle_thread.c
 __attribute__((weak)) int mtl_link_wait_vsync(uint64_t *seen, uint64_t timeout_ns) { (void)seen; (void)timeout_ns; return 0; }   // nvn_mtl.m
+static _Atomic int g_vs_quit, g_vs_up;   // the run ends (dm_sdk16_end_run); vsync threads running
 static void *vsync_thread(void *ev) {
     dm_host_helper_qos(QOS_CLASS_USER_INTERACTIVE);   // the game paces frames on this event
     const char *e = getenv("DM_VSYNC_HZ"); double hz = e ? atof(e) : 60.0; if (hz <= 0) hz = 60.0;
     uint64_t period = (uint64_t)(1e9 / hz), next = now_ns() + period, seen = 0;
     for (;;) {
+        if (atomic_load(&g_vs_quit)) { atomic_fetch_sub(&g_vs_up, 1); return NULL; }
         if (!e && mtl_link_wait_vsync(&seen, 2 * period)) { hle_signal_system_event(ev); next = now_ns() + period; continue; }
         uint64_t t = now_ns(); if (next > t) { struct timespec ts = {(time_t)((next - t) / 1000000000ull), (long)((next - t) % 1000000000ull)}; nanosleep(&ts, NULL); }
         hle_signal_system_event(ev); next += period; if (now_ns() > next + 4 * period) next = now_ns() + period;   // do not try to catch up when far behind
@@ -235,7 +237,7 @@ HLE_FORCE("_ZN2nn2vi33GetIndirectImageMemoryRequirementEPmS1_ii", "indirect laye
 }
 HLE_FORCE("_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", "vsync event: a host thread signals it at 60 Hz", Result, h_vi_VsyncEvent, void *ev, void *disp) {
     (void)disp; hle_bind_system_event(ev, 1);
-    pthread_t th; if (pthread_create(&th, NULL, vsync_thread, ev)) die("cannot start the vsync thread"); pthread_detach(th);
+    atomic_fetch_add(&g_vs_up, 1); pthread_t th; if (pthread_create(&th, NULL, vsync_thread, ev)) die("cannot start the vsync thread"); pthread_detach(th);
     LOG("vi::GetDisplayVsyncEvent: %p signalled by the host at 60 Hz", ev); return RES_OK;
 }
 
@@ -284,4 +286,13 @@ HLE_FORCE("_ZN2nn8settings25GetAvailableLanguageCodesEPNS0_12LanguageCodeEi", "a
 // main+0x117590; the SDK's own version aborted in sm::Initialize)
 HLE_FORCE("_ZN2nn8settings29GetAvailableLanguageCodeCountEv", "number of available language codes (the fixed system table)", int, h_set_AvailLangN, void) {
     return (int)(sizeof k_lang_code / sizeof *k_lang_code);
+}
+// End of the run (an in-process program switch, progswitch.c): the vsync threads stop (they signal an event in the guest memory that goes away) and the shared fonts are unmapped
+void dm_sdk16_end_run(void) {
+    atomic_store(&g_vs_quit, 1);
+    for (int i = 0; i < 200 && atomic_load(&g_vs_up) > 0; i++) usleep(5000);
+    if (atomic_load(&g_vs_up) > 0) LOG("[RED] end of the run: %d vsync thread(s) did not stop", atomic_load(&g_vs_up));
+    pthread_mutex_lock(&font_mu);
+    if (std_f.p) munmap(std_f.p, std_f.n); if (ext_f.p) munmap(ext_f.p, ext_f.n); std_f = ext_f = (font_t){0};
+    pthread_mutex_unlock(&font_mu);
 }

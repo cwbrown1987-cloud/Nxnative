@@ -2371,3 +2371,21 @@ int nvn_host_signal_sync(void *nvnsync) {
     o->fence = 0; o->fenced = 1; return 0;
 }
 NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }   // unified memory + dirty page tracking: nothing to flush
+// End of the run (an in-process program switch, progswitch.c), with no guest thread left: the graphics layers drain, stop their threads and release what they hold,
+// before the run's statics are reset. The Vulkan and GL layers first (their frames are presented on this layer's queue), then the sparse pools and borrowed command
+// memory here, then the Metal layer. The gate stays closed: the next run's statics open it again
+__attribute__((weak)) void dm_vk_end_run(void) {}   // dm/gfx/vk/hle_vk.m
+__attribute__((weak)) void dm_gl_end_run(void) {}   // dm/gfx/gl/hle_gl.m
+void mtl_end_run(void);
+void dm_gfx_end_run(void) {
+    dm_gfx_suspend(1);
+    dm_vk_end_run(); dm_gl_end_run();
+    for (int i = 0; i < NVPOOL; i++) if (g_vp[i].base) vpool_release(g_vp[i].pool);
+    pthread_mutex_lock(&g_hostseg_mu);
+    for (int i = 0; i < g_nhostseg; i++) free(g_hostseg[i].mem);
+    free(g_hostseg); g_hostseg = NULL; g_nhostseg = g_caphostseg = 0; g_hostseg_bytes = 0;
+    pthread_mutex_unlock(&g_hostseg_mu);
+    if (g_tsv) { fclose(g_tsv); g_tsv = NULL; }
+    mtl_end_run();
+}
+

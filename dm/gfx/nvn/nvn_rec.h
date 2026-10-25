@@ -18,7 +18,7 @@ typedef struct { void *d; const void *s; size_t n; } ubc_op;
 enum { UBC_N = 8192 };
 static ubc_op g_ubc[UBC_N];
 static _Atomic uint64_t g_ubc_head, g_ubc_done;   // ops queued / made (monotonic)
-static _Atomic int g_ubc_sleeping;
+static _Atomic int g_ubc_sleeping, g_ubc_quit, g_ubc_up;   // the run ends (mtl_end_run); the copy thread is running
 static pthread_mutex_t g_ubc_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ubc_cv = PTHREAD_COND_INITIALIZER;
 static int ubc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_UB_COPY_THREAD"); v = !(e && !strcmp(e, "0")); } return v; }
 static void *ubc_thread(void *arg) {
@@ -28,7 +28,8 @@ static void *ubc_thread(void *arg) {
         if (t == h) {
             for (int spin = 0; spin < 2000 && t == h; spin++) h = atomic_load_explicit(&g_ubc_head, memory_order_acquire);   // a submission queues copies in bursts: stay awake a moment
             if (t == h) { pthread_mutex_lock(&g_ubc_mu); atomic_store(&g_ubc_sleeping, 1);
-                while ((h = atomic_load_explicit(&g_ubc_head, memory_order_acquire)) == t) pthread_cond_wait(&g_ubc_cv, &g_ubc_mu);
+                while ((h = atomic_load_explicit(&g_ubc_head, memory_order_acquire)) == t && !atomic_load(&g_ubc_quit)) pthread_cond_wait(&g_ubc_cv, &g_ubc_mu);
+                if (h == t && atomic_load(&g_ubc_quit)) { atomic_store(&g_ubc_up, 0); pthread_cond_broadcast(&g_ubc_cv); pthread_mutex_unlock(&g_ubc_mu); return NULL; }
                 atomic_store(&g_ubc_sleeping, 0); pthread_mutex_unlock(&g_ubc_mu); }
         }
         for (; t < h; t++) { const ubc_op *o = &g_ubc[t % UBC_N]; memcpy(o->d, o->s, o->n); }
@@ -50,7 +51,7 @@ static inline uint64_t ubc_head(void) { return atomic_load_explicit(&g_ubc_head,
 // Queue a copy (submit thread only); returns the count of ops that must be made for it to be done
 static uint64_t ubc_push(void *d, const void *s, size_t n) {
     static int started;
-    if (!started) { pthread_t th; if (pthread_create(&th, NULL, ubc_thread, NULL)) MDIE("cannot start the uniform copy thread"); pthread_detach(th); started = 1; }
+    if (!started) { atomic_store(&g_ubc_up, 1); pthread_t th; if (pthread_create(&th, NULL, ubc_thread, NULL)) MDIE("cannot start the uniform copy thread"); pthread_detach(th); started = 1; }
     uint64_t h = atomic_load_explicit(&g_ubc_head, memory_order_relaxed);
     if (h - atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= UBC_N) ubc_wait(h - UBC_N + 1);
     g_ubc[h % UBC_N] = (ubc_op){d, s, n};
@@ -90,7 +91,7 @@ static inline int rec_on(void) {
 static pthread_mutex_t g_rb_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_rb_work = PTHREAD_COND_INITIALIZER, g_rb_idle = PTHREAD_COND_INITIALIZER;
 static rec_blk *g_rb_cur, *g_rb_head, *g_rb_tail, *g_rb_free;   // the submit thread's open block; blocks waiting for the encode thread; empty blocks
-static int g_rb_busy, g_rb_started, g_rb_sleeping;              // the encode thread is working through a block; the thread exists; it waits for work
+static int g_rb_busy, g_rb_started, g_rb_sleeping, g_rb_quit;            // the encode thread is working through a block; the thread exists; it waits for work
 
 static inline uint64_t rec_obj(id o) { return o ? (uint64_t)(uintptr_t)CFBridgingRetain(o) : 0; }
 static inline id rec_id(uint64_t v) { return (__bridge id)(void *)(uintptr_t)v; }
@@ -176,7 +177,8 @@ static void *rec_thread(void *arg) {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     for (;;) {
         pthread_mutex_lock(&g_rb_mu);
-        while (!g_rb_head) { g_rb_sleeping = 1; pthread_cond_wait(&g_rb_work, &g_rb_mu); g_rb_sleeping = 0; }
+        while (!g_rb_head && !g_rb_quit) { g_rb_sleeping = 1; pthread_cond_wait(&g_rb_work, &g_rb_mu); g_rb_sleeping = 0; }
+        if (!g_rb_head) { g_rb_started = 0; pthread_cond_broadcast(&g_rb_idle); pthread_mutex_unlock(&g_rb_mu); return NULL; }   // the run ends (mtl_end_run)
         rec_blk *b = g_rb_head; g_rb_head = b->next; if (!g_rb_head) g_rb_tail = NULL; g_rb_busy = 1;
         pthread_mutex_unlock(&g_rb_mu);
         @autoreleasepool { for (int i = 0; i < b->n; i++) rec_exec(&b->r[i]); }

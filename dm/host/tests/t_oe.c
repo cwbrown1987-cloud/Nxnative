@@ -15,6 +15,9 @@ void dm_host_shutdown(const char *why) { (void)why; g_shut_at = ++g_step; }   //
 void front_program_handoff(int index, const char *name) { g_handoff_at = ++g_step; g_handoff_ix = index; g_handoff_name = name; }   // front.h: the iOS front end names the next program
 static void (*g_then)(void *); static void *g_then_arg;   // what oe::ExecuteProgram with DM_PROGRAMS hands the graceful exit (prog_exec and its plan)
 void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg) { (void)why; g_then = then; g_then_arg = arg; }
+int dm_terminating(void) { return 0; }   // progswitch.c / hle_thread.c: no in-process switch in this test (DM_PROGRAM_SWITCH unset)
+void dm_thread_term_check(void) {}
+int dm_program_switch_request(const dm_switch_req *r) { (void)r; return 0; }
 static int env_has(char **env, const char *kv) { for (; env && *env; env++) if (!strcmp(*env, kv)) return 1; return 0; }
 static int env_key(char **env, const char *k) { size_t n = strlen(k); for (; env && *env; env++) if (!strncmp(*env, k, n) && (*env)[n] == '=') return 1; return 0; }
 // The notification event (hle_thread.c binds a kernel event): the unit test only tracks whether it is signalled

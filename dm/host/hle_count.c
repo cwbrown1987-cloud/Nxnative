@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <libkern/OSCacheControl.h>
+#pragma clang section bss="" data=""   // process-lifetime statics, not reset by a program switch (dm_run.h): its counting stubs and atexit writer live for the process
 #if !TARGET_OS_IPHONE
 #define HC_MAX 8192
 static struct { const char *kind, *name; void *fn; _Atomic uint64_t n; } g_hc[HC_MAX];

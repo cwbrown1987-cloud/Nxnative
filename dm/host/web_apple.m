@@ -20,6 +20,7 @@ typedef NSView DmView;
 #include "dm.h"
 #include "dm_input.h"
 #include "front.h"
+#pragma clang section bss="" data=""   // process-lifetime statics, not reset by a program switch (dm_run.h): the front end's web view
 
 void front_web_attach(DmView *box);   // front_mac.m / front_ios.m: puts the page's view over the game picture (main thread)
 void front_web_detach(DmView *box);   // and takes it away again, handing the keyboard focus back to the game

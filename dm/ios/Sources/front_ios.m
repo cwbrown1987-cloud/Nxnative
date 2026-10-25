@@ -10,6 +10,7 @@
 #include "hle.h"
 #include "dm.h"
 #include "haptics_apple.h"
+#pragma clang section bss="" data=""   // process-lifetime statics, not reset by a program switch (dm_run.h): the iOS front end
 
 UIView *dm_gamepad_view(CGRect frame);
 void dm_gamepad_reset(void);

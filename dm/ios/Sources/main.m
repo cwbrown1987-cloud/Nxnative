@@ -23,6 +23,50 @@ static NSString *romfs_locate(NSString *prog) {   // prog: an app of several pro
     return nil;
 }
 
+// The running program's files (an app of several programs of a multi-program application, build_ipa.sh PROGRAMS_TSV: Super Mario 3D All-Stars' launcher and the games it
+// starts): dm/programs.txt lists them, and each has its own files: <App>/p<N>/romfs (and html beside it), <App>/msl/p<N>, <App>/dm/p<N> (rewriter tables, shader tables,
+// launcher settings) and its modules in sections tagged p<N> (DM_EMBED_TAG, loader.c). The host profile is the program's (DM_PROGRAM, main.c dm_game_cur). oe::ExecuteProgram
+// records the program and its parameters in Documents/program.bin (DM_EXEC_OUT, hle_oe.c). Without the in-process switch the app names it on screen, schedules a notification
+// that opens it again (front_ios.m front_program_handoff, when the player allowed notifications) and ends, and the next start runs that program, with those parameters as its
+// launch parameter, until a program starts another (Sunshine's pause menu: Return to title selection starts program 0); program 0 when nothing is recorded or the program is
+// not in the app. With DM_PROGRAM_SWITCH=inproc (an env file) the host ends the run and starts the recorded program in this process (progswitch.c), after calling
+// front_program_env, which sets the same variables again (switching: overwriting what the previous program set). Returns the program's dm folder (the host's modules folder), nil
+// when its game files are missing
+static NSString *program_env(int switching) {
+    NSFileManager *fm = NSFileManager.defaultManager; int ow = switching != 0;
+    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0], *res = NSBundle.mainBundle.resourcePath;
+    NSString *dmdir = [res stringByAppendingPathComponent:@"dm"], *msl = [res stringByAppendingPathComponent:@"msl"], *prog = nil;
+    NSString *plist = [NSString stringWithContentsOfFile:[dmdir stringByAppendingPathComponent:@"programs.txt"] encoding:NSUTF8StringEncoding error:nil];
+    if (plist) {
+        NSArray *have = [plist componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSString *rec = [doc stringByAppendingPathComponent:@"program.bin"]; NSData *d = [NSData dataWithContentsOfFile:rec]; int32_t n = 0;
+        if (d.length >= 4) memcpy(&n, d.bytes, 4);
+        if (![have containsObject:[NSString stringWithFormat:@"%d", n]]) { fprintf(stderr, "boot: program %d is not in this app; program 0\n", n); n = 0; d = nil; }
+        prog = [NSString stringWithFormat:@"p%d", n];
+        NSString *lp = [doc stringByAppendingPathComponent:@"launch_param.bin"];
+        if (d.length > 4) { [[d subdataWithRange:NSMakeRange(4, d.length - 4)] writeToFile:lp atomically:YES]; setenv("DM_LAUNCH_PARAM", lp.fileSystemRepresentation, 1); }
+        else { [fm removeItemAtPath:lp error:nil]; unsetenv("DM_LAUNCH_PARAM"); }
+        setenv("DM_PROGRAM", [NSString stringWithFormat:@"%d", n].UTF8String, 1);
+        setenv("DM_EMBED_TAG", prog.UTF8String, 1);
+        setenv("DM_EXEC_OUT", rec.fileSystemRepresentation, 0);
+        dmdir = [dmdir stringByAppendingPathComponent:prog]; msl = [msl stringByAppendingPathComponent:prog];
+        setenv("DM_APP_DM", dmdir.fileSystemRepresentation, 1);   // the launcher's settings (Launcher.swift)
+        fprintf(stderr, "%s: program %d of %s (%zu bytes of launch parameter)\n", switching ? "program switch" : "boot", n, [[plist stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] stringByReplacingOccurrencesOfString:@"\n" withString:@" "].UTF8String, d.length > 4 ? (size_t)d.length - 4 : 0);
+    }
+    NSString *romfs = romfs_locate(prog);
+    if (!romfs) { fprintf(stderr, "boot: game files not found (<App>/romfs or Documents/romfs)\n"); return nil; }
+    fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
+    setenv("DM_ROMFS", romfs.fileSystemRepresentation, ow);
+    setenv("DM_NVN_SHMAP", [dmdir stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, ow);
+    setenv("DM_MSL_DIR", msl.fileSystemRepresentation, ow);
+    return dmdir;
+}
+// progswitch.c (through hle_oe.c): the next program's environment once the run's statics are reset; its dm folder is the host's modules folder
+const char *front_program_env(void *index) {
+    (void)index; NSString *dm = program_env(1);
+    return dm ? strdup(dm.fileSystemRepresentation) : NULL;
+}
+
 // Boot prerequisites (done before UIApplicationMain): directories / environment variables / log -- the host's early load reads these
 static int boot_env(void) {
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -56,41 +100,10 @@ static int boot_env(void) {
     NSString *lang = [NSBundle.mainBundle objectForInfoDictionaryKey:@"DMLanguage"];
     if (!getenv("DM_LANG") && [lang isKindOfClass:NSString.class] && lang.length) setenv("DM_LANG", lang.UTF8String, 0);
     fprintf(stderr, "boot: game language %s\n", getenv("DM_LANG") ?: "en-US");
-    // An app holding several programs of a multi-program application (build_ipa.sh PROGRAMS_TSV: Super Mario 3D All-Stars' launcher and the games it starts): dm/programs.txt lists them,
-    // and each has its own files: <App>/p<N>/romfs (and html beside it), <App>/msl/p<N>, <App>/dm/p<N> (rewriter tables, shader tables, launcher settings) and its modules in sections
-    // tagged p<N> (DM_EMBED_TAG, loader.c). The host profile is the program's (DM_PROGRAM, main.c dm_game_cur). iOS cannot start an app's process again, so oe::ExecuteProgram records
-    // the program and its parameters in Documents/program.bin (DM_EXEC_OUT, hle_oe.c), the app names it on screen and schedules a notification that opens it again (front_ios.m
-// front_program_handoff, when the player allowed notifications), and the app ends; the next start runs that program, with those parameters as its launch
-    // parameter, until a program starts another (Sunshine's pause menu: Return to title selection starts program 0). Program 0 when nothing is recorded or the program is not in the app
-    NSString *dmdir = [res stringByAppendingPathComponent:@"dm"], *msl = [res stringByAppendingPathComponent:@"msl"], *prog = nil;
-    NSString *plist = [NSString stringWithContentsOfFile:[dmdir stringByAppendingPathComponent:@"programs.txt"] encoding:NSUTF8StringEncoding error:nil];
-    if (plist) {
-        NSArray *have = [plist componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        NSString *rec = [doc stringByAppendingPathComponent:@"program.bin"]; NSData *d = [NSData dataWithContentsOfFile:rec]; int32_t n = 0;
-        if (d.length >= 4) memcpy(&n, d.bytes, 4);
-        if (![have containsObject:[NSString stringWithFormat:@"%d", n]]) { fprintf(stderr, "boot: program %d is not in this app; program 0\n", n); n = 0; d = nil; }
-        prog = [NSString stringWithFormat:@"p%d", n];
-        if (d.length > 4) {
-            NSString *lp = [doc stringByAppendingPathComponent:@"launch_param.bin"];
-            [[d subdataWithRange:NSMakeRange(4, d.length - 4)] writeToFile:lp atomically:YES];
-            setenv("DM_LAUNCH_PARAM", lp.fileSystemRepresentation, 1);
-        }
-        setenv("DM_PROGRAM", [NSString stringWithFormat:@"%d", n].UTF8String, 1);
-        setenv("DM_EMBED_TAG", prog.UTF8String, 1);
-        setenv("DM_EXEC_OUT", rec.fileSystemRepresentation, 0);
-        dmdir = [dmdir stringByAppendingPathComponent:prog]; msl = [msl stringByAppendingPathComponent:prog];
-        setenv("DM_APP_DM", dmdir.fileSystemRepresentation, 1);   // the launcher's settings (Launcher.swift)
-        fprintf(stderr, "boot: program %d of %s (%zu bytes of launch parameter)\n", n, [[plist stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] stringByReplacingOccurrencesOfString:@"\n" withString:@" "].UTF8String, d.length > 4 ? (size_t)d.length - 4 : 0);
-    }
-    NSString *romfs = romfs_locate(prog);
-    if (!romfs) { fprintf(stderr, "boot: game files not found (<App>/romfs or Documents/romfs)\n"); return 0; }
-    fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
-    setenv("DM_ROMFS", romfs.fileSystemRepresentation, 0);
+    NSString *dm = program_env(0);
+    if (!dm) return 0;
     setenv("DM_SAVE", [doc stringByAppendingPathComponent:@"save"].fileSystemRepresentation, 0);
     setenv("DM_TEMP", [doc stringByAppendingPathComponent:@"temp"].fileSystemRepresentation, 0);
-    NSString *dm = dmdir;
-    setenv("DM_NVN_SHMAP", [dm stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
-    setenv("DM_MSL_DIR", msl.fileSystemRepresentation, 0);
     setenv("DM_FONT_DIR", [[res stringByAppendingPathComponent:@"dm"] stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
     NSString *aoc = [res stringByAppendingPathComponent:@"aoc"];   // add-on content: build_ipa.sh puts the RomFS extracted from the player's DLC NSPs at <App>/aoc/<index>/
     if ([fm fileExistsAtPath:aoc]) setenv("DM_AOC_DIR", aoc.fileSystemRepresentation, 0);
@@ -140,7 +153,9 @@ int front_ios_boot_ok(void) { return g_boot_ok; }
 - (void)sceneDidBecomeActive:(UIScene *)s { front_ios_focus_event(3); }
 @end
 
+void dm_runstate_snapshot(void);
 int main(int argc, char **argv) {
+    dm_runstate_snapshot();   // the host's per-run statics as they are at process start, before the early loading runs host code (progswitch.c)
     @autoreleasepool { g_boot_ok = boot_env(); }
     @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass(App.class)); }
 }

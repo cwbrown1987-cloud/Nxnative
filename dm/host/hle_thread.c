@@ -19,6 +19,7 @@
 #include <pthread/qos.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
+#include <setjmp.h>
 
 #define R_TIMEOUT     0xEA01u   // Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -82,6 +83,7 @@ typedef struct thr {
     const uint32_t *whs; int whn;   // WaitSynchronization's handle array (guest memory, valid while the thread waits there): a signal wakes only waiters that hold the signalled object
     int ctx_ok; uint64_t ctx_x[29], ctx_fp, ctx_lr, ctx_sp, ctx_pc; uint32_t ctx_pstate, ctx_fpcr, ctx_fpsr; __uint128_t ctx_v[32];
     pthread_cond_t pcv;
+    sigjmp_buf *term_jb;       // where the thread leaves to when the run ends (dm_threads_terminate): thread_main's frame, or the main thread's (dm_thread_main_exit_point)
 } thr_t;
 static thr_t *g_all;
 extern __thread _Atomic int dm_host_work;   // declared in hle.h too; defined in hle_nvn.c
@@ -90,9 +92,25 @@ static _Atomic uint64_t g_preempt_n, g_preempt_ns, g_preempt_cap;   // same-core
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
-static pthread_key_t g_keythr;
+DM_PROCESS static pthread_key_t g_keythr; DM_PROCESS static int g_keythr_made;   // process-lifetime (dm_run.h): created once, every run's threads use it
 static uint64_t g_next_id = 0x51;
 static thr_t *g_wait;          // All waiting threads (lock / condition / address / synchronization)
+// The run ends (an in-process program switch, progswitch.c): every guest thread leaves at its next point that holds no host lock -- SVC entry or exit, a wait here once G is
+// released, a sleep, or guest code when the SIGUSR2 handler finds it there -- by a siglongjmp to the host frame it started from (term_jb), and is then counted as exited.
+// Host code that a guest thread runs outside an SVC (an HLE function) is not interrupted: the thread leaves when it returns to guest code or makes an SVC
+static _Atomic int g_term;
+static pthread_cond_t g_term_cv = PTHREAD_COND_INITIALIZER;   // broadcast under G when a thread leaves
+static void term_mark(thr_t *t);
+static __attribute__((noreturn)) void term_self(thr_t *t) {   // holding no host lock
+    if (!t->term_jb) die("thread %#x has no exit point for the end of the run", t->handle);
+    siglongjmp(*t->term_jb, 1);
+}
+int dm_terminating(void) { return atomic_load(&g_term); }
+void dm_threads_term_begin(void) { atomic_store(&g_term, 1); }   // the run ends (progswitch.c): from now on every guest thread leaves at its next point
+void dm_thread_term_check(void) {   // host code on a guest thread that holds no host lock may leave here when the run ends
+    if (!atomic_load(&g_term)) return;
+    thr_t *t = pthread_getspecific(g_keythr); if (t && t->term_jb) term_self(t);
+}
 
 static uint32_t h_new(int type, void *obj) {     // Caller holds G
     for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; return 0x1000 + i; }
@@ -177,6 +195,7 @@ static int64_t block(thr_t *t, int kind, int64_t ns) {
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
     while (!t->woke) {
         int rc;
+        if (atomic_load(&g_term) && t->term_jb) { wait_unlink(t); t->wkind = 0; pthread_mutex_unlock(&G); term_self(t); }
         if (det_wait) {
             uint64_t now = guest_ns();
             if (now >= guest_deadline) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
@@ -240,7 +259,9 @@ static void qos_apply(thr_t *t) {   // on the thread itself
 void dm_host_helper_qos(qos_class_t q) { if (g_qos_map) pthread_set_qos_class_self_np(q, 0); }
 static const char *thr_name(thr_t *t, char *buf, size_t n);
 static void *thread_main(void *p) {
-    thr_t *t = p;
+    thr_t *t = p; sigjmp_buf jb;
+    if (sigsetjmp(jb, 1)) { term_mark(t); return NULL; }   // the run ended (term_self): the pthread ends here, its TSD destructors free the TLS blocks
+    t->term_jb = &jb;
     pthread_setspecific(g_keythr, t);
     pthread_set_qos_class_self_np(prio_qos(t->prio), 0);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
@@ -248,7 +269,8 @@ static void *thread_main(void *p) {
     t->mport = pthread_mach_thread_np(pthread_self()); t->host_work = &dm_host_work;
     crash_thread_init();
     guest_thread_init();
-    pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); while (!t->started && !atomic_load(&g_term)) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
+    if (!t->started) term_self(t);   // created, never started, and the run ended
     { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, thr_name(t, nb, sizeof nb)); pthread_setname_np(hn); }   // the guest's name (set before StartThread) for sample / Instruments
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
     die("guest thread entry returned");
@@ -270,6 +292,58 @@ static void thread_exit(thr_t *t) {
     pthread_exit(NULL);
 }
 void dm_thread_returned(void) { die("guest thread entry function returned (Horizon requires ExitThread)"); }
+// ---------- End of the run (an in-process program switch, progswitch.c) ----------
+static void term_mark(thr_t *t) {   // on the leaving thread, after its siglongjmp
+    pthread_mutex_lock(&G);
+    t->exit_ns = now_ns(); t->exited = 1; t->wkind = 0;
+    pthread_setspecific(g_keythr, NULL);
+    pthread_cond_broadcast(&g_term_cv);
+    pthread_mutex_unlock(&G);
+}
+// The main guest thread's exit point: main.c sigsetjmps it before guest_main and passes it here once the thread is registered; dm_thread_main_left marks it after the siglongjmp
+static _Atomic int g_main_ready;   // the main guest thread has its exit point: the run can end
+void dm_thread_set_exit_point(sigjmp_buf *jb) { thr_t *t = pthread_getspecific(g_keythr); if (t) { t->term_jb = jb; atomic_store(&g_main_ready, 1); } }
+int dm_thread_main_ready(void) { return atomic_load(&g_main_ready); }
+void dm_thread_main_left(void) { thr_t *t = pthread_getspecific(g_keythr); if (t) term_mark(t); }
+// End every guest thread (called on a host thread that is not one): wake each from its wait, signal those in guest code, until all have left or timeout_ns passes.
+// Returns how many are still there (0 = all left); with any left, their state is logged and the caller must not take the run down
+int dm_threads_terminate(uint64_t timeout_ns) {
+    atomic_store(&g_term, 1);
+    uint64_t t0 = now_ns(), last_sig = 0; int live = 0, fenced = 0;
+    for (;;) {
+        pthread_t sig[256]; int ns = 0; live = 0;
+        pthread_mutex_lock(&G);
+        for (thr_t *t = g_all; t; t = t->all) {
+            if (t->exited || !t->pt) continue;
+            live++; pthread_cond_broadcast(&t->cv); pthread_cond_broadcast(&t->pcv);
+            if (!(atomic_load(&t->svc_state) & 1) && ns < 256) sig[ns++] = t->pt;   // in an SVC it leaves at the exit; else it may be in guest code
+        }
+        if (!live) { pthread_mutex_unlock(&G); break; }
+        uint64_t now = now_ns();
+        if (now - t0 > timeout_ns) { pthread_mutex_unlock(&G); break; }
+        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 1000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&g_term_cv, &G, &dl);
+        pthread_mutex_unlock(&G);
+        if (now - last_sig >= 5000000) { last_sig = now; for (int i = 0; i < ns; i++) pthread_kill(sig[i], SIGUSR2); }   // a stale id of a thread that just left is refused (ESRCH)
+        // Threads that keep to host code (HLE functions) are seldom caught in guest code by the signal: after 20 ms guest code loses execute permission, and they leave at their return
+        if (!fenced && now - t0 > 20000000) { void dm_modules_fence(void); fenced = 1; dm_modules_fence(); LOG("end of the run: %d guest thread(s) left after 20 ms; guest code fenced", live); }
+    }
+    if (live) {
+        LOG("[RED] end of the run: %d guest thread(s) still running after %.1f s", live, (now_ns() - t0) / 1e9);
+        pthread_mutex_lock(&G);
+        for (thr_t *t = g_all; t; t = t->all) if (!t->exited && t->pt) { char nb[48]; LOG("[RED]   thread %#x '%s' last svc %#x, in an SVC %d", t->handle, thr_name(t, nb, sizeof nb), t->last_svc, atomic_load(&t->svc_state) & 1); }
+        pthread_mutex_unlock(&G);
+    } else LOG("end of the run: every guest thread left (%.0f ms)", (now_ns() - t0) / 1e6);
+    return live;
+}
+// After dm_threads_terminate returned 0: free every thread and event object (the handle table itself is reset with the run's statics)
+void dm_threads_release(void) {
+    pthread_mutex_lock(&G);
+    for (int i = 1; i < MAX_H; i++) if (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W) { event_t *e = g_h[i].obj; g_h[i].type = O_FREE; if (--e->refs <= 0) free(e); }
+    while (g_all) thr_free(g_all);
+    g_wait = NULL;
+    pthread_mutex_unlock(&G);
+}
 
 // IL2CPP's Boehm garbage collector stops the world: SetThreadActivity(handle, paused) on each thread, GetThreadContext3 to read registers for roots, scan the stack, then resume. Both used to be placeholders that reported success:
 // threads kept running and the context was empty, so the collector missed pointers held only in registers and freed objects still in use (finalizers releasing native resources with them). They now really stop, as on Horizon:
@@ -280,8 +354,10 @@ module_t *module_of(const void *p);
 static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si;
     thr_t *t = pthread_getspecific(g_keythr);
-    if (!t || !atomic_load(&t->pause_req) || atomic_load(&t->svc_regs)) return;
+    if (!t || atomic_load(&t->svc_regs)) return;
     ucontext_t *uc = uc_; const struct __darwin_arm_thread_state64 *ss = &uc->uc_mcontext->__ss;
+    if (atomic_load(&g_term)) { if (t->term_jb && module_of((void *)__darwin_arm_thread_state64_get_pc(*ss))) term_self(t); return; }   // the run ends: leave from guest code
+    if (!atomic_load(&t->pause_req)) return;
     if (!module_of((void *)__darwin_arm_thread_state64_get_pc(*ss))) return;   // in host code: do not stop; the requester resends
     pthread_mutex_lock(&G);
     if (t->pause_req) {
@@ -294,27 +370,39 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
         t->ctx_sp = __darwin_arm_thread_state64_get_sp(*ss) - 32; t->ctx_pc = __darwin_arm_thread_state64_get_pc(*ss); t->ctx_pstate = ss->__cpsr;
         memcpy(t->ctx_v, uc->uc_mcontext->__ns.__v, sizeof t->ctx_v); t->ctx_fpcr = uc->uc_mcontext->__ns.__fpcr; t->ctx_fpsr = uc->uc_mcontext->__ns.__fpsr;
         t->ctx_ok = 1; t->paused = 1; pthread_cond_broadcast(&t->pcv);
-        while (t->pause_req) pthread_cond_wait(&t->pcv, &G);
+        while (t->pause_req && !atomic_load(&g_term)) pthread_cond_wait(&t->pcv, &G);
         t->paused = 0; t->ctx_ok = 0;
     }
     pthread_mutex_unlock(&G);
+    if (atomic_load(&g_term) && t->term_jb) term_self(t);   // still in guest code (the handler interrupted it there)
 }
 // called by the gate on SVC entry / exit (gate_dispatch in hle.c)
 void thr_svc_enter(uint64_t *regs, uint64_t pc) {
     thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
+    if (atomic_load(&g_term) && t->term_jb) term_self(t);
     t->svc_pc = pc; t->svc_x18 = (uint64_t)(uintptr_t)pthread_getspecific(g_key18); atomic_store(&t->svc_regs, regs); atomic_fetch_or(&t->svc_state, 1);
     if (atomic_load_explicit(&t->qos_pending, memory_order_relaxed) && atomic_exchange(&t->qos_pending, 0)) qos_apply(t);
     if (atomic_load(&t->pause_req)) { pthread_mutex_lock(&G); if (t->pause_req && !t->paused) { t->paused = 1; pthread_cond_broadcast(&t->pcv); } pthread_mutex_unlock(&G); }
 }
 void thr_svc_leave(void) {
     thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
+    if (atomic_load(&g_term) && t->term_jb) { atomic_store(&t->svc_state, 0); atomic_store(&t->svc_regs, NULL); term_self(t); }
     int in = 1; if (atomic_compare_exchange_strong(&t->svc_state, &in, 0)) { atomic_store(&t->svc_regs, NULL); return; }   // no pause requested: G is not needed (every other thread's SVC takes it)
     pthread_mutex_lock(&G);
-    while (t->pause_req) { t->paused = 1; pthread_cond_broadcast(&t->pcv); pthread_cond_wait(&t->pcv, &G); }
+    while (t->pause_req && !atomic_load(&g_term)) { t->paused = 1; pthread_cond_broadcast(&t->pcv); pthread_cond_wait(&t->pcv, &G); }
     t->paused = 0; atomic_fetch_and(&t->svc_state, ~1); atomic_store(&t->svc_regs, NULL);
     pthread_mutex_unlock(&G);
 }
+// A guest thread that comes back into guest code after the modules were fenced (dm_modules_fence): it leaves from the fault (crash.c calls this hook first)
+static int term_fault(void *addr, int is_write, void *uc_) {
+    (void)addr; (void)is_write;
+    thr_t *t = pthread_getspecific(g_keythr); if (!atomic_load(&g_term) || !t || !t->term_jb) return 0;
+    ucontext_t *uc = uc_; if (module_of((void *)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss))) term_self(t);
+    return 0;
+}
+void dm_fault_hook_register(int (*fn)(void *addr, int is_write, void *uc));
 static void pause_install(void) {
+    dm_fault_hook_register(term_fault);
     struct sigaction sa = {.sa_sigaction = on_pause_sig, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART};
     sigemptyset(&sa.sa_mask);
     sigaction(SIGUSR2, &sa, NULL);
@@ -416,7 +504,7 @@ static void hitch_init(void) {
 }
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {
-    pthread_key_create(&g_keythr, NULL);
+    if (!g_keythr_made) { g_keythr_made = 1; pthread_key_create(&g_keythr, NULL); }
     qos_map_init();
     pause_install();
     hitch_init();
@@ -733,8 +821,9 @@ void dm_thread_cpu(char *out, size_t n, double secs) {
 // Each step sleeps only 3/4 of the remaining time (the slack is at most about 25%, so it never oversleeps), looping until within 20 µs: a 33 ms sleep takes about 4 system calls with an error of tens of microseconds, and nothing spins
 static void sleep_precise(uint64_t dl) {
     for (int i = 0; i < 16; i++) {
-        uint64_t now = now_ns(); if (now + 20000 >= dl) return;
+        uint64_t now = now_ns(); if (now + 20000 >= dl || atomic_load(&g_term)) return;
         uint64_t rem = dl - now, s = rem < 100000 ? rem : rem - rem / 4;
+        if (s > 20000000) { s = 20000000; i--; }   // at most 20 ms per step, so a long sleep sees the end of the run (dm_threads_terminate)
         struct timespec ts = {(time_t)(s / 1000000000u), (long)(s % 1000000000u)}; nanosleep(&ts, 0);
     }
 }
@@ -744,7 +833,7 @@ void dm_guest_sleep_ns(int64_t ns) {
     if (ns <= 0) return;
     if (dm_detclock_enabled()) {
         uint64_t deadline = guest_ns() + (uint64_t)ns;
-        while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
+        while (guest_ns() < deadline && !atomic_load(&g_term)) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
         return;
     }
     thr_t *me = pthread_getspecific(g_keythr); if (me) me->sleeping = 1;

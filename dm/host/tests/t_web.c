@@ -13,6 +13,8 @@ void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; }
 void hle_signal_system_event(void *g) { (void)g; ev_sig = 1; }
 void hle_clear_system_event(void *g) { (void)g; ev_sig = 0; }
 void dm_input_hold(int on) { held = on; }
+int dm_terminating(void) { return 0; }   // the end of a run (progswitch.c): no in-process switch here
+void dm_thread_term_check(void) {}
 int front_web_open(const char *dir, const char *path, const char *callback, int hidden, const dm_web_opts *o) {
     (void)o; if (!front_ok) return -1;
     opened++; hidden_at_open = hidden; snprintf(open_dir, sizeof open_dir, "%s", dir); snprintf(open_path, sizeof open_path, "%s", path); snprintf(open_cb, sizeof open_cb, "%s", callback);

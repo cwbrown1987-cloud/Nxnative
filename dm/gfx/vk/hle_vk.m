@@ -16,6 +16,7 @@
 #define VK_NO_PROTOTYPES
 #include "../../host/hle.h"
 #include "../nvn/nvn_mtl.h"
+#include "../nvn/nvn_hmap.h"
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan_vi.h>
 #import <Metal/Metal.h>
@@ -238,6 +239,12 @@ struct VkCommandBuffer_T { void *loader; VkCommandPool pool; struct VkCommandBuf
 struct VkSwapchainKHR_T { uint32_t n, next; VkImage img[4]; uint64_t ticket[4]; };
 
 static void *zalloc(size_t n) { void *p = calloc(1, n); if (!p) die("[vk] out of memory %zu", n); return p; }
+// Live handles that hold Metal objects (the game reaches them only through guest memory), so the end of a run can destroy what the game left (dm_vk_end_run):
+// handle → its kind, added at creation, removed at destruction
+enum { VR_MEM = 1, VR_BVIEW, VR_IMAGE, VR_IVIEW, VR_SAMPLER, VR_DPOOL, VR_SHADER, VR_PIPE, VR_SWAP };
+static nvn_hmap g_vreg = {.klen = 8}; static pthread_mutex_t g_vreg_mu = PTHREAD_MUTEX_INITIALIZER;
+static void vreg_add(const void *h, int kind) { pthread_mutex_lock(&g_vreg_mu); nvn_hm_put(&g_vreg, &h, (void *)(uintptr_t)kind); pthread_mutex_unlock(&g_vreg_mu); }
+static void vreg_del(const void *h) { pthread_mutex_lock(&g_vreg_mu); nvn_hm_del(&g_vreg, &h); pthread_mutex_unlock(&g_vreg_mu); }
 
 // ---------- Instance and physical device ----------
 static VkResult fill_names(const char *const *names, uint32_t n, uint32_t *count, VkExtensionProperties *p) {
@@ -429,12 +436,13 @@ static id<MTLBuffer> mem_buf(VkDeviceMemory m) {
 VK(vkAllocateMemory, VkResult, VkDevice d, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *a, VkDeviceMemory *out) {
     (void)d; (void)a;
     if (ai->memoryTypeIndex >= 3) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    VkDeviceMemory m = zalloc(sizeof *m); m->size = ai->allocationSize; m->type = ai->memoryTypeIndex;
+    VkDeviceMemory m = zalloc(sizeof *m); m->size = ai->allocationSize; m->type = ai->memoryTypeIndex; vreg_add(m, VR_MEM);
     OLOG("AllocateMemory %p %llu bytes type %u", (void *)m, (unsigned long long)m->size, m->type);
     *out = m; return VK_SUCCESS;
 }
 VKB(vkFreeMemory, void, VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks *a) {
     (void)d; (void)a; if (!m) return;
+    vreg_del(m);
     if (m->buf) g_mem_bytes -= m->size;
     m->buf = nil; free(m);
 }
@@ -466,11 +474,11 @@ VKB(vkBindBufferMemory2, VkResult, VkDevice d, uint32_t n, const VkBindBufferMem
     return VK_SUCCESS;
 }
 VK(vkCreateBufferView, VkResult, VkDevice d, const VkBufferViewCreateInfo *ci, const VkAllocationCallbacks *a, VkBufferView *out) {
-    (void)d; (void)a; VkBufferView v = zalloc(sizeof *v); v->buf = ci->buffer; v->f = fmt_of(ci->format); v->off = ci->offset; v->range = ci->range;
+    (void)d; (void)a; VkBufferView v = zalloc(sizeof *v); vreg_add(v, VR_BVIEW); v->buf = ci->buffer; v->f = fmt_of(ci->format); v->off = ci->offset; v->range = ci->range;
     if (!v->f || v->f->pf == MTLPixelFormatInvalid) RED1("buffer view format %d not mapped", ci->format);
     *out = v; return VK_SUCCESS;
 }
-VK(vkDestroyBufferView, void, VkDevice d, VkBufferView v, const VkAllocationCallbacks *a) { (void)d; (void)a; if (v) { v->tex = nil; free(v); } }
+VK(vkDestroyBufferView, void, VkDevice d, VkBufferView v, const VkAllocationCallbacks *a) { (void)d; (void)a; if (v) { vreg_del(v); v->tex = nil; free(v); } }
 static id<MTLTexture> bview_tex(VkBufferView v) {   // texel buffer as a linear texture over the buffer's storage, made at first use
     if (v->tex || !v->f || v->f->pf == MTLPixelFormatInvalid || !v->buf->mem) return v->tex;
     VkDeviceSize range = v->range == VK_WHOLE_SIZE ? v->buf->size - v->off : v->range, n = range / v->f->bytes;
@@ -497,7 +505,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
     // Metal's linear-texture alignment (which vkGetImageSubresourceLayout reports). Super Mario Galaxy fills staging images from the CPU this way and samples a 4x4 one
     if (ci->tiling == VK_IMAGE_TILING_LINEAR && ci->imageType == VK_IMAGE_TYPE_2D && ci->mipLevels <= 1 && ci->arrayLayers <= 1 && ci->samples <= 1 && f->kind != K_BLOCK && !fmt_has_depth(f) && !fmt_has_stencil(f)) {
         NSUInteger al = [g_dev minimumLinearTextureAlignmentForPixelFormat:f->pf]; if (!al) al = 256;
-        VkImage im = zalloc(sizeof *im);
+        VkImage im = zalloc(sizeof *im); vreg_add(im, VR_IMAGE);
         im->f = f; im->fmt = ci->format; im->type = ci->imageType; im->w = ci->extent.width; im->h = umax(1, ci->extent.height); im->d = im->mips = im->layers = im->samples = 1;
         im->usage = ci->usage; im->pitch = (uint32_t)(((NSUInteger)im->w * f->bytes + al - 1) / al * al); im->size = (VkDeviceSize)im->pitch * im->h;
         OLOG("CreateImage %p %ux%u format %d linear (pitch %u) usage %#x", (void *)im, im->w, im->h, ci->format, im->pitch, ci->usage);
@@ -527,7 +535,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         td.usage = u; td.storageMode = MTLStorageModePrivate;
         id<MTLTexture> t = [g_dev newTextureWithDescriptor:td];
         if (!t) { LOG("[vk] [RED] cannot create image %ux%ux%u format %d levels %u layers %u", ci->extent.width, ci->extent.height, ci->extent.depth, ci->format, ci->mipLevels, layers); return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
-        VkImage im = zalloc(sizeof *im);
+        VkImage im = zalloc(sizeof *im); vreg_add(im, VR_IMAGE);
         im->tex = t; im->f = f; im->fmt = ci->format; im->type = ci->imageType; im->w = (uint32_t)td.width; im->h = (uint32_t)td.height; im->d = (uint32_t)td.depth;
         im->mips = (uint32_t)td.mipmapLevelCount; im->layers = layers; im->samples = samples; im->size = img_bytes(f, im->w, im->h, im->d, im->mips, layers, samples);
         OLOG("CreateImage %p %ux%ux%u format %d levels %u layers %u usage %#x", (void *)im, im->w, im->h, im->d, ci->format, im->mips, layers, ci->usage);
@@ -536,7 +544,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
     return VK_SUCCESS;
 }
 static void conv_drop(VkImage im);
-VKB(vkDestroyImage, void, VkDevice d, VkImage im, const VkAllocationCallbacks *a) { (void)d; (void)a; if (im) { if (im->ccopy) conv_drop(im); im->tex = nil; free(im); } }
+VKB(vkDestroyImage, void, VkDevice d, VkImage im, const VkAllocationCallbacks *a) { (void)d; (void)a; if (im) { vreg_del(im); if (im->ccopy) conv_drop(im); im->tex = nil; free(im); } }
 // Converted linear images: a texture of their own in the Metal format, filled at each submit from the image's memory when its bytes changed since the last conversion.
 // The game finishes its CPU writes before it submits the work that samples them (Vulkan's host write ordering), so the submit is where the bytes are final
 static pthread_mutex_t g_conv_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -644,7 +652,7 @@ VKB(vkCreateImageView, VkResult, VkDevice d, const VkImageViewCreateInfo *ci, co
     MTLTextureSwizzleChannels sw = MTLTextureSwizzleChannelsMake(swz(ci->components.r, MTLTextureSwizzleRed), swz(ci->components.g, MTLTextureSwizzleGreen),
                                                                  swz(ci->components.b, MTLTextureSwizzleBlue), bc1rgb ? MTLTextureSwizzleOne : swz(ci->components.a, MTLTextureSwizzleAlpha));
     int ident = sw.red == MTLTextureSwizzleRed && sw.green == MTLTextureSwizzleGreen && sw.blue == MTLTextureSwizzleBlue && sw.alpha == MTLTextureSwizzleAlpha;
-    VkImageView v = zalloc(sizeof *v); v->img = im;
+    VkImageView v = zalloc(sizeof *v); v->img = im; vreg_add(v, VR_IVIEW);
     if (pf == im->tex.pixelFormat && tt == im->tex.textureType && !r->baseMipLevel && lv == im->mips && !r->baseArrayLayer && ly == im->layers && ident) v->tex = im->tex;
     else @autoreleasepool {
         v->tex = [im->tex newTextureViewWithPixelFormat:pf textureType:tt levels:NSMakeRange(r->baseMipLevel, lv)
@@ -653,7 +661,7 @@ VKB(vkCreateImageView, VkResult, VkDevice d, const VkImageViewCreateInfo *ci, co
     }
     *out = v; return VK_SUCCESS;
 }
-VKB(vkDestroyImageView, void, VkDevice d, VkImageView v, const VkAllocationCallbacks *a) { (void)d; (void)a; if (v) { v->tex = nil; free(v); } }
+VKB(vkDestroyImageView, void, VkDevice d, VkImageView v, const VkAllocationCallbacks *a) { (void)d; (void)a; if (v) { vreg_del(v); v->tex = nil; free(v); } }
 
 static MTLSamplerAddressMode addr_mode(VkSamplerAddressMode m) {
     switch (m) {
@@ -679,13 +687,13 @@ VKB(vkCreateSampler, VkResult, VkDevice d, const VkSamplerCreateInfo *ci, const 
         sd.lodMinClamp = ci->minLod; sd.lodMaxClamp = ci->maxLod;
         sd.normalizedCoordinates = !ci->unnormalizedCoordinates;
         if (ci->mipLodBias != 0) RED1("sampler LOD bias %.2f not implemented", ci->mipLodBias);
-        VkSampler s = zalloc(sizeof *s); s->s = [g_dev newSamplerStateWithDescriptor:sd];
+        VkSampler s = zalloc(sizeof *s); s->s = [g_dev newSamplerStateWithDescriptor:sd]; vreg_add(s, VR_SAMPLER);
         if (!s->s) LOG("[vk] [RED] cannot create the sampler");
         *out = s;
     }
     return VK_SUCCESS;
 }
-VKB(vkDestroySampler, void, VkDevice d, VkSampler s, const VkAllocationCallbacks *a) { (void)d; (void)a; if (s) { s->s = nil; free(s); } }
+VKB(vkDestroySampler, void, VkDevice d, VkSampler s, const VkAllocationCallbacks *a) { (void)d; (void)a; if (s) { vreg_del(s); s->s = nil; free(s); } }
 
 // ---------- Descriptor sets ----------
 static int is_dyn(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC; }
@@ -721,7 +729,7 @@ VK(vkCreateDescriptorSetLayout, VkResult, VkDevice d, const VkDescriptorSetLayou
 }
 VK(vkDestroyDescriptorSetLayout, void, VkDevice d, VkDescriptorSetLayout L, const VkAllocationCallbacks *a) { (void)d; (void)L; (void)a; }   // kept: sets allocated from it still read it
 VK(vkCreateDescriptorPool, VkResult, VkDevice d, const VkDescriptorPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorPool *out) {
-    (void)d; (void)ci; (void)a; *out = zalloc(sizeof **out); return VK_SUCCESS;
+    (void)d; (void)ci; (void)a; *out = zalloc(sizeof **out); vreg_add(*out, VR_DPOOL); return VK_SUCCESS;
 }
 // The sets that exist: a set freed with its pool (reset or destroyed) may still be named to vkFreeDescriptorSets. Super Mario 64 (Super Mario 3D All-Stars) does so when it ends
 // to go back to the launcher, and freeing the set again read freed memory (a crash in set_free); a free of a set that no longer exists is ignored
@@ -743,7 +751,7 @@ static void set_free(VkDescriptorSet s) {
     free(s->d); free(s);
 }
 VK(vkResetDescriptorPool, VkResult, VkDevice d, VkDescriptorPool p, VkDescriptorPoolResetFlags f) { (void)d; (void)f; while (p->sets) set_free(p->sets); return VK_SUCCESS; }
-VK(vkDestroyDescriptorPool, void, VkDevice d, VkDescriptorPool p, const VkAllocationCallbacks *a) { (void)a; if (p) { h_vkResetDescriptorPool(d, p, 0); free(p); } }
+VK(vkDestroyDescriptorPool, void, VkDevice d, VkDescriptorPool p, const VkAllocationCallbacks *a) { (void)a; if (p) { vreg_del(p); h_vkResetDescriptorPool(d, p, 0); free(p); } }
 VK(vkAllocateDescriptorSets, VkResult, VkDevice d, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out) {
     (void)d;
     for (uint32_t i = 0; i < ai->descriptorSetCount; i++) {
@@ -870,7 +878,7 @@ static void sh_capture(const char *key, const void *code, size_t n) {
 VKB(vkCreateShaderModule, VkResult, VkDevice d, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out) {
     (void)d; (void)a; dev_init();
     uint8_t h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(ci->pCode, (CC_LONG)ci->codeSize, h);
-    VkShaderModule m = zalloc(sizeof *m);
+    VkShaderModule m = zalloc(sizeof *m); vreg_add(m, VR_SHADER);
     for (int i = 0; i < 8; i++) snprintf(m->key + 2 * i, 3, "%02x", h[i]);
     sh_capture(m->key, ci->pCode, ci->codeSize);
     m->si = sh_find(m->key);
@@ -879,7 +887,7 @@ VKB(vkCreateShaderModule, VkResult, VkDevice d, const VkShaderModuleCreateInfo *
     else OLOG("CreateShaderModule %s", m->key);
     *out = m; return VK_SUCCESS;
 }
-VKB(vkDestroyShaderModule, void, VkDevice d, VkShaderModule m, const VkAllocationCallbacks *a) { (void)d; (void)a; if (m) { m->fn = m->fn_d = nil; m->spec = nil; free(m); } }
+VKB(vkDestroyShaderModule, void, VkDevice d, VkShaderModule m, const VkAllocationCallbacks *a) { (void)d; (void)a; if (m) { vreg_del(m); m->fn = m->fn_d = nil; m->spec = nil; free(m); } }
 // Pipeline caches hold nothing: the game's initial data is NVIDIA's binary cache (Super Mario Galaxy's data/database/vulkan/*.cache), and Metal keeps its own
 VK(vkCreatePipelineCache, VkResult, VkDevice d, const VkPipelineCacheCreateInfo *ci, const VkAllocationCallbacks *a, VkPipelineCache *out) {
     (void)d; (void)ci; (void)a; *out = zalloc(sizeof **out); return VK_SUCCESS;
@@ -956,7 +964,7 @@ static id<MTLFunction> spec_fn(VkShaderModule m, id<MTLFunction> base, const VkS
     return f;
 }
 static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
-    VkPipeline p = zalloc(sizeof *p); p->layout = ci->layout;
+    VkPipeline p = zalloc(sizeof *p); p->layout = ci->layout; vreg_add(p, VR_PIPE);
     @autoreleasepool {
         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
         char keys[64] = ""; int dual = dual_source(ci->pColorBlendState);
@@ -1067,7 +1075,7 @@ VKB(vkCreateGraphicsPipelines, VkResult, VkDevice d, VkPipelineCache c, uint32_t
     for (uint32_t i = 0; i < n; i++) out[i] = pipe_make(&ci[i]);   // a pipeline Metal refuses is still handed out: its draws are skipped
     return VK_SUCCESS;
 }
-VKB(vkDestroyPipeline, void, VkDevice d, VkPipeline p, const VkAllocationCallbacks *a) { (void)d; (void)a; if (p) { p->pso = nil; p->dss = nil; free(p); } }
+VKB(vkDestroyPipeline, void, VkDevice d, VkPipeline p, const VkAllocationCallbacks *a) { (void)d; (void)a; if (p) { vreg_del(p); p->pso = nil; p->dss = nil; free(p); } }
 
 // ---------- Command buffers: recording ----------
 enum { C_BRP = 1, C_ERP, C_PIPE, C_SETS, C_VB, C_IB, C_VP, C_SC, C_DRAWI, C_COPYB, C_COPYB2I, C_DRAW, C_PUSH, C_COPYI, C_COPYI2B, C_QRESET, C_QTS, C_QBEGIN, C_QEND, C_CLRC, C_CLRDS, C_STENCIL };
@@ -1671,7 +1679,7 @@ VKB(vkCreateSwapchainKHR, VkResult, VkDevice d, const VkSwapchainCreateInfoKHR *
     (void)d; (void)a; dev_init();
     const fmt_t *f = fmt_of(ci->imageFormat);
     if (!f || f->pf == MTLPixelFormatInvalid) { LOG("[vk] [RED] swap chain format %d not mapped", ci->imageFormat); return VK_ERROR_FORMAT_NOT_SUPPORTED; }
-    VkSwapchainKHR sc = zalloc(sizeof *sc); sc->n = umin(umax(ci->minImageCount, 2), 4);
+    VkSwapchainKHR sc = zalloc(sizeof *sc); sc->n = umin(umax(ci->minImageCount, 2), 4); vreg_add(sc, VR_SWAP);
     @autoreleasepool {
         for (uint32_t i = 0; i < sc->n; i++) {
             MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f->pf width:ci->imageExtent.width height:ci->imageExtent.height mipmapped:NO];
@@ -1689,6 +1697,7 @@ VKB(vkCreateSwapchainKHR, VkResult, VkDevice d, const VkSwapchainCreateInfoKHR *
 }
 VKB(vkDestroySwapchainKHR, void, VkDevice d, VkSwapchainKHR sc, const VkAllocationCallbacks *a) {
     (void)d; (void)a; if (!sc) return;
+    vreg_del(sc);
     for (uint32_t i = 0; i < sc->n; i++) { if (sc->ticket[i]) mtl_present_wait(sc->ticket[i]); sc->img[i]->tex = nil; free(sc->img[i]); }   // the present path keeps its own reference to each texture
     free(sc);
 }
@@ -1790,3 +1799,33 @@ VK(vkDebugReportMessageEXT, void, VkInstance i, VkDebugReportFlagsEXT f, VkDebug
 }
 VK(vkGetInstanceProcAddr, PFN_vkVoidFunction, VkInstance i, const char *name) { (void)i; return (PFN_vkVoidFunction)vk_lookup(name); }
 VK(vkGetDeviceProcAddr, PFN_vkVoidFunction, VkDevice d, const char *name) { (void)d; return (PFN_vkVoidFunction)vk_lookup(name); }
+// End of the run (an in-process program switch, progswitch.c), after dm_gfx_suspend(1) drained the queue, with no guest thread left: every handle the game did not
+// destroy is destroyed here as the game would (swap chains, pipelines and shader modules, descriptor pools with their sets, views, samplers, images, then memory), and the
+// layer's own Metal objects are released, before the run's statics are reset
+void dm_vk_end_run(void) {
+    pthread_mutex_lock(&g_vreg_mu);
+    uint32_t n = g_vreg.n, k = 0; struct { void *h; int kind; } *v = calloc(n ? n : 1, sizeof *v);
+    for (uint32_t i = 0; i < g_vreg.cap && k < n; i++) if (g_vreg.vals[i]) { memcpy(&v[k].h, g_vreg.keys + (size_t)i * 8, 8); v[k++].kind = (int)(uintptr_t)g_vreg.vals[i]; }
+    pthread_mutex_unlock(&g_vreg_mu);
+    static const int order[] = {VR_SWAP, VR_PIPE, VR_SHADER, VR_DPOOL, VR_IVIEW, VR_BVIEW, VR_SAMPLER, VR_IMAGE, VR_MEM};
+    int cnt[16] = {0};
+    for (size_t o = 0; o < sizeof order / sizeof *order; o++) for (uint32_t i = 0; i < k; i++) if (v[i].kind == order[o]) {
+        cnt[v[i].kind]++;
+        switch (v[i].kind) {
+        case VR_SWAP: h_vkDestroySwapchainKHR(&g_device, v[i].h, NULL); break;
+        case VR_PIPE: h_vkDestroyPipeline(&g_device, v[i].h, NULL); break;
+        case VR_SHADER: h_vkDestroyShaderModule(&g_device, v[i].h, NULL); break;
+        case VR_DPOOL: h_vkDestroyDescriptorPool(&g_device, v[i].h, NULL); break;
+        case VR_IVIEW: h_vkDestroyImageView(&g_device, v[i].h, NULL); break;
+        case VR_BVIEW: h_vkDestroyBufferView(&g_device, v[i].h, NULL); break;
+        case VR_SAMPLER: h_vkDestroySampler(&g_device, v[i].h, NULL); break;
+        case VR_IMAGE: h_vkDestroyImage(&g_device, v[i].h, NULL); break;
+        case VR_MEM: h_vkFreeMemory(&g_device, v[i].h, NULL); break;
+        }
+    }
+    free(v); free(g_vreg.keys); free(g_vreg.vals); memset(&g_vreg, 0, sizeof g_vreg);
+    free(g_conv); g_conv = NULL; g_nconv = g_capconv = 0;
+    g_dev = nil; g_q = nil; g_ev = nil; g_dss_off = nil; g_lib = nil;
+    if (k) LOG("[vk] end of the run: destroyed what the game left: %d memory, %d images, %d image views, %d buffer views, %d samplers, %d descriptor pools, %d shader modules, %d pipelines, %d swap chains",
+               cnt[VR_MEM], cnt[VR_IMAGE], cnt[VR_IVIEW], cnt[VR_BVIEW], cnt[VR_SAMPLER], cnt[VR_DPOOL], cnt[VR_SHADER], cnt[VR_PIPE], cnt[VR_SWAP]);
+}

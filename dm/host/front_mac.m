@@ -17,6 +17,7 @@
 #include "haptics_apple.h"
 #include <signal.h>
 #include <math.h>
+#pragma clang section bss="" data=""   // process-lifetime statics, not reset by a program switch (dm_run.h): the Mac front end
 
 static CAMetalLayer *g_layer;
 static uint64_t g_btn;

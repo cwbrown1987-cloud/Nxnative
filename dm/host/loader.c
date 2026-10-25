@@ -4,6 +4,7 @@
 #include <TargetConditionals.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <mach-o/getsect.h>
@@ -18,7 +19,9 @@ int g_nmod;
 // Stable module addresses live in g_mod; lookup order follows activation, including unload/reload.
 static module_t *g_loaded[MAX_MOD]; static int g_nloaded;
 static pthread_rwlock_t g_modules_mu = PTHREAD_RWLOCK_INITIALIZER;
-pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
+// The thread slot keys live for the process (DM_PROCESS): every program run of an in-process switch reuses them (their numbers go into each run's key pages), so no key leaks per switch
+DM_PROCESS pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
+DM_PROCESS static int g_keys_made;
 enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_N };
 
 uint64_t resolve_import(module_t *m, const char *name);
@@ -32,6 +35,8 @@ static pthread_key_t key_value(unsigned i) {
     }
 }
 static void create_keys(void) {
+    if (g_keys_made) return;
+    g_keys_made = 1;
     if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) ||
         pthread_key_create(&g_keytlr, NULL) || pthread_key_create(&g_keygate, NULL)) die("cannot create the host key");
     LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", g_key18, g_keytls, g_keytlr, g_keygate);
@@ -108,6 +113,17 @@ void *guest_sym(const char *name) {
     return p;
 }
 // For modules with the patch area before the base (patch_off < 0) addresses in the patch area count too, as for modules whose patch area follows the image (crash reports, the GC pause's "in guest code" test)
+// End of the run (hle_thread.c dm_threads_terminate): the modules' code and patch areas lose execute permission, so a guest thread that comes back from host code into
+// guest code faults there and leaves (hle_thread.c term_fault) instead of running on. Reads stay allowed. The modules are unmapped afterwards
+void dm_modules_fence(void) {
+    for (int i = 0; i < g_nmod; i++) {
+        module_t *m = &g_mod[i]; if (!m->base) continue;
+        uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
+        if (mprotect(m->base, rx, PROT_READ)) LOG("[RED] %s: the code could not be fenced (errno %d)", m->name, errno);
+        if (m->patch_off < 0) { if (m->patch_len && mprotect(m->base + m->patch_off, m->patch_len, PROT_READ)) LOG("[RED] %s: the patch area could not be fenced (errno %d)", m->name, errno); }
+        else { uint64_t po = m->patch_off & ~0x3FFFull; if (po < m->size && mprotect(m->base + po, m->size - po, PROT_READ)) LOG("[RED] %s: the patch area could not be fenced (errno %d)", m->name, errno); }
+    }
+}
 module_t *module_of(const void *p) {
     for (int i = 0; i < g_nmod; i++) {
         const uint8_t *b = g_mod[i].base;
@@ -688,4 +704,27 @@ void run_module_inits(void) {
         LOG("%s: DT_INIT +%#llx (init_array %llu entries)", m->name, m->init, m->init_arraysz / 8);
         ((void (*)(void))(m->base + m->init))();
     }
+}
+// End of the run (an in-process program switch, progswitch.c), with no guest thread left: every module image is unmapped and its tables freed
+void dm_modules_end_run(void) {
+    for (int i = 0; i < g_nmod; i++) {
+        module_t *m = &g_mod[i]; if (!m->base) continue;
+        uint8_t *a = m->base; size_t len = m->size;
+        if (m->patch_off < 0) { a += m->patch_off; len += (size_t)-m->patch_off; }
+#if TARGET_OS_IPHONE
+        vm_deallocate(mach_task_self(), (vm_address_t)a, len);
+#else
+        munmap(a, len);
+#endif
+        free(m->symh); free(m->pristine); m->base = NULL;
+    }
+    if (g_jit_base) {   // the reservation the modules and a served jit image sit in (DM_JIT_SERVE)
+#if TARGET_OS_IPHONE
+        vm_deallocate(mach_task_self(), (vm_address_t)g_jit_base, g_jit_span);
+#else
+        munmap(g_jit_base, g_jit_span);
+#endif
+    }
+    free(g_force_hits);
+    LOG("end of the run: %d module(s) unmapped", g_nmod);
 }

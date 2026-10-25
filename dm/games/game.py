@@ -215,7 +215,8 @@ if __name__ == '__main__':
             tmp = out.with_name(out.name + '.tmp'); tmp.write_text(text); tmp.replace(out)
     elif len(a) >= 3 and a[0] == 'header-multi':   # header-multi <out.h> <program>=<id>...
         out = Path(a[1]); out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(header_multi([(int(x.split('=')[0]), load(x.split('=')[1])) for x in a[2:]]))
+        text = header_multi([(int(x.split('=')[0]), load(x.split('=')[1])) for x in a[2:]])
+        if not (out.exists() and out.read_text() == text): out.write_text(text)   # only when it changes, as header does (the host Makefile runs it on every make)
     elif len(a) == 2 and a[0] == 'dir':
         print(load(a[1]).dir)
     elif len(a) == 3 and a[0] == 'link':   # link → the profile folder (replaced when it points elsewhere)

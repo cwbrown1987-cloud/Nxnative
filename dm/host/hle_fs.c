@@ -838,3 +838,10 @@ HLE_FORCE("_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE", "fsp-srv; save dat
 HLE_FORCE("_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE", "fsp-srv; file read priority, ignored by the host", void, h_fs_SetPrio, int prio) { (void)prio; }
 HLE_FORCE("_ZN2nn2fs6detail18IsEnabledAccessLogEj", "fsp-srv; access log always off (returns bool)", unsigned, h_fs_AccessLogMask, unsigned mask) { (void)mask; return 0; }
 HLE_FORCE("_ZN2nn2fs6detail18IsEnabledAccessLogEv", "fsp-srv; access log always off (returns bool)", unsigned, h_fs_AccessLog, void) { return 0; }
+// End of the run (an in-process program switch, progswitch.c): the game's open files are closed (a file handle is its fd; g_fmode marks the open ones). A save
+// transaction not committed stays in the mount's work folder, which the next mount of that save discards, as a power cut would on the console
+void dm_fs_end_run(void) {
+    int n = 0;
+    for (int fd = 0; fd < (int)sizeof g_fmode; fd++) if (g_fmode[fd]) { close(fd); g_fmode[fd] = 0; n++; }
+    if (n) LOG("end of the run: %d game file(s) closed", n);
+}

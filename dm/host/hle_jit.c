@@ -382,3 +382,13 @@ HLE_FORCE("_ZN2nn3jit12GenerateCodeEPNS0_9CodeRangeES2_NS0_9JitHandleEmPKvmRKS1_
     if (c1_out) *c1_out = o1;
     return ret;
 }
+// End of the run (an in-process program switch, progswitch.c), with no guest thread left: the environment the game did not destroy (Super Mario 64 keeps its one until
+// it ends) is freed as DestroyJitEnvironment frees it, less the plugin's own teardown, which is guest code: a plugin's code memory and the data memory are unmapped (a served
+// image's code memory is in the modules' layout, which the modules' end of the run releases)
+void dm_jit_end_run(void) {
+    jit_env *e = g_jit_env; if (!e) return;
+    g_jit_env = NULL;
+    LOG("end of the run: jit environment freed (code %#llx, data %#llx bytes)", (unsigned long long)e->rx_size, (unsigned long long)e->ro_size);
+    if (e->plugin) munmap((void *)e->rx, e->rx_size);
+    munmap((void *)e->ro, e->ro_size); pthread_mutex_destroy(&e->mu); free(e);
+}
