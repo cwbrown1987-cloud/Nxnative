@@ -33,6 +33,7 @@ static module_t *module_from(const ro_module *rm) {
 
 HLE_FORCE("_ZN2nn2ro18LookupModuleSymbolEPmPKNS0_6ModuleEPKc", "look up a definition by name in one loaded NRO", Result, h_ro_LookupModuleSymbol, uintptr_t *out, const void *mod, const char *name) {
     module_t *m = module_from(mod); void *p = m && name ? module_sym(m, name) : NULL;
+    static int n; if (n++ < 40) LOG("ro::LookupModuleSymbol %s → %p", name ? name : "(null)", p);
     if (!p) { static int red; if (!red++) LOG("[RED] ro::LookupModuleSymbol %s: %s", name ? name : "(null)", m ? "not defined in that module" : "not a loaded module"); return RO_FAIL; }
     if (out) *out = (uintptr_t)p;
     return 0;

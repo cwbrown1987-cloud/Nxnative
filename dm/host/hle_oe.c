@@ -81,8 +81,19 @@ HLE_FORCE("_ZN2nn2oe15EnableRecordingEv", "video recording switch; the host has 
 // Applet resource user ID (ARUID, the number am assigns to this process): the host has no am, and the SDK's own getter returns 0. SDK 20's OpenAudioRenderer (the CPU rendering + manual execution path, sdk+0x221730)
 //   aborts when it gets 0 (The Legend of Zelda: Breath of the Wild 1.9.0); SDK 16 did not check. Report a fixed non-zero ID, used only as an identifier
 HLE_FORCE("_ZN2nn6applet23GetAppletResourceUserIdEv", "applet resource user ID; the host returns a fixed non-zero value", uint64_t, h_applet_Aruid, void) { return 0x80; }
-// Launch parameter (present only when another program launched this one with one; returns bool): the host never passes one
-HLE_FORCE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", "launch parameter: none", unsigned, h_oe_PopLaunchParam, size_t *out, void *buf, size_t n) { (void)buf; (void)n; if (out) *out = 0; return 0; }
+// Launch parameter (present only when another program launched this one with one; returns bool, popped once as on Horizon). DM_LAUNCH_PARAM=<file>: its bytes are the parameter, as the
+// launching program passed them to oe::ExecuteProgram (Super Mario 3D All-Stars' menu hands each game 16 bytes: its LanguageCode and two volumes; Sunshine started without one quits at boot)
+HLE_FORCE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", "launch parameter: the bytes of DM_LAUNCH_PARAM's file, once; none without it", unsigned, h_oe_PopLaunchParam, size_t *out, void *buf, size_t n) {
+    static _Atomic int popped; const char *f = getenv("DM_LAUNCH_PARAM");
+    if (out) *out = 0;
+    if (!f || atomic_exchange(&popped, 1)) return 0;
+    FILE *fp = fopen(f, "rb");
+    if (!fp) { LOG("[RED] oe::TryPopLaunchParameter: cannot open DM_LAUNCH_PARAM %s", f); return 0; }
+    size_t got = buf ? fread(buf, 1, n, fp) : 0; fclose(fp);
+    LOG("oe::TryPopLaunchParameter: %zu bytes from %s", got, f);
+    if (out) *out = got;
+    return 1;
+}
 // Tears of the Kingdom (SDK 20.5.22): the index of the program that launched this one in a multi-program application. The SDK asks the applet proxy, which the host never opens
 // (null read in applet::GetPreviousProgramIndex right after the window setup); -1 = launched from the home menu
 HLE_FORCE("_ZN2nn2oe23GetPreviousProgramIndexEv", "previous program index: launched from HOME, -1", int, h_oe_PrevProgram, void) { return -1; }

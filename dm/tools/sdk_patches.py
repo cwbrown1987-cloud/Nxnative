@@ -155,4 +155,13 @@ CUTS = {
     (0x346190, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
     (0x34622c, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
+  # SDK 9.5.1 sdk cdb385c299fd (Super Mario 3D All-Stars 1.0.0: the Super Mario 64 and Super Mario Sunshine programs): the node area cut and Absolum's alignment cut. Sunshine's Hagi maps the
+  # GameCube's 32-bit address space 1:1 (hagi.config Mmu false) in one AllocateAddressRegion of 4 GB + 2 MB (main+0x125960), which failed in a 4.25 GB alias region after the 1 GB node area
+  # (the AddressRegionManager constructor at sdk+0xd2de0 writes the constant as an ORR immediate: orr w8,wzr,#0x3fe00000), and VammManager::AllocateAddressRegion (sdk+0xd2ef0) aligns it to
+  # 1 GB (+0xd2fec): up to 1 GB more lost before it, which the 6 GB a single iOS reservation allows cannot spare beside the heap
+  'cdb385c299fdba2786299ea08a86ca25': [
+    (0xd2df0, 'e8230b32', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0xd2e8c, 'e9230b32', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+    (0xd2fec, 'ea030232', '0a40a052', 'AllocateAddressRegion: alignment of regions of 1 GB and more mov w10,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)'),
+  ],
 }
