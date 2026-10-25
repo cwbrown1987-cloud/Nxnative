@@ -207,6 +207,13 @@ Most service calls can be found before they crash, before the first boot or the 
 
 ## Input
 
+### Steam Controller hotplug interrupts other players
+
+- **Symptom:** connecting a Steam Controller clears another controller's held input or rumble and makes it press a button to rejoin; a composite controller can appear as two players or lose native fallback after a partial exclusive open.
+- **Cause:** resetting every native profile covered the native/HID notification race, but discarded unrelated players. Independent opens of native and vendor siblings could leave half of one controller seized.
+- **Fix:** `controllers_mac.m` completes synchronous HID discovery before admitting a fresh, non-neutral native event. It gates only unadmitted snapshots and preserves established slots and the merged rumble owner. USB device ancestry, per-port Puck interface ancestry, or the OS physical-device ID groups sibling claims; report metadata selects the Triton endpoint. Opens commit together, suppression handles have no decoder, and failure releases only that group. Unknown physical identity constrains new claims instead of guessing a native instance. See [Mac controller behavior and fallback](../mac-controllers.md#steam-controller-2026).
+- **Found on:** synthetic native/HID race, ownership-failure and mixed-controller regressions in `dm/host/tests/t_controllers_mac.m`; physical controller/game validation remains pending.
+
 ### History reads fill every requested entry
 
 - **Symptom:** buttons and menus work, the sticks do nothing in play (Super Mario Odyssey: its first hint, "Look Around", waited forever); an `nn::diag` abort with Result 0x2aca in the first frames of `nnMain` (Hollow Knight: Silksong, Unity 6000.0.50f1: `bt: sdk+0x514580 main+0x1296c64 …`).

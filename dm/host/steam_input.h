@@ -1,7 +1,7 @@
 /*
  * Triton protocol adapted from SDL_hidapi_steam_triton.c and Valve's controller
  * structs in SDL e4ed62ee3f7d7fda8bf8e0f09e42b14a7ac11984. This is an altered,
- * standalone implementation, not the SDL driver. See docs/mac-app.md.
+ * standalone implementation, not the SDL driver. See docs/mac-controllers.md.
  *
  * Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
  * Copyright (C) Valve Corporation
