@@ -7,17 +7,20 @@
 #include <signal.h>
 #include <unistd.h>
 void hlecount_flush(void);
-void dm_host_shutdown(const char *why) {
+// then (oe::ExecuteProgram with DM_PROGRAMS, hle_oe.c): run instead of _exit once the host has stopped, also by the fallback (it starts another program in this process's place)
+void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg) {
     static _Atomic int once; if (atomic_exchange(&once, 1)) return;
     uint64_t t0 = now_ns(); LOG("received %s: graceful exit", why);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-        LOG("[RED] graceful exit not done in 1.5 seconds, exiting at once"); _exit(0); });
+        LOG("[RED] graceful exit not done in 1.5 seconds, exiting at once"); if (then) then(arg); _exit(0); });
     hlecount_flush();                               // DM_HLECOUNT: _exit does not run atexit, write a copy here
     dm_audio_suspend(1);
     dm_gfx_suspend(1);
     LOG("graceful exit done (%.3f s)", (now_ns() - t0) / 1e9);
+    if (then) then(arg);
     _exit(0);
 }
+void dm_host_shutdown(const char *why) { dm_host_shutdown_then(why, NULL, NULL); }
 void dm_term_install(void) {
     signal(SIGTERM, SIG_IGN);                       // do not take the default action: hand over to the GCD signal source to wrap up on an ordinary thread
     static dispatch_source_t src;

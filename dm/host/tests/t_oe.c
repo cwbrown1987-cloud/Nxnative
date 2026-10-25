@@ -11,6 +11,10 @@ void dm_audio_suspend(int on) { (void)on; }   // stubs for the bg item of DM_OE_
 void guest_clock_freeze_for(int reason, int on) { (void)reason; (void)on; }
 void dm_gfx_suspend(int on) { (void)on; }
 void dm_host_shutdown(const char *why) { (void)why; }   // hle_lifecycle.c: oe::ExecuteProgram with DM_EXEC_OUT ends the process
+static void (*g_then)(void *); static void *g_then_arg;   // what oe::ExecuteProgram with DM_PROGRAMS hands the graceful exit (prog_exec and its plan)
+void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg) { (void)why; g_then = then; g_then_arg = arg; }
+static int env_has(char **env, const char *kv) { for (; env && *env; env++) if (!strcmp(*env, kv)) return 1; return 0; }
+static int env_key(char **env, const char *k) { size_t n = strlen(k); for (; env && *env; env++) if (!strncmp(*env, k, n) && (*env)[n] == '=') return 1; return 0; }
 // The notification event (hle_thread.c binds a kernel event): the unit test only tracks whether it is signalled
 static int ev_bound, ev_sig;
 void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; ev_bound = 1; }
@@ -123,5 +127,23 @@ int main(void) {
     CHECK(pop_is(15) && empty(), "focus mode 2: focus notification 15");
     h_oe_SetFocusMode(1); dm_focus_set(2);
     CHECK(pop_is(15) && empty(), "focus mode 1: focus notification 15");
+    // DM_PROGRAMS (the Mac's multi-program run): the plan for the named program, its environment less every key a program's row sets, and the launch parameter in its run folder
+    { const char *tsv = "# programs\n0\texe=/h0\targ=/p0\tcwd=/r0\tDM_ROOT=/b0\tDM_AOC_DIR=/a0\n2\texe=/h2\targ=/p2\tcwd=/r2\tDM_ROOT=/b2\tDM_LANG=en-US\n";
+      char *envp[] = {"PATH=/bin", "DM_ROOT=/old", "DM_AOC_DIR=/aoc", "DM_LAUNCH_PARAM=/x", "DM_WINDOW=1", NULL}; prog_plan P;
+      CHECK(prog_plan_make(tsv, 2, envp, &P) && !strcmp(P.exe, "/h2") && !strcmp(P.arg, "/p2") && !strcmp(P.cwd, "/r2") && !strcmp(P.param, "/r2/launch_param.bin"), "DM_PROGRAMS: program 2's host, modules, run folder and launch parameter file");
+      CHECK(env_has(P.env, "PATH=/bin") && env_has(P.env, "DM_WINDOW=1") && env_has(P.env, "DM_ROOT=/b2") && env_has(P.env, "DM_LANG=en-US") && env_has(P.env, "DM_LAUNCH_PARAM=/r2/launch_param.bin"), "DM_PROGRAMS: the environment keeps what no row sets and takes the row's keys");
+      CHECK(!env_has(P.env, "DM_ROOT=/old") && !env_key(P.env, "DM_AOC_DIR") && !env_has(P.env, "DM_LAUNCH_PARAM=/x"), "DM_PROGRAMS: another program's keys (DM_AOC_DIR) and the old launch parameter are dropped");
+      CHECK(!prog_plan_make(tsv, 3, envp, &P) && !prog_plan_make("# none\n", 0, envp, &P), "DM_PROGRAMS: no row for program 3 (not packed): no plan");
+      char dir[] = "/tmp/t_oe_XXXXXX"; CHECK(mkdtemp(dir) != NULL, "temporary folder");
+      char tf[256], row[1024]; snprintf(tf, sizeof tf, "%s/programs.tsv", dir); snprintf(row, sizeof row, "0\texe=/h0\targ=/p0\tcwd=%s\tDM_ROOT=/b0\n", dir);
+      FILE *f = fopen(tf, "w"); fputs(row, f); fclose(f); setenv("DM_PROGRAMS", tf, 1);
+      g_then = NULL; h_oe_ExecProgram(3, "abc", 3);
+      CHECK(!g_then, "ExecuteProgram(3) with no row: logged, the game carries on (no exit)");
+      static const uint8_t prm[16] = {'e', 'n', '-', 'U', 'S', 0, 0, 0, 0x33, 0x33, 0xb3, 0x3e, 0x33, 0x33, 0x33, 0x3f};
+      h_oe_ExecProgram(0, prm, sizeof prm);
+      char pp[300]; snprintf(pp, sizeof pp, "%s/launch_param.bin", dir); uint8_t got[32] = {0}; size_t gn = 0; f = fopen(pp, "rb"); if (f) { gn = fread(got, 1, sizeof got, f); fclose(f); }
+      CHECK(g_then == prog_exec && g_then_arg && !strcmp(((prog_plan *)g_then_arg)->exe, "/h0"), "ExecuteProgram(0): the graceful exit then starts program 0's host");
+      CHECK(gn == sizeof prm && !memcmp(got, prm, sizeof prm), "ExecuteProgram(0): its 16 bytes of parameters are in <cwd>/launch_param.bin");
+      unlink(pp); unlink(tf); rmdir(dir); unsetenv("DM_PROGRAMS"); }
     printf("== oe %d checks, %d failed ==\n", checks, fails); return fails != 0;
 }
