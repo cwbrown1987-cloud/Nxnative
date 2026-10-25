@@ -1,0 +1,51 @@
+# Super Mario 3D All-Stars (010049900F546000, base game 1.0.0 = v0, no update), SDK 9.5.1: its program 2, Super Mario Sunshine (title ID base + 2, packed with --program 2).
+# A multi-program application: the launcher (program 0, NVN) starts Super Mario 64 (1, an N64 emulator on nn::jit), Sunshine (2) and Super Mario Galaxy (3, 32-bit ARM: not runnable
+# on Apple silicon) with oe::ExecuteProgram and hands each a 16-byte launch parameter (LanguageCode, two volume floats). The host takes it from DM_LAUNCH_PARAM (hle_oe.c).
+# NERD's "Hagi" GameCube layer, as Super Mario Galaxy's Wii one: the PowerPC code is statically recompiled into an NRO (data/gekko/MarioSunshine/nx/MarioSunshine.nrolz, loaded with
+# ro::LoadModule; nro_collect.py), and Hagi stands in for the GameCube (GX → Vulkan with SPIR-V generated at run time, the DSP by HLE, the memory card as save:/MarioSunshine/A.sav,
+# DVD reads from MarioSunshine/Super_Mario_Sunshine_Stardust-trimmed.gcm, whose marioEU.MAP is the DOL's link map). Its pause menu is an offline web page (hle_offline.c)
+
+# ---- Identity ----
+title_id	010049900F546002
+program_id	010049900F546002
+
+# ---- App ----
+name	Super Mario 3D All-Stars: Sunshine
+ipa	SuperMario3DAllStarsSunshine.ipa
+app_category	public.app-category.games
+# Hagi: a 3D game pad (the camera is on the right stick, menus on the D-pad)
+pad_layout	full
+# hagi.config: the pointer is the touch screen in handheld mode (Sunshine itself reads only the pad)
+op_mode	handheld
+
+# ---- Versions ----
+build	v0	1.0.0	main=ed0d7ace84eec7807225034ad8a30cfd	subsdk0=3b1090649ca17ee83e29f43600b63be5	sdk=cdb385c299fdba2786299ea08a86ca25
+package	v0
+shader_versions	v0
+
+# ---- Graphics ----
+# main imports Vulkan, not NVN: the host's Vulkan layer (dm/gfx/vk/hle_vk.m). Hagi generates its GX shaders as SPIR-V at run time from
+# data/database/pip/MarioSunshine/pipelineDB.pip; the NSP script captures them on the Mac (1,152 modules) and vk_shaders.py translates the capture
+
+# ---- Files ----
+# load order as on Horizon: main, subsdk0 (NintendoSDK_movie, for the MP4 movies in data/video_replace), sdk; subsdk1 (NintendoSDK_OpenGL) and subsdk2 (NintendoSDK_Vulkan) are
+# replaced by the host's Vulkan layer and not loaded. The game NRO is mapped from patched_v0/nro.tsv when Hagi loads it
+modules	main subsdk0 sdk
+romfs_marker	MarioSunshine/Super_Mario_Sunshine_Stardust-trimmed.gcm
+zip_store	.cache:.gcm:.har:.mp4:.nrolz:.png:.metallib
+
+# ---- Memory ----
+# NPDM system resource 8 MB; main sets a heap of pool − 64 MB. Hagi maps the GameCube's 32-bit address space 1:1 (hagi.config Mmu false) in one 4 GB + 2 MB address region
+# (main+0x125960) and its coroutine stacks in a second region, cut from 1 GB to 64 MB (patches.py); with the SDK's node area cut (sdk_patches.py) they end at +4.16 GB of the
+# alias region. Measured on the Mac (boot, the opening, Delfino Airstrip): the alias region touched up to +4.12 GB, the heap 450 MB of 1.12 GB.
+# 6 GB, the most iOS gives one reservation: 256 MB in front + alias 4.25 GB + stack 256 MB + heap region 1.25 GB
+mem_reserve	0x180000000
+mem_alias	0x110000000
+mem_stack	0x10000000
+# the game asks for a heap of pool − 64 MB: 1.19 GB in the 1.25 GB heap region
+app_pool	0x50000000
+sys_resource	0x800000
+
+# ---- Shader split ----
+shader_groups	/data/=data /MarioSunshine/=mariosunshine /.nrr/=nrr
+shader_note	Super Mario Sunshine has no NVN shaders (its SPIR-V shaders go through the Vulkan layer)

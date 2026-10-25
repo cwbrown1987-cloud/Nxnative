@@ -8,6 +8,7 @@
 // The base game may also be a cartridge dump (.xci, Monster Hunter Rise): its secure partition holds the NCAs, which carry their keys in the key area (no ticket).
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using LibHac.Common;
@@ -26,6 +27,8 @@ static class P {
     [DllImport("libc", SetLastError = true)] static extern int clonefile(string src, string dst, uint flags);
 
     static int Main(string[] a) {
+        // Numbers as the scripts parse them ("32.9 MB"): under a French locale the summary lines read "32,9 MB" and build_ipa_from_nsp.py's extracted() found 0 files
+        CultureInfo.DefaultThreadCurrentCulture = CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
         bool manifest = Array.IndexOf(a, "--manifest") >= 0; a = Array.FindAll(a, s => s != "--manifest");
         g_allow = Array.IndexOf(a, "--allow-damaged") >= 0; a = Array.FindAll(a, s => s != "--allow-damaged");
         int prog = 0, pi = Array.IndexOf(a, "--program");   // --program <index>: another program of a multi-program application (Super Mario 3D All-Stars: the menu is 0, each game 1-3)

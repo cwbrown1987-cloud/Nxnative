@@ -971,6 +971,10 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             t->whs = hs; t->whn = n; int64_t br = block(t, 4, left); t->whs = NULL; t->whn = 0;
             if (br == R_TIMEOUT) { r = R_TIMEOUT; break; }
         }
+        // A poll that found nothing (timeout 0, as TryWaitSystemEvent) right after a yield keeps the run of yields going (thr_yield): the loop only waits. Super Mario 3D All-Stars'
+        // Hagi main thread polls a system event and yields in turn (main+0x82c4), about 2.5 million times a second; each poll broke the run, the back-off never began, and the
+        // thread kept a host core busy (88% of one) while the emulated machine waited on it
+        if (ns == 0 && r == R_TIMEOUT && t->yrun_svc + 1 == t->nsvc) t->yrun_svc = t->nsvc;
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; regs[1] = idx >= 0 ? (uint64_t)idx : 0; return 1;
     }

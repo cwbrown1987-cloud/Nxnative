@@ -20,6 +20,7 @@
 #include <vulkan/vulkan_vi.h>
 #import <Metal/Metal.h>
 #include <CommonCrypto/CommonDigest.h>
+#include <mach/mach.h>
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include <math.h>
@@ -1507,13 +1508,37 @@ VKB(vkAcquireNextImageKHR, VkResult, VkDevice d, VkSwapchainKHR sc, uint64_t tim
     if (f) atomic_store(&f->val, 0);
     *idx = i; return VK_SUCCESS;
 }
+void dm_yield_top(char *out, size_t n);                // hle_thread.c (weak stand-ins in hle_nvn.c)
+void dm_thread_cpu(char *out, size_t n, double secs);
 static uint64_t g_frames;
+static int dcmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+// Every 300 frames, as the NVN layer's timing and power lines (hle_nvn.c tsummary / power_line): the present interval p50 / p95 / max, the frame rate, the process's CPU (100% = one core),
+// the guest threads that yielded most and the busiest guest threads (hle_thread.c). Vulkan games (Hades, the Hagi games) had only draw counts, so a game running slow showed nothing
+static void timing_line(uint64_t f, double *iv, unsigned n) {
+    static uint64_t pt, pcpu; uint64_t t = now_ns();
+    struct task_thread_times_info tt; mach_msg_type_number_t c = TASK_THREAD_TIMES_INFO_COUNT; struct task_basic_info_64 bi; mach_msg_type_number_t bc = TASK_BASIC_INFO_64_COUNT;
+    uint64_t cpu = 0;
+    if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO, (task_info_t)&tt, &c) == KERN_SUCCESS && task_info(mach_task_self(), TASK_BASIC_INFO_64, (task_info_t)&bi, &bc) == KERN_SUCCESS)
+        cpu = ((uint64_t)tt.user_time.seconds + tt.system_time.seconds + bi.user_time.seconds + bi.system_time.seconds) * 1000000000ull
+            + ((uint64_t)tt.user_time.microseconds + tt.system_time.microseconds + bi.user_time.microseconds + bi.system_time.microseconds) * 1000ull;   // live threads + terminated ones
+    if (pt && t > pt && n) {
+        double s = (t - pt) / 1e9; char yt[192], tc[400]; dm_yield_top(yt, sizeof yt); dm_thread_cpu(tc, sizeof tc, s);
+        qsort(iv, n, sizeof *iv, dcmp);
+        VLOG("timing up to frame %llu: present interval p50 %.2f / p95 %.2f / max %.2f ms, %.1f fps; CPU %.0f%% (100 = one core); top yielders: %s; threads: %s", (unsigned long long)f,
+             iv[n / 2], iv[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1], iv[n - 1], n / s, (cpu - pcpu) / 1e7 / s, yt, tc);
+    } else { char yt[192], tc[400]; dm_yield_top(yt, sizeof yt); dm_thread_cpu(tc, sizeof tc, 1); }   // the first call only takes the baselines
+    pt = t; pcpu = cpu;
+}
 static void frame_end(void) {
-    static uint64_t pd, pp, ps, pc;
-    uint64_t f = ++g_frames, dr = g_n_draw, pa = g_n_pass, su = g_n_submit, co = g_n_copy;
+    static uint64_t pd, pp, ps, pc, last; static double iv[300]; static unsigned niv;
+    uint64_t f = ++g_frames, dr = g_n_draw, pa = g_n_pass, su = g_n_submit, co = g_n_copy, t = now_ns();
+    if (last && niv < 300) iv[niv++] = (t - last) / 1e6;
+    if (last && t - last > 100000000ull) { extern uint64_t g_t0_ns; VLOG("long frame: %.0f ms before frame %llu (at %.3f s, DM_FSLOG's clock)", (t - last) / 1e6, (unsigned long long)f, (t - g_t0_ns) / 1e9); }
+    last = t;
     if (f <= 3 || f % 300 == 0)
         VLOG("frame %llu: draws %llu, passes %llu, submits %llu, copies %llu (since the last record, %llu frames); pipelines so far %llu, buffer memory %.1f MB", (unsigned long long)f, (unsigned long long)(dr - pd),
              (unsigned long long)(pa - pp), (unsigned long long)(su - ps), (unsigned long long)(co - pc), (unsigned long long)(f <= 3 ? 1 : 300), (unsigned long long)g_n_pso, g_mem_bytes / 1048576.0);
+    if (f % 300 == 0) { timing_line(f, iv, niv); niv = 0; }
     if (f <= 3 || f % 300 == 0) { pd = dr; pp = pa; ps = su; pc = co; }
     dm_guest_frame_tick();
 }
