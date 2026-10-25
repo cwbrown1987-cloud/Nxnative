@@ -137,6 +137,18 @@ Under each game: the IPA's size, and "60 fps with 1.2.0" where the game runs at 
 </tr>
 </table>
 
+### Not yet tested on an iPhone
+
+These play on a Mac; their IPA builds, but nobody has run it on a device yet:
+
+<table>
+<tr>
+<td align="center" valign="top" width="33%"><img src="docs/images/super-mario-3d-all-stars.jpg" width="256" alt="Super Mario 3D All-Stars"><br>Super Mario 3D All-Stars<br><sub>~2.6 GB · Super Mario 64 and Sunshine · no Galaxy</sub></td>
+</tr>
+</table>
+
+Super Mario 3D All-Stars packs as one app holding its menu, Super Mario 64 and Super Mario Sunshine (Super Mario Galaxy is built for 32-bit ARM, which an Apple chip cannot run; its tile in the menu does nothing). Choosing a game, or "Return to title selection" in a game's pause menu, closes the app; a notification then opens it on that game. Super Mario 64 compiles some of its code while it runs, which an iPhone does not allow: the packing script captures that code on the Mac (two boots, a few minutes), and for the parts of the game only reached in play, play them first in the Mac build (`--platform mac`), which records them for the next IPA. A part never played on the Mac may stop the iPhone app there.
+
 ## Pack an IPA
 
 Prefer a graphical interface to the command line? **[NX2Apple](https://github.com/LNPANDY/NX2Apple)** is a community fork with a macOS app that runs this whole pipeline for you and packs the game files into a sharded RomFS archive for a slimmer IPA. It is a separate project that follows this one; the steps below are nxnative's own command-line way.

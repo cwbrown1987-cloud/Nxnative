@@ -1,4 +1,4 @@
-// What Super Mario 64 (Super Mario 3D All-Stars) needed from the Vulkan layer: vkCmdClearColorImage / vkCmdClearDepthStencilImage clear the image (they were stubs, and the title's
+// What Super Mario 64 (Super Mario 3D All-Stars) needed from the Vulkan layer (and a free of descriptor sets whose pool is gone, ignored): vkCmdClearColorImage / vkCmdClearDepthStencilImage clear the image (they were stubs, and the title's
 // Mario head and logo failed their depth test against old values), the dynamic stencil masks pick a depth-stencil state of their own, specialization constants specialize the
 // Metal function, and a linear R4G4 image (no Metal format) is sampled as RG8 converted from its memory at each submit
 #include "../vk/hle_vk.m"
@@ -113,6 +113,21 @@ int main(void) {
         CHECK(t[2] == 0x55 && t[3] == 0, "a changed byte is converted again at the next submit");
         h_vkDestroyImage(&g_device, rg, NULL);
         CHECK(g_nconv == 0, "a destroyed image leaves the conversion list");
+
+        // Sets freed after their pool went: ignored, as the game frees them when it ends (the second free read freed memory)
+        VkDescriptorSetLayoutBinding lb = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo lci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &lb};
+        VkDescriptorSetLayout L; h_vkCreateDescriptorSetLayout(&g_device, &lci, NULL, &L);
+        VkDescriptorPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2};
+        VkDescriptorPool pool; h_vkCreateDescriptorPool(&g_device, &pci, NULL, &pool);
+        VkDescriptorSetLayout Ls[2] = {L, L}; VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 2, .pSetLayouts = Ls};
+        VkDescriptorSet sets[2]; h_vkAllocateDescriptorSets(&g_device, &ai, sets);
+        CHECK(h_vkFreeDescriptorSets(&g_device, pool, 1, &sets[0]) == VK_SUCCESS && set_is_live(sets[1]) && !set_is_live(sets[0]), "one set freed, the other kept");
+        h_vkDestroyDescriptorPool(&g_device, pool, NULL);
+        CHECK(!set_is_live(sets[1]), "the pool's sets go with it");
+        void *junk[64]; for (int i = 0; i < 64; i++) { junk[i] = malloc(sizeof(struct VkDescriptorSet_T)); memset(junk[i], 0xa5, sizeof(struct VkDescriptorSet_T)); }
+        CHECK(h_vkFreeDescriptorSets(&g_device, pool, 2, sets) == VK_SUCCESS, "freeing sets that no longer exist is ignored");
+        for (int i = 0; i < 64; i++) free(junk[i]);
     }
     printf("t_vk_clear: %d checks, %d failed\n", checks, fails);
     return fails != 0;

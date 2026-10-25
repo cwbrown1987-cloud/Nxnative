@@ -723,7 +723,19 @@ VK(vkDestroyDescriptorSetLayout, void, VkDevice d, VkDescriptorSetLayout L, cons
 VK(vkCreateDescriptorPool, VkResult, VkDevice d, const VkDescriptorPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorPool *out) {
     (void)d; (void)ci; (void)a; *out = zalloc(sizeof **out); return VK_SUCCESS;
 }
+// The sets that exist: a set freed with its pool (reset or destroyed) may still be named to vkFreeDescriptorSets. Super Mario 64 (Super Mario 3D All-Stars) does so when it ends
+// to go back to the launcher, and freeing the set again read freed memory (a crash in set_free); a free of a set that no longer exists is ignored
+static pthread_mutex_t g_sets_mu = PTHREAD_MUTEX_INITIALIZER;
+static CFMutableSetRef g_sets;
+static void set_live(VkDescriptorSet s, int on) {
+    pthread_mutex_lock(&g_sets_mu);
+    if (!g_sets) g_sets = CFSetCreateMutable(NULL, 0, NULL);
+    if (on) CFSetAddValue(g_sets, s); else CFSetRemoveValue(g_sets, s);
+    pthread_mutex_unlock(&g_sets_mu);
+}
+static int set_is_live(VkDescriptorSet s) { pthread_mutex_lock(&g_sets_mu); int r = g_sets && CFSetContainsValue(g_sets, s); pthread_mutex_unlock(&g_sets_mu); return r; }
 static void set_free(VkDescriptorSet s) {
+    set_live(s, 0);
     VkDescriptorPool p = s->pool;
     if (s->prev) s->prev->next = s->next; else p->sets = s->next;
     if (s->next) s->next->prev = s->prev;
@@ -739,12 +751,14 @@ VK(vkAllocateDescriptorSets, VkResult, VkDevice d, const VkDescriptorSetAllocate
         VkDescriptorSet s = zalloc(sizeof *s); s->d = zalloc(umax(1, L->total) * sizeof(desc_t));
         s->L = L; s->pool = ai->descriptorPool; s->next = s->pool->sets; if (s->next) s->next->prev = s; s->pool->sets = s;
         if (L->imm) for (uint32_t k = 0; k < L->total; k++) s->d[k].smp = L->imm[k] ? L->imm[k]->s : nil;
+        set_live(s, 1);
         out[i] = s;
     }
     return VK_SUCCESS;
 }
 VK(vkFreeDescriptorSets, VkResult, VkDevice d, VkDescriptorPool p, uint32_t n, const VkDescriptorSet *s) {
-    (void)d; (void)p; for (uint32_t i = 0; i < n; i++) if (s[i]) set_free(s[i]);
+    (void)d; (void)p;
+    for (uint32_t i = 0; i < n; i++) if (s[i]) { if (set_is_live(s[i])) set_free(s[i]); else RED1("vkFreeDescriptorSets: a set that no longer exists (freed with its pool), ignored"); }
     return VK_SUCCESS;
 }
 // Element `elem` of `binding`; an index past the binding's count continues into the next bindings (Vulkan's consecutive-binding updates)
