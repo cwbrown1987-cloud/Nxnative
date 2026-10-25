@@ -88,21 +88,27 @@ Game rumble is enabled by default (`DM_RUMBLE=0` disables it); `DM_RUMBLE_GAIN=0
 
 Haptic engines are created on demand, after the game has activated its audio session. Stop/reset handlers are installed before starting an engine. Idle release, focus loss and engine resets stop an engine but keep it, so the next effect restarts the same one. An engine or player failure releases that connection; fresh game signals retry with a new engine after a 1–8 second backoff, without replaying effects from before the failure. If a controller advertises separate handle localities but those engines cannot be created or started, the route falls back to the controller's default locality until it is reconnected. The log names the controller, localities and output channels, and errors name the failed stage with the error domain/code and underlying service error. The Apple adapter test covers failed creation/start, player and parameter failures, default-locality fallback and stale callbacks using fake controllers and engines; an iOS Settings Identify response alone does not verify the app's own haptics connection.
 
-### A Mac-only build for development
+### macOS native app build
 
-The Mac is the development host, not a platform for players: there is no Mac app. To test or debug a game on the Mac, `--platform mac` (`PLATFORM = 'mac'` in Spyder) builds only what running it in the Mac host needs, from the same NSP folder:
-- the same steps up to the shaders: extraction, rewrite, run-time shader captures and decodes, a provisional profile's heap check and the shader split;
-- the Mac shader libraries only: `dmsh_build.py` without `IOSOUT` into `<id>_build/shader/cache/b-<chain>/`, which a full build stamps with the profile's inputs (`inputs.tsv`) and from which it makes the profile's `c1_full.tsv` and `cb_extent.tsv`, or a Vulkan or GL game's library without `--ios` into `<id>_build/shader/vk/` or `gl/`;
-- the Mac host for the profile into `<id>_build/tools/dmhost`: the compile line of `make -C dm/host GAME=<id> dmhost`, with a provisional or derived profile through `DM_GAMES_DIR` / `DM_GAMES_FIRST` as for the script's other host builds. It is reused while its sources (the chain header `dm/gfx/nvn/dmsh_chain.h` among them), the generated profile header, libvpx and the compiler are unchanged;
-- the button-icon font (`make_ext_font.py`) into `<id>_build/font/`.
+`--platform mac` (`PLATFORM = 'mac'` in Spyder) builds a macOS application bundle (`<Game Name>.app`) for Apple silicon Macs:
+- the same extraction, rewrite, run-time shader captures/decodes, provisional profile checks and shader split as iOS;
+- the Mac shader libraries only (`dmsh_build.py` without `IOSOUT`, or Vulkan/GL shaders without `--ios`);
+- the native Mac host compiled for the profile (`dmhost`);
+- the button-icon font (`make_ext_font.py`);
+- multi-resolution `AppIcon.icns` generated from the game's extracted `icon.jpg` using `sips` and `iconutil`;
+- packaging into `<NSP folder>/<Game Name>.app` (or `--out`) via `dm/tools/pack_mac_app.py`, ad-hoc signed so it opens directly.
 
-It skips the iOS shaders, the Xcode project and the IPA. For Mario Kart 8 Deluxe that saves about 30,000 iOS shader compiles and the 12 GB IPA. It keeps the extracted files even with `--no-keep-extracted`, because the game runs from them. It needs a Mac with Apple silicon, and it cannot be combined with `--prepare-xcode`. The last line it prints is the command that runs the game, built from the run's own paths (step 5 of [Build by hand (Mac)](#build-by-hand-mac)), for example:
+The resulting `.app` runs directly from Finder or terminal (`open "<Game Name>.app"`):
+- Save data: `~/Library/Application Support/NxNative/<Game Name>/save/` (or custom save folder in Settings; Export/Restore Save Backup `.zip`)
+- Logs: `~/Library/Logs/NxNative/<Game Name>.log`
+- Caches: `~/Library/Caches/NxNative/<Game Name>/temp/`
+- Screenshots: `~/Pictures/NxNative/<Game Name>/` (`⌘S` / `F12`)
+- Menu bar: File (Save folder, Export/Restore, Log, Screenshot, Restart), Game (Pause, Docked/Handheld, Target FPS and Render Scale when supported), Audio (Mute, Volume), View (Full Screen, Window Scale presets 1.0x–3.0x, Metal HUD), Controllers (Player 1–4 device mapping, Nintendo / Xbox button layouts, keyboard remapping).
+- Settings (`⌘,`): unified preferences window with live Docked/Handheld switching, Metal HUD, save folder management, and an interactive key remapping table. Window tabbing is explicitly disallowed.
 
-```
-cd "<NSP folder>/<id>_build/run" && DM_ROOT="<NSP folder>/<id>_build" DM_ROMFS="<NSP folder>/<id>_build/extract/<version>/RomFS" DM_SAVE="<NSP folder>/<id>_build/run/save" DM_TEMP="<NSP folder>/<id>_build/run/temp" DM_MSL_DIR="<NSP folder>/<id>_build/shader/cache" DM_FONT_DIR="<NSP folder>/<id>_build/font" DM_NVN_SHMAP="<repository>/dm/games/<id>/shader_map.tsv" DM_LANG=en-US DM_WINDOW=1 DM_AUDIO=1 "<NSP folder>/<id>_build/tools/dmhost" "<NSP folder>/<id>_build/patched_<version>"
-```
-
-The save is in `<id>_build/run/save` and stays there from run to run. `DM_AOC_DIR` is added when the folder has DLC. `DM_NVN_SHMAP` is added for an NVN game; it names the profile's shader map, or the derived or provisional profile's. A Vulkan or GL game's `DM_MSL_DIR` is `<id>_build/shader`. The switches of `--env-file` are added to the command.
+#### Packaging Modes (`dm/tools/pack_mac_app.py`)
+- `--mode thin` (default): symlinks large assets (`RomFS`, shader libraries) into `Contents/Resources/` so creating the `.app` takes seconds and minimal disk space.
+- `--mode standalone`: copies all assets into `Contents/Resources/` for a completely self-contained `.app` bundle.
 
 Reuse works as for the IPA. Each shader output has its own key, named after the one chain version: `shader/ios/b-<chain>.key` for the iOS libraries and `shader/mac-b-<chain>.key` for the Mac's (`shader/ios/vk.key` and `shader/vk.key` for a Vulkan game, the same with `gl` for a GL game). An iOS build writes both keys, since it builds the Mac's libraries too, so a Mac-only build of a folder already packed as an IPA reuses its shaders. Either key is taken only while the Mac libraries carry a full build's stamp; `c1_full.tsv` or `cb_extent.tsv` that does not name it is made again from them, as for the IPA. An iOS build after a Mac-only build still has the iPhone's libraries to make. It translates the shaders again, because `dmsh_build.py`'s per-shader cache keys include the iOS compile convention. It then takes the Mac libraries from the Metal compile cache (`shader/cache/cas/metallib`) and compiles only the iPhone's.
 
