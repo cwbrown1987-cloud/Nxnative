@@ -1,4 +1,4 @@
-// What Super Mario 64 (Super Mario 3D All-Stars) needed from the Vulkan layer (and a free of descriptor sets whose pool is gone, ignored): vkCmdClearColorImage / vkCmdClearDepthStencilImage clear the image (they were stubs, and the title's
+// What Super Mario 64 (Super Mario 3D All-Stars) needed from the Vulkan layer (and a free of descriptor sets whose pool is gone, and a destruction of swap chain images, ignored): vkCmdClearColorImage / vkCmdClearDepthStencilImage clear the image (they were stubs, and the title's
 // Mario head and logo failed their depth test against old values), the dynamic stencil masks pick a depth-stencil state of their own, specialization constants specialize the
 // Metal function, and a linear R4G4 image (no Metal format) is sampled as RG8 converted from its memory at each submit
 #include "../vk/hle_vk.m"
@@ -128,6 +128,20 @@ int main(void) {
         void *junk[64]; for (int i = 0; i < 64; i++) { junk[i] = malloc(sizeof(struct VkDescriptorSet_T)); memset(junk[i], 0xa5, sizeof(struct VkDescriptorSet_T)); }
         CHECK(h_vkFreeDescriptorSets(&g_device, pool, 2, sets) == VK_SUCCESS, "freeing sets that no longer exist is ignored");
         for (int i = 0; i < 64; i++) free(junk[i]);
+
+        // A swap chain's images destroyed by the game with vkDestroyImage (it does so as it leaves through the collection's menu): ignored, the swap chain still frees them
+        // (freed by both, the swap chain's destruction at the end of the run stored into the freed memory and freed it again)
+        VkSwapchainCreateInfoKHR sci = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .minImageCount = 3, .imageFormat = VK_FORMAT_B8G8R8A8_UNORM, .imageExtent = {64, 32},
+                                        .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, .presentMode = VK_PRESENT_MODE_FIFO_KHR};
+        VkSwapchainKHR sc = NULL; uint32_t nimg = 4; VkImage simg[4] = {0};
+        CHECK(h_vkCreateSwapchainKHR(&g_device, &sci, NULL, &sc) == VK_SUCCESS && h_vkGetSwapchainImagesKHR(&g_device, sc, &nimg, simg) == VK_SUCCESS && nimg == 3, "a swap chain of 3 images");
+        for (uint32_t i = 0; i < nimg; i++) h_vkDestroyImage(&g_device, simg[i], NULL);
+        void *reuse[64]; for (int i = 0; i < 64; i++) { reuse[i] = malloc(sizeof(struct VkImage_T)); memset(reuse[i], 0xa5, sizeof(struct VkImage_T)); }
+        int alive = 1; for (uint32_t i = 0; i < nimg; i++) alive &= sc->img[i] == simg[i] && simg[i]->tex != nil && simg[i]->w == 64;
+        CHECK(alive, "vkDestroyImage of a swap chain image leaves it to the swap chain");
+        h_vkDestroySwapchainKHR(&g_device, sc, NULL);
+        CHECK(1, "the swap chain then frees its images once");
+        for (int i = 0; i < 64; i++) free(reuse[i]);
     }
     printf("t_vk_clear: %d checks, %d failed\n", checks, fails);
     return fails != 0;

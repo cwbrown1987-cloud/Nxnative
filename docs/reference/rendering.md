@@ -664,6 +664,14 @@ The Vulkan layer (`dm/gfx/vk/hle_vk.m`) was written for Hades; Super Mario Galax
 - **Found on:** [Super Mario 3D All-Stars: Super Mario 64](../../dm/games/010049900F546001/README.md), on its way back to the launcher.
 - **Check:** `t_vk_clear` frees a set after its pool, with the freed memory reused.
 
+### Swap chain images destroyed by the game
+
+- **Symptom:** after the game leaves for another program with `DM_PROGRAM_SWITCH=inproc`, a crash seconds later in an unrelated allocation (`CRASH sig=5` in `_xzm_xzone_malloc_freelist_outlined`: malloc found its free list corrupted), or at once in `objc_release` from `dm_vk_end_run`.
+- **Cause:** the game destroys the images it got from `vkGetSwapchainImagesKHR` with `vkDestroyImage` and keeps the swap chain, which Vulkan does not allow (VUID-vkDestroyImage-image-04882) and NVIDIA's driver evidently tolerates. The layer freed them while the swap chain still pointed at them; at the end of the run `vkDestroySwapchainKHR` stored into the freed memory (malloc's free-list link) and freed it again.
+- **Fix:** a swap chain's images are marked as its own (`VkImage_T.swap`), and `vkDestroyImage` of one is ignored, with a line once (`vkDestroyImage of a swap chain image: ignored (the swap chain owns it)`); the swap chain frees them when it is destroyed.
+- **Found on:** [Super Mario 3D All-Stars: Super Mario 64](../../dm/games/010049900F546001/README.md), as it tears its renderer down to go back to the launcher through the collection's menu (`main+0x9500`). Runs that ended the game from `DM_CTL` (`program 0`) never reached that code.
+- **Check:** `t_vk_clear` destroys a swap chain's images, reuses the memory, then destroys the swap chain.
+
 ### Not translated in the Vulkan layer: geometry shaders and LOD bias
 
 - **Symptom:** GX points and lines drawn as one-pixel points and lines; a red line for the sampler LOD bias.

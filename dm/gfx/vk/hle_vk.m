@@ -195,7 +195,8 @@ struct VkBuffer_T { VkDeviceSize size; VkBufferUsageFlags usage; VkDeviceMemory 
 struct VkBufferView_T { VkBuffer buf; const fmt_t *f; VkDeviceSize off, range; __strong id<MTLTexture> tex; };
 struct VkImage_T { __strong id<MTLTexture> tex; const fmt_t *f; VkFormat fmt; VkImageType type; uint32_t w, h, d, mips, layers, samples; VkDeviceSize size; uint64_t serial;
                   VkImageUsageFlags usage; uint32_t pitch;   // pitch: row pitch of a linear image (its texture is made over the bound memory), 0 otherwise
-                  VkDeviceMemory cmem; VkDeviceSize coff; uint8_t *ccopy; int cfresh; };   // a converted linear image (fmt_t conv): its memory, and the bytes last converted
+                  VkDeviceMemory cmem; VkDeviceSize coff; uint8_t *ccopy; int cfresh;   // a converted linear image (fmt_t conv): its memory, and the bytes last converted
+                  int swap; };   // one of a swap chain's images (vkGetSwapchainImagesKHR): the swap chain owns it
 struct VkImageView_T { __strong id<MTLTexture> tex; VkImage img; };
 struct VkSampler_T { __strong id<MTLSamplerState> s; };
 struct VkShaderModule_T { const shinfo *si; __strong id<MTLFunction> fn, fn_d; char key[17]; int tried_d;   // fn_d: the dual-source variant vk_<key>_d, looked up on first use
@@ -544,7 +545,15 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
     return VK_SUCCESS;
 }
 static void conv_drop(VkImage im);
-VKB(vkDestroyImage, void, VkDevice d, VkImage im, const VkAllocationCallbacks *a) { (void)d; (void)a; if (im) { vreg_del(im); if (im->ccopy) conv_drop(im); im->tex = nil; free(im); } }
+// A swap chain's image is not the game's to destroy (Vulkan: VUID-vkDestroyImage-image-04882), but Super Mario 64 (3D All-Stars) destroys the images it got from vkGetSwapchainImagesKHR
+// with its own when it leaves through the collection's menu (main+0x9500), and keeps the swap chain. Freed here, the swap chain kept pointers to them: at the end of the run (an
+// in-process program switch) vkDestroySwapchainKHR stored into the freed memory and freed it again, which corrupted malloc's free lists (a crash seconds later in an unrelated malloc)
+// or crashed in objc_release. Ignored, as the console's driver evidently does; the swap chain frees them
+VKB(vkDestroyImage, void, VkDevice d, VkImage im, const VkAllocationCallbacks *a) {
+    (void)d; (void)a; if (!im) return;
+    if (im->swap) { static int n; if (!n++) LOG("[vk] vkDestroyImage of a swap chain image: ignored (the swap chain owns it)"); return; }
+    vreg_del(im); if (im->ccopy) conv_drop(im); im->tex = nil; free(im);
+}
 // Converted linear images: a texture of their own in the Metal format, filled at each submit from the image's memory when its bytes changed since the last conversion.
 // The game finishes its CPU writes before it submits the work that samples them (Vulkan's host write ordering), so the submit is where the bytes are final
 static pthread_mutex_t g_conv_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -1685,7 +1694,7 @@ VKB(vkCreateSwapchainKHR, VkResult, VkDevice d, const VkSwapchainCreateInfoKHR *
             MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f->pf width:ci->imageExtent.width height:ci->imageExtent.height mipmapped:NO];
             td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | (ci->imageUsage & VK_IMAGE_USAGE_STORAGE_BIT ? MTLTextureUsageShaderWrite : 0);
             td.storageMode = MTLStorageModePrivate;
-            VkImage im = zalloc(sizeof *im);
+            VkImage im = zalloc(sizeof *im); im->swap = 1;
             im->tex = [g_dev newTextureWithDescriptor:td]; im->f = f; im->fmt = ci->imageFormat; im->type = VK_IMAGE_TYPE_2D;
             im->w = ci->imageExtent.width; im->h = ci->imageExtent.height; im->d = im->mips = im->layers = im->samples = 1;
             im->serial = mtl_ext_tex((__bridge void *)im->tex);
