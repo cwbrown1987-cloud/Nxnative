@@ -69,6 +69,8 @@ static void samples_xy(int s, uint32_t *sx, uint32_t *sy) {
 // storage is whole tiles, 64 KB aligned. Monster Hunter Rise's streamed textures come pre-swizzled that way in its files and are placed at the level offsets the host reports: laid out unpadded,
 // its 1024×1024 ASTC 6×6 textures (48 GOBs wide instead of 43, level 1 at 0x90000 instead of 0x81000) read 2,183 all-zero blocks in level 0 and 3,043 in level 1, which ASTC
 // decodes as its error colour (magenta clothes)
+// Yoshi's Crafted World ships its streamed textures pre-swizzled in the 64 KB tile shapes below (sparse_tile_h): a 384×384 DXT5 level is 32 GOBs × two 8-GOB block rows (0x40000 bytes, 16-GOB blocks
+// gave 0x30000), a 1350×270 BGRA8 one 88 GOBs × three 16-GOB block rows. UE sizes its upload buffer from the host's layout, and the larger level data overran it into the heap
 enum { SPARSE_TILE = 0x10000 };
 static int sparse_of(const nvn_texdesc *d) { return (d->flags & 0x20) && !(d->flags & 0x50) && d->target != 10; }
 // A sparse 2D texture without a packaged layout takes the block height of its 64 KB tile instead of the automatic one: the tile's shape in blocks is the standard one,
