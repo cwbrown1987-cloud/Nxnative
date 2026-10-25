@@ -501,10 +501,14 @@ static void remap_at(module_t *m, vm_address_t to, const void *from, unsigned lo
 // take 294. gen_embed.py puts their pieces one after another, each 16K aligned, in __TEXT,__dm_nro_x0 / __DM_NRO_W,__img / __TEXT,__dm_nro_x1, and __DATA,__dm_nro_tab lists them:
 // 32 bytes of name, then the offset and length of its x0, W and x1 pieces in their sections (u64 each). A module name never holds an underscore, so these names meet no module's
 typedef struct { char name[32]; uint64_t off[3][2]; } nro_ent;
+// DM_EMBED_TAG (main.m, in an app holding several programs of a multi-program application): the running program's sections are tagged (gen_embed.py --tag: __dm<tag><name>x0, …, __dm<tag>_nro_x0)
+static const char *embed_tag(void) { const char *t = getenv("DM_EMBED_TAG"); return t ? t : ""; }
 static int nro_pieces(const char *name, const uint8_t **x0, unsigned long *z0, const uint8_t **w, unsigned long *zw, const uint8_t **x1, unsigned long *z1) {
     unsigned long zt, s0, sw, s1;
-    const nro_ent *t = (const nro_ent *)getsectiondata(IMAGE_MH, "__DATA", "__dm_nro_tab", &zt);
-    const uint8_t *b0 = getsectiondata(IMAGE_MH, "__TEXT", "__dm_nro_x0", &s0), *bw = getsectiondata(IMAGE_MH, "__DM_NRO_W", "__img", &sw), *b1 = getsectiondata(IMAGE_MH, "__TEXT", "__dm_nro_x1", &s1);
+    char st[17], s0n[17], swn[17], s1n[17]; const char *g = embed_tag();
+    snprintf(st, sizeof st, "__dm%s_nro_tab", g); snprintf(s0n, sizeof s0n, "__dm%s_nro_x0", g); snprintf(swn, sizeof swn, "__DM%s_NRO_W", g); snprintf(s1n, sizeof s1n, "__dm%s_nro_x1", g);
+    const nro_ent *t = (const nro_ent *)getsectiondata(IMAGE_MH, "__DATA", st, &zt);
+    const uint8_t *b0 = getsectiondata(IMAGE_MH, "__TEXT", s0n, &s0), *bw = getsectiondata(IMAGE_MH, swn, "__img", &sw), *b1 = getsectiondata(IMAGE_MH, "__TEXT", s1n, &s1);
     if (!t || !b0 || !bw || !b1) return 0;
     for (unsigned long i = 0; i < zt / sizeof *t; i++) if (!strncmp(t[i].name, name, sizeof t[i].name)) {
         *x0 = b0 + t[i].off[0][0]; *z0 = t[i].off[0][1]; *w = bw + t[i].off[1][0]; *zw = t[i].off[1][1]; *x1 = b1 + t[i].off[2][0]; *z1 = t[i].off[2][1];
@@ -514,7 +518,8 @@ static int nro_pieces(const char *name, const uint8_t **x0, unsigned long *z0, c
 }
 static void map_image(module_t *m, const char *dir) {
     (void)dir;
-    char sx0[17], sx1[17], dm[17]; snprintf(sx0, sizeof sx0, "__dm%sx0", m->name); snprintf(sx1, sizeof sx1, "__dm%sx1", m->name); snprintf(dm, sizeof dm, "__DM%sW", m->name);
+    char sx0[17], sx1[17], dm[17]; const char *g = embed_tag();
+    snprintf(sx0, sizeof sx0, "__dm%s%sx0", g, m->name); snprintf(sx1, sizeof sx1, "__dm%s%sx1", g, m->name); snprintf(dm, sizeof dm, "__DM%s%sW", g, m->name);
     unsigned long z0 = 0, zw = 0, z1 = 0;
     const uint8_t *x0 = NULL, *w = NULL, *x1 = NULL;
     if (m->nro) { if (!nro_pieces(m->name, &x0, &z0, &w, &zw, &x1, &z1)) die("NRO %s: not in the embedded NRO table (__DATA,__dm_nro_tab)", m->name); }

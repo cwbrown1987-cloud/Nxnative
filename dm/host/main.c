@@ -12,6 +12,19 @@ static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("missing symbo
 
 // Game arguments: argv[0] is fixed to "game", and whatever follows "--" is appended as is (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
 static char *g_argv[64] = {"game"}; static int g_argc = 1;
+#ifdef DM_GAME_MULTI
+// An app holding several programs of a multi-program application (game.py header-multi, Super Mario 3D All-Stars on the iPhone): the profile of the program DM_PROGRAM names
+// (main.m sets it from the last oe::ExecuteProgram), program 0 without it
+const dm_game_t *dm_game_cur(void) {
+    static const dm_game_t *g;
+    if (!g) {
+        const char *e = getenv("DM_PROGRAM"); int p = e ? atoi(e) : 0; const dm_game_t *f = &dm_games[0];
+        for (size_t i = 0; i < sizeof dm_games / sizeof *dm_games; i++) if (dm_games[i].program == p) f = &dm_games[i];
+        g = f;
+    }
+    return g;
+}
+#endif
 
 static void guest_main(void) {
     guest_thread_init();
@@ -92,7 +105,12 @@ static void host_preload(int argc, char **argv) {
         for (char *t = strtok(s, " "); t && g_argc < 63; t = strtok(NULL, " ")) g_argv[g_argc++] = t;
         LOG("game arguments from the game profile: %s", DM_GAME_ARGS);
     }
-    if (!n) { static const char *def[] = DM_GAME_MODULES; for (int k = 0; k < DM_GAME_NMOD && n < MAX_MOD; k++) names[n++] = def[k]; }   // default module list from the game profile's modules (Mario: main sdk)
+#ifdef DM_GAME_MULTI
+    const char *const *def = DM_GAME_MODULES_ARR;   // an app of several programs: the running program's (dm_game_cur)
+#else
+    static const char *def[] = DM_GAME_MODULES;
+#endif
+    if (!n) { for (int k = 0; k < DM_GAME_NMOD && n < MAX_MOD; k++) names[n++] = def[k]; }   // default module list from the game profile's modules (Mario: main sdk)
     load_modules(argv[1], names, n);
     dm_sdk_major();   // logs the SDK version, which SDK-dependent behaviour follows (loader.c)
     uint64_t ta = now_ns();

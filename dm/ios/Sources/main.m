@@ -14,11 +14,12 @@ void front_ios_focus_event(int ev);
 
 static char *g_argv[4]; static int g_argc;
 
-static NSString *romfs_locate(void) {
+static NSString *romfs_locate(NSString *prog) {   // prog: an app of several programs, the running program's folder in the app (p<N>); nil otherwise
     NSFileManager *fm = NSFileManager.defaultManager;
-    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
-    for (NSString *d in @[[doc stringByAppendingPathComponent:@"romfs"], [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"romfs"]])
-        if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@DM_GAME_ROMFS_MARKER]]) return d;   // only a directory containing the game profile's romfs_marker path counts (Mario: System/Resource, the resource size table)
+    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0], *res = NSBundle.mainBundle.resourcePath;
+    NSArray *dirs = prog ? @[[[res stringByAppendingPathComponent:prog] stringByAppendingPathComponent:@"romfs"]] : @[[doc stringByAppendingPathComponent:@"romfs"], [res stringByAppendingPathComponent:@"romfs"]];
+    for (NSString *d in dirs)
+        if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@(DM_GAME_ROMFS_MARKER)]]) return d;   // only a directory containing the game profile's romfs_marker path counts (Mario: System/Resource, the resource size table)
     return nil;
 }
 
@@ -55,16 +56,41 @@ static int boot_env(void) {
     NSString *lang = [NSBundle.mainBundle objectForInfoDictionaryKey:@"DMLanguage"];
     if (!getenv("DM_LANG") && [lang isKindOfClass:NSString.class] && lang.length) setenv("DM_LANG", lang.UTF8String, 0);
     fprintf(stderr, "boot: game language %s\n", getenv("DM_LANG") ?: "en-US");
-    NSString *romfs = romfs_locate();
+    // An app holding several programs of a multi-program application (build_ipa.sh PROGRAMS_TSV: Super Mario 3D All-Stars' launcher and the games it starts): dm/programs.txt lists them,
+    // and each has its own files: <App>/p<N>/romfs (and html beside it), <App>/msl/p<N>, <App>/dm/p<N> (rewriter tables, shader tables, launcher settings) and its modules in sections
+    // tagged p<N> (DM_EMBED_TAG, loader.c). The host profile is the program's (DM_PROGRAM, main.c dm_game_cur). iOS cannot start an app's process again, so oe::ExecuteProgram records
+    // the program and its parameters in Documents/program.bin (DM_EXEC_OUT, hle_oe.c) and the app ends; the next start runs that program, with those parameters as its launch
+    // parameter, until a program starts another (Sunshine's pause menu: Return to title selection starts program 0). Program 0 when nothing is recorded or the program is not in the app
+    NSString *dmdir = [res stringByAppendingPathComponent:@"dm"], *msl = [res stringByAppendingPathComponent:@"msl"], *prog = nil;
+    NSString *plist = [NSString stringWithContentsOfFile:[dmdir stringByAppendingPathComponent:@"programs.txt"] encoding:NSUTF8StringEncoding error:nil];
+    if (plist) {
+        NSArray *have = [plist componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSString *rec = [doc stringByAppendingPathComponent:@"program.bin"]; NSData *d = [NSData dataWithContentsOfFile:rec]; int32_t n = 0;
+        if (d.length >= 4) memcpy(&n, d.bytes, 4);
+        if (![have containsObject:[NSString stringWithFormat:@"%d", n]]) { fprintf(stderr, "boot: program %d is not in this app; program 0\n", n); n = 0; d = nil; }
+        prog = [NSString stringWithFormat:@"p%d", n];
+        if (d.length > 4) {
+            NSString *lp = [doc stringByAppendingPathComponent:@"launch_param.bin"];
+            [[d subdataWithRange:NSMakeRange(4, d.length - 4)] writeToFile:lp atomically:YES];
+            setenv("DM_LAUNCH_PARAM", lp.fileSystemRepresentation, 1);
+        }
+        setenv("DM_PROGRAM", [NSString stringWithFormat:@"%d", n].UTF8String, 1);
+        setenv("DM_EMBED_TAG", prog.UTF8String, 1);
+        setenv("DM_EXEC_OUT", rec.fileSystemRepresentation, 0);
+        dmdir = [dmdir stringByAppendingPathComponent:prog]; msl = [msl stringByAppendingPathComponent:prog];
+        setenv("DM_APP_DM", dmdir.fileSystemRepresentation, 1);   // the launcher's settings (Launcher.swift)
+        fprintf(stderr, "boot: program %d of %s (%zu bytes of launch parameter)\n", n, [[plist stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] stringByReplacingOccurrencesOfString:@"\n" withString:@" "].UTF8String, d.length > 4 ? (size_t)d.length - 4 : 0);
+    }
+    NSString *romfs = romfs_locate(prog);
     if (!romfs) { fprintf(stderr, "boot: game files not found (<App>/romfs or Documents/romfs)\n"); return 0; }
     fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
     setenv("DM_ROMFS", romfs.fileSystemRepresentation, 0);
     setenv("DM_SAVE", [doc stringByAppendingPathComponent:@"save"].fileSystemRepresentation, 0);
     setenv("DM_TEMP", [doc stringByAppendingPathComponent:@"temp"].fileSystemRepresentation, 0);
-    NSString *dm = [res stringByAppendingPathComponent:@"dm"];
+    NSString *dm = dmdir;
     setenv("DM_NVN_SHMAP", [dm stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
-    setenv("DM_MSL_DIR", [res stringByAppendingPathComponent:@"msl"].fileSystemRepresentation, 0);
-    setenv("DM_FONT_DIR", [dm stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
+    setenv("DM_MSL_DIR", msl.fileSystemRepresentation, 0);
+    setenv("DM_FONT_DIR", [[res stringByAppendingPathComponent:@"dm"] stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
     NSString *aoc = [res stringByAppendingPathComponent:@"aoc"];   // add-on content: build_ipa.sh puts the RomFS extracted from the player's DLC NSPs at <App>/aoc/<index>/
     if ([fm fileExistsAtPath:aoc]) setenv("DM_AOC_DIR", aoc.fileSystemRepresentation, 0);
     chdir(doc.fileSystemRepresentation);

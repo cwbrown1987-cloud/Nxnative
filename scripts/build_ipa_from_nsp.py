@@ -59,7 +59,8 @@ HEAP_CHECK_NNMAIN_SECS = 5
 PROGRAM = 0                             # program index of a multi-program application (Super Mario 3D All-Stars: 0 the menu, 1 Super Mario 64, 2 Super Mario Sunshine, 3 Super Mario Galaxy):
                                         #   the program packed, under the title ID base + index (its own profile); 0 = the application's first program, as Horizon starts it
 PROGRAMS = ''                           # a multi-program application packed from program 0 (PROGRAM 0): the programs packed with it, e.g. '0,2'; empty = 0 and every program whose title ID
-                                        #   (base + index) has a game profile in dm/games. On the Mac they run as one: the run command starts program 0, and each oe::ExecuteProgram starts another
+                                        #   (base + index) has a game profile in dm/games. On the Mac they run as one: the run command starts program 0, and each oe::ExecuteProgram starts another;
+                                        #   on the iPhone one IPA holds them all, and the app starts the program the last oe::ExecuteProgram named (it ends then: iOS cannot restart it)
 
 PROGRESS = 'auto'                       # stage lines on the console: 'bar' (one line per stage, redrawn in place), 'lines' (a plain line every BEAT seconds), 'off' (only each stage's start and end); 'auto' = bar in a terminal or Spyder, lines when the output goes to a file; 'json' = one JSON event per line, for a program that shows the build
 BEAT = 30                               # seconds between progress lines in 'lines' mode
@@ -1608,7 +1609,8 @@ def parse_args(argv):
     ap.add_argument('--no-heap-check', action='store_true', help='a provisional profile: skip the heap check on the Mac (the alias / heap split stays a guess)')
     ap.add_argument('--program', type=int, help='program index of a multi-program application to pack (Super Mario 3D All-Stars: 1-3 the games), under the title ID base + index (default: the PROGRAM setting, 0)')
     ap.add_argument('--programs', help='a multi-program application packed from program 0: the programs packed with it, comma-separated, e.g. 0,2 (default: the PROGRAMS setting; empty = 0 and every program '
-                    'whose title ID, base + index, has a game profile). On the Mac the run command starts program 0 and each program the game starts runs in its place (DM_PROGRAMS)')
+                    'whose title ID, base + index, has a game profile). On the Mac the run command starts program 0 and each program the game starts runs in its place (DM_PROGRAMS); '
+                    'on the iPhone one IPA holds them all and starts the program the last one started (not with --prepare-xcode)')
     ap.add_argument('--progress', choices=('auto', 'bar', 'lines', 'json', 'off'), help='stage lines on the console: bar = one line per stage, redrawn in place; lines = a plain line every BEAT seconds; json = newline-delimited JSON events (no prompts); off = only each stage\'s start and end '
                     '(default: the PROGRESS setting; auto = bar in a terminal or Spyder, lines when the output goes to a file or a pipe)')
     return ap.parse_args(argv)
@@ -1650,13 +1652,15 @@ def program_list(args, nsp_dir, repo):
 
 def main(args=None):
     """One program (pack_one), or several programs of a multi-program application packed from program 0 (program_list): each into its own work folder from its own profile,
-    then on the Mac one run command over them all (DM_PROGRAMS, a programs.tsv in program 0's work folder: oe::ExecuteProgram starts the named program in the host's place, hle_oe.c)"""
+    then on the Mac one run command over them all (DM_PROGRAMS, a programs.tsv in program 0's work folder: oe::ExecuteProgram starts the named program in the host's place, hle_oe.c),
+    on the iPhone one IPA holding them all (ios_programs). An Xcode project (--prepare-xcode) holds one program"""
     args = args or parse_args([])
     PROG.mode = progress_mode(args.progress or PROGRESS)
     global PROGRAM
     PROGRAM = PROGRAM if args.program is None else args.program
     if not 0 <= PROGRAM < 16: raise BuildError(f'the program index (PROGRAM / --program) must be 0-15: {PROGRAM}')
-    if (args.platform or PLATFORM) != 'mac': return pack_one(args)   # the iPhone: one program per app
+    mac = (args.platform or PLATFORM) == 'mac'
+    if args.prepare_xcode or PREPARE_XCODE: return pack_one(args)   # an Xcode project holds one program
     repo = find_repo(Path(globals().get('__file__') or sys.argv[0]).resolve())
     nsp_dir = Path(os.path.expanduser(args.nsp_dir or NSP_DIR or ask('NSP folder: ', 'the NSP folder'))).resolve()
     if not nsp_dir.is_dir(): raise BuildError(f'not a folder: {nsp_dir}')
@@ -1673,6 +1677,7 @@ def main(args=None):
             for k in os.environ.keys() - environ.keys(): del os.environ[k]
             os.environ.update(environ)
     PROGRAM = 0
+    if not mac: return ios_programs(repo, runs, progs)
     tsv = Path(runs[0]['cwd']).parent / 'programs.tsv'
     rows = ['# The programs of this multi-program application on the Mac (build_ipa_from_nsp.py): index, its host (exe), rewritten modules (arg), run folder (cwd) and environment.',
             '# DM_PROGRAMS=<this file>: oe::ExecuteProgram ends the running program and starts the named one in its place (hle_oe.c)']
@@ -1683,6 +1688,27 @@ def main(args=None):
     q = lambda v: shlex.quote(str(v))
     say(f'done: programs {", ".join(map(str, progs))} run on the Mac with this command, program 0 first; each program the game starts runs in its place ({tsv}; DM_WINDOW=1 opens a window, DM_AUDIO=1 plays sound):')
     PROG.say(runs[0]['cmd'].replace(' && ', f' && DM_PROGRAMS={q(tsv)} ', 1))
+    return runs
+
+
+def ios_programs(repo, runs, progs):
+    """One IPA holding every packed program (build_ipa.sh PROGRAMS_TSV): program 0's app (name, identity, icon, version) with each program's modules, tables, RomFS, offline pages and
+    iOS shader libraries; the app starts the program the last oe::ExecuteProgram named (main.m), program 0 at first"""
+    r0 = runs[0]; work, out_ipa = r0['work'], r0['out_ipa']
+    if free_gb(out_ipa.parent) < 5: raise BuildError(f'less than 5 GB free on the volume of {out_ipa.parent}')
+    tsv = work / 'ipa_programs.tsv'
+    tsv.write_text('# program\tprofile\trewritten modules\tRomFS\tiOS shaders\tgraphics API (build_ipa.sh PROGRAMS_TSV)\n' + ''.join('\t'.join(map(str, runs[n]['row'])) + '\n' for n in progs))
+    say(f'building one IPA with programs {", ".join(map(str, progs))} → {out_ipa}')
+    watch = IpaWatch(repo, work / 'ipa', out_ipa)
+    PROG.stage('app build', poll=watch.poll, step='starting')
+    run(['bash', repo / 'dm/ios/tools/build_ipa.sh', out_ipa], work / 'logs/build_ipa.log', env=dict(r0['ipa_env'], PROGRAMS_TSV=str(tsv)), on_line=watch.line)
+    if not out_ipa.is_file(): raise BuildError(f'no IPA at {out_ipa}')
+    PROG.end(f'{out_ipa.name}, {amount(out_ipa.stat().st_size, "B")}')
+    for r in runs.values():
+        rmtree(r['work'] / 'tmp')
+        if not r['keep']: say(f'deleting the extracted game files: {r["ex"]}'); rmtree(r['ex'])
+    say(f'done: {out_ipa} ({out_ipa.stat().st_size / 2**30:.1f} GB): programs {", ".join(map(str, progs))}; the app starts program 0, and the program a game starts the next time it is opened')
+    for r in runs.values(): report_profile_status(r['g'], r['reg'], r['pkg_ver'], r['derived'], r['provisional'])
     return runs
 
 
@@ -1919,6 +1945,9 @@ def pack_one(args, multi=False):
         say('choose the game scheme in Xcode, select your Team and iPhone or iPad, then Run (Release)')
         report_profile_status(g, reg, pkg_ver, derived, provisional, 'Xcode project')
         return
+    if multi:   # an app of several programs: main builds it once over every program's parts
+        return {'ipa_env': ipa_env, 'out_ipa': out_ipa, 'work': work, 'ex': ex, 'keep': keep, 'reg': reg, 'g': g, 'pkg_ver': pkg_ver, 'derived': derived, 'provisional': provisional,
+                'row': (PROGRAM, g.id, patched, game / 'RomFS', ios, gfx)}
     watch = IpaWatch(repo, work / 'ipa', out_ipa)
     PROG.stage('app build', poll=watch.poll, step='starting')   # build_ipa.sh's "pack IPA" line starts the stage "IPA pack"
     run(['bash', repo / 'dm/ios/tools/build_ipa.sh', out_ipa], logs / 'build_ipa.log', env=ipa_env, on_line=watch.line)

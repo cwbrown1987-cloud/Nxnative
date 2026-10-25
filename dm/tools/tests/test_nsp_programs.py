@@ -69,6 +69,38 @@ class Programs(unittest.TestCase):
         self.assertEqual(len(out), 1); self.assertIn(f'&& DM_PROGRAMS={tsv} DM_ROOT=', out[0]); self.assertTrue(out[0].startswith(f'cd {self.tmp / f"{APP:016X}_build/run"} && '))
         self.assertEqual(sorted(runs), [0, 2])
 
+    def test_ios_one_ipa(self):   # the iPhone: every program's parts, then one build_ipa.sh run with PROGRAMS_TSV over program 0's app
+        def pack_one(args, multi=False):
+            b = self.tmp / f'{APP + nsp.PROGRAM:016X}_build'; (b / 'logs').mkdir(parents=True)
+            return {'ipa_env': {'GAME': f'{APP + nsp.PROGRAM:016X}'}, 'out_ipa': self.tmp / f'p{nsp.PROGRAM}.ipa', 'work': b, 'ex': b / 'extract', 'keep': True, 'reg': None, 'g': None,
+                    'pkg_ver': 'v0', 'derived': False, 'provisional': False, 'row': (nsp.PROGRAM, f'{APP + nsp.PROGRAM:016X}', b / 'patched_v0', b / 'extract/v0/RomFS', b / 'shader/ios', 'vulkan' if nsp.PROGRAM else 'nvn')}
+        ran = []
+        def run(cmd, log, env=None, cwd=None, on_line=None):
+            ran.append(env); Path(cmd[-1]).write_bytes(b'ipa')
+        args = nsp.parse_args([str(self.tmp), '--platform', 'ios'])
+        with mock.patch.object(nsp, 'pack_one', pack_one), mock.patch.object(nsp, 'run', run), mock.patch.object(nsp, 'free_gb', lambda p: 100), \
+             mock.patch.object(nsp, 'report_profile_status', lambda *a: None), mock.patch.object(nsp, 'IpaWatch', mock.Mock()):
+            nsp.main(args)
+        self.assertEqual(len(ran), 1); self.assertEqual(ran[0]['GAME'], f'{APP:016X}')
+        rows = [l.split('\t') for l in Path(ran[0]['PROGRAMS_TSV']).read_text().splitlines() if not l.startswith('#')]
+        self.assertEqual([(r[0], r[1], r[5]) for r in rows], [('0', f'{APP:016X}', 'nvn'), ('2', f'{APP + 2:016X}', 'vulkan')])
+        self.assertTrue((self.tmp / 'p0.ipa').is_file())   # program 0's IPA name
+
+
+class HeaderMulti(unittest.TestCase):   # game.py header-multi: the host over a table of the programs' profiles, DM_PROGRAM picking the entry (main.c dm_game_cur)
+    def test_values_follow_the_program(self):
+        tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tmp)
+        import subprocess
+        subprocess.run([sys.executable, REPO / 'dm/games/game.py', 'header-multi', tmp / 'game_profile.h', '0=010049900F546000', '2=010049900F546002'], check=True)
+        (tmp / 't.c').write_text('#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include "game_profile.h"\n'
+            'const dm_game_t *dm_game_cur(void) { const char *e = getenv("DM_PROGRAM"); for (size_t i = 0; i < sizeof dm_games / sizeof *dm_games; i++) if (dm_games[i].program == (e ? atoi(e) : 0)) return &dm_games[i]; return &dm_games[0]; }\n'
+            'int main(void) { const struct { const char *b, *v; } k[] = {DM_GAME_DISPLAY_VERSIONS}; int nv = 0; for (unsigned j = 0; j < sizeof k / sizeof *k; j++) nv += k[j].b != NULL;\n'
+            '  printf("%s %llx %d %s %d %d\\n", DM_GAME_ID, (unsigned long long)DM_GAME_MEM_RESERVE, DM_GAME_RENDER_COND, DM_GAME_MODULES_ARR[1], DM_GAME_NMOD, nv); return 0; }\n')
+        subprocess.run(['clang', '-Wall', '-Werror', '-o', tmp / 't', tmp / 't.c'], check=True)
+        out = lambda p: subprocess.run([tmp / 't'], env=dict(os.environ, DM_PROGRAM=p), capture_output=True, text=True, check=True).stdout.split()
+        self.assertEqual(out('0'), ['010049900F546000', '100000000', '1', 'subsdk0', '3', '1'])
+        self.assertEqual(out('2'), ['010049900F546002', '180000000', '0', 'subsdk0', '3', '1'])
+
 
 if __name__ == '__main__':
     unittest.main()

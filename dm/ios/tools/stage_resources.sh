@@ -26,6 +26,9 @@ mkdir -p "$APP/romfs" "$APP/msl/$DM_RESOURCE_MSLDIR"
 for old in "$APP/msl/"*; do
     [ "$old" = "$APP/msl/$DM_RESOURCE_MSLDIR" ] || rm -rf "$old"
 done
+# The offline HTML pages beside the RomFS (nx_extract --html, the NSP script), where the host finds them beside <App>/romfs (hle_web.c)
+H=$(dirname "$DM_RESOURCE_ROMFS")/html
+if [ -d "$H" ]; then mkdir -p "$APP/html"; /usr/bin/rsync -a --delete -- "$H/" "$APP/html/"; else rm -rf "$APP/html"; fi
 if [ -n "$DM_RESOURCE_AOC" ]; then
     mkdir -p "$APP/aoc"
     /usr/bin/rsync -a --delete -- "$DM_RESOURCE_AOC/" "$APP/aoc/"
