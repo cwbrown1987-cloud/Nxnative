@@ -11,6 +11,9 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 typedef struct { uint64_t offset, size; } jit_range;   // nn::jit::CodeRange: offset and size in the code (rx) or data (ro) memory
 // The plugin's view of its memory (the JITConfiguration yuzu names): the game's code and data memory, the transfer memory, and the service's own mappings of the first two.
@@ -47,6 +50,151 @@ static void *jit_resolve(const char *name) {
 
 static int range_ok(const jit_range *r, uint64_t size) { return r->offset <= size && r->size <= size - r->offset; }
 
+// ---- Capture (Mac, DM_JIT_CAPTURE=<dir>): what the plugin made, for a host that runs no code made at run time (iOS) ----
+// A request is known by its key: the command, the data with the words that differ from run to run masked (the code offset the game asks for, host addresses: Super Mario 64's
+// command 4 passes the block's PC, its MIPS word count, the address of those words and the offset), and the SHA-256 of the input buffer (command 4: the block's MIPS words;
+// a larger input only its size, in_sha). Each request is written once, as <dir>/<key>.jit: the request, the layout it was made in (every module, the code,
+// data and transfer memory: the code holds absolute addresses into them), the code and the output buffer. dm/tools/jit_capture.py builds the image the iOS app serves from
+int dm_guest_as_contains(uintptr_t a);
+static const char *jit_capture_dir(void) { static const char *d; static int set; if (!set) { d = getenv("DM_JIT_CAPTURE"); set = 1; } return d; }
+// A host address: in a module, the guest block, or the code / data / transfer memory of the environment (masked in the data words)
+static jit_env *g_jit_env;
+static int host_addr(uint64_t v) {
+    jit_env *e = g_jit_env;
+    if (e && ((v >= e->rx && v - e->rx < e->rx_size) || (v >= e->ro && v - e->ro < e->ro_size) || (v >= e->cfg.tmem.offset && v - e->cfg.tmem.offset < e->cfg.tmem.size))) return 1;
+    return module_of((void *)(uintptr_t)v) || dm_guest_as_contains((uintptr_t)v);
+}
+// The input's part of the key: its SHA-256 up to 1 MB (Super Mario 64's command 4: the block's MIPS words). A larger input is the bulk request at boot (command 3: the N64 state with
+// the precompiled block list, 140 MB), which holds a table of 4,235 pointers into the precompiled NRO, different in every run; its key is the command, the data and the size.
+// Masking host addresses by value does not make it stable: about 92,000 other words fall inside the host's module range by chance ({x, 1} pairs of 32-bit values), and which ones
+// depends on where the modules were mapped
+enum { JIT_KEY_IN_MAX = 1 << 20 };
+static void in_sha(const void *in, size_t n, uint8_t out[32]) {
+    if (n > JIT_KEY_IN_MAX) { memset(out, 0, 32); memcpy(out, &n, sizeof n); return; }
+    CC_SHA256(in, (CC_LONG)n, out);
+}
+// The data words that differ from run to run, masked: the offset asked for and host addresses. masked[] is what the capture stores
+static void data_mask(uint8_t masked[32], const jit_range *c0_in, const void *in, size_t in_size, const uint8_t d32[32], size_t data_size) {
+    uint64_t w[4]; memcpy(w, d32, 32);
+    for (int k = 0; k < 4; k++) {
+        uintptr_t v = (uintptr_t)w[k];
+        if (8 * (size_t)k >= data_size) w[k] = 0;
+        else if (w[k] == c0_in->offset || (in && v >= (uintptr_t)in && v - (uintptr_t)in < in_size) || host_addr(w[k])) w[k] = ~0ull;
+    }
+    memcpy(masked, w, 32);
+}
+// The key: SHA-256 of the command, the data size, its data and the input's hash, first 16 bytes in hex (jit_capture.py builds the same keys). The data: when the image's
+// keydata row names a command's request bytes, those bytes as they are (Super Mario 64's command 4 struct leaves 4 padding bytes uninitialised, which differ when the plugin does not
+// run, and masking by value took one such word, the count with 1 above it, for a host address); otherwise the data with run-dependent words masked (data_mask)
+static uint8_t g_keydata[8][32]; static uint8_t g_keydata_set[8];
+// outcode rows: where a command's output lists the code's entry points (u32 offsets of entries 1 … count − 1 from the code's start), their count and the code size. The game takes
+// the code to be where it asked (Super Mario 64: entry = its own code pointer + offset, main+0x5256c, and it advances that pointer by the size, main+0x52640), so a request served
+// elsewhere in the image gets its entry offsets moved by the difference and a size of 0: the game then always asks at the same offset, below every such request in the image
+static struct { int set; uint32_t entries, count, size; } g_outcode[8];
+static void jit_key(char hx[33], uint64_t cmd, const jit_range *c0_in, const void *in, size_t in_size, const uint8_t d32[32], size_t data_size, const uint8_t ish[32]) {
+    uint8_t w[32];
+    if (cmd < 8 && g_keydata_set[cmd]) for (int k = 0; k < 32; k++) w[k] = (k < (int)data_size ? d32[k] : 0) & g_keydata[cmd][k];
+    else data_mask(w, c0_in, in, in_size, d32, data_size);
+    CC_SHA256_CTX c; CC_SHA256_Init(&c);
+    CC_SHA256_Update(&c, &cmd, 8); uint64_t ds = data_size; CC_SHA256_Update(&c, &ds, 8); CC_SHA256_Update(&c, w, 32); CC_SHA256_Update(&c, ish, 32);
+    uint8_t h[32]; CC_SHA256_Final(h, &c);
+    for (int k = 0; k < 16; k++) snprintf(hx + 2 * k, 3, "%02x", h[k]);
+}
+typedef struct { char name[16]; uint64_t base, size, pre; } jit_region;
+
+// ---- Serving (iOS; the Mac with DM_JIT_SERVE=<dir>): GenerateCode answered from the image dm/tools/jit_capture.py built, the plugin never runs ----
+// jit.img is the code memory's first part (mapped read + execute at the layout's base, loader.c; on iOS the executable's __TEXT,__dm_jit section, as the modules are embedded),
+// jit.tsv the requests by key (where each one's code lies in the image, its output and the output's host addresses to relocate) and jit.out the outputs
+typedef struct { char key[33]; uint64_t cmd, code_off, code_size, ro_off, ro_size, out_off, out_size; int ret; uint32_t nrel; uint64_t *rel_at, *rel_off; int *rel_mod; } jit_req;
+static jit_req *g_req; static int g_nreq; static const uint8_t *g_out; static size_t g_out_len; static uint64_t g_img_size, g_layout_rx, g_layout_ro;
+static void jit_serve_load(const char *dir) {
+    char path[1100]; snprintf(path, sizeof path, "%s/jit.tsv", dir);
+    FILE *f = fopen(path, "r"); if (!f) die("jit: no %s", path);
+    size_t cap = 0; char *line = NULL; ssize_t n;
+    while ((n = getline(&line, &cap, f)) > 0) {
+        unsigned long long a, b, c;
+        if (sscanf(line, "layout\t%llx\t%llx\t%llx", &a, &b, &c) == 3) { g_layout_rx = a; g_layout_ro = b; g_img_size = c; continue; }
+        unsigned kc; char km[65];
+        if (sscanf(line, "keydata\t%u\t%64s", &kc, km) == 2 && kc < 8) { for (int k = 0; k < 32; k++) sscanf(km + 2 * k, "%2hhx", &g_keydata[kc][k]); g_keydata_set[kc] = 1; continue; }
+        unsigned oe, oc, os2;
+        if (sscanf(line, "outcode\t%u\t%x\t%x\t%x", &kc, &oe, &oc, &os2) == 4 && kc < 8) { g_outcode[kc].set = 1; g_outcode[kc].entries = oe; g_outcode[kc].count = oc; g_outcode[kc].size = os2; continue; }
+        if (strncmp(line, "req\t", 4)) continue;
+        g_req = realloc(g_req, (size_t)(g_nreq + 1) * sizeof *g_req); jit_req *r = &g_req[g_nreq++]; memset(r, 0, sizeof *r);
+        char rel[16]; unsigned long long co, cs, roo, ros, oo, os; int off = 0;
+        if (sscanf(line, "req\t%32s\t%llu\t%llx\t%llx\t%llx\t%llx\t%d\t%llx\t%llx\t%n", r->key, (unsigned long long *)&r->cmd, &co, &cs, &roo, &ros, &r->ret, &oo, &os, &off) < 9 || !off) die("%s: bad row", path);
+        r->code_off = co; r->code_size = cs; r->ro_off = roo; r->ro_size = ros; r->out_off = oo; r->out_size = os;
+        (void)rel;
+        for (const char *q = line + off; *q && *q != '\n' && *q != '-';) {   // <out offset>=<region>+<offset>, comma-separated
+            unsigned long long at, ro2; char nm[17]; int k = 0;
+            if (sscanf(q, "%llx=%16[^+]+%llx%n", &at, nm, &ro2, &k) != 3) die("%s: bad relocation in %s", path, r->key);
+            int mi = -1; if (strcmp(nm, "jit_rx")) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, nm)) mi = i; if (mi < 0) die("%s: relocation into %s, which is not loaded", path, nm); }
+            r->rel_at = realloc(r->rel_at, (r->nrel + 1) * 8); r->rel_off = realloc(r->rel_off, (r->nrel + 1) * 8); r->rel_mod = realloc(r->rel_mod, (r->nrel + 1) * sizeof(int));
+            r->rel_at[r->nrel] = at; r->rel_off[r->nrel] = ro2; r->rel_mod[r->nrel] = mi; r->nrel++;
+            q += k; if (*q == ',') q++;
+        }
+    }
+    free(line); fclose(f);
+    snprintf(path, sizeof path, "%s/jit.out", dir);
+    int fd = open(path, O_RDONLY); struct stat st;
+    if (fd < 0 || fstat(fd, &st)) die("jit: no %s", path);
+    g_out_len = (size_t)st.st_size; g_out = g_out_len ? mmap(NULL, g_out_len, PROT_READ, MAP_PRIVATE, fd, 0) : NULL; close(fd);
+    if (g_out == MAP_FAILED) die("jit: cannot map %s", path);
+    LOG("jit: serving %d requests from %s (image %#llx bytes, outputs %.1f MB): the plugin does not run", g_nreq, dir, (unsigned long long)g_img_size, g_out_len / 1048576.0);
+}
+static const jit_req *jit_find(const char *key) { for (int i = 0; i < g_nreq; i++) if (!strcmp(g_req[i].key, key)) return &g_req[i]; return NULL; }
+// The image at the layout's base: the Mac maps jit.img read + execute, iOS remaps the executable's signed __TEXT,__dm_jit pages there (as loader.c remaps the modules)
+#if TARGET_OS_IPHONE
+#include <mach/mach.h>
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
+#endif
+static void jit_map_image(uint8_t *at, const char *dir) {
+    if (!g_img_size) return;
+#if TARGET_OS_IPHONE
+    (void)dir; unsigned long z = 0;
+    const uint8_t *sec = getsectiondata(&_mh_execute_header, "__TEXT", "__dm_jit", &z);
+    if (!sec || z < g_img_size || ((uintptr_t)sec & 0x3fff)) die("jit: the image is not in the executable (__TEXT,__dm_jit), or smaller than jit.tsv says");
+    vm_address_t a = (vm_address_t)at; vm_prot_t cur = 0, max = 0;
+    if (vm_remap(mach_task_self(), &a, g_img_size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)sec, FALSE, &cur, &max, VM_INHERIT_NONE) != KERN_SUCCESS || a != (vm_address_t)at || !(cur & VM_PROT_EXECUTE))
+        die("jit: cannot remap the image to %p", at);
+#else
+    char path[1100]; snprintf(path, sizeof path, "%s/jit.img", dir);
+    // As loader.c maps the modules on the Mac: copied into anonymous pages, then sealed read + execute (macOS refuses a fixed executable mapping of the file)
+    int fd = open(path, O_RDONLY); if (fd < 0) die("jit: no %s", path);
+    if (mmap(at, g_img_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) != at) die("jit: cannot map %s at %p", path, at);
+    if (read(fd, at, g_img_size) != (ssize_t)g_img_size) die("jit: cannot read %s", path);
+    close(fd);
+    if (mprotect(at, g_img_size, PROT_READ | PROT_EXEC)) die("jit: cannot seal the image at %p", at);
+    sys_icache_invalidate(at, g_img_size);
+#endif
+}   // pre: a module's patch area in front of its base (patch_off < 0)
+static void jit_capture(jit_env *e, uint64_t cmd, const void *in, size_t in_size, const jit_range *c0_in, const uint8_t d32[32], size_t data_size, const void *out, size_t out_size,
+                        int ret, const jit_range *o0, const jit_range *o1) {
+    uint8_t ish[32]; in_sha(in, in_size, ish);
+    char key[33]; jit_key(key, cmd, c0_in, in, in_size, d32, data_size, ish);
+    uint8_t md[32]; data_mask(md, c0_in, in, in_size, d32, data_size);
+    char p[1024], t[1100]; snprintf(p, sizeof p, "%s/%s.jit", jit_capture_dir(), key);
+    if (access(p, F_OK) == 0) return;
+    jit_region r[MAX_MOD + 3]; uint32_t nr = 0;
+    for (int i = 0; i < g_nmod; i++) { strlcpy(r[nr].name, g_mod[i].name, 16); r[nr].base = (uint64_t)g_mod[i].base; r[nr].size = g_mod[i].size; r[nr].pre = g_mod[i].patch_off < 0 ? (uint64_t)-g_mod[i].patch_off : 0; nr++; }
+    strlcpy(r[nr].name, "jit_rx", 16); r[nr].base = e->rx; r[nr].size = e->rx_size; r[nr].pre = 0; nr++;
+    strlcpy(r[nr].name, "jit_ro", 16); r[nr].base = e->ro; r[nr].size = e->ro_size; r[nr].pre = 0; nr++;
+    strlcpy(r[nr].name, "jit_tmem", 16); r[nr].base = e->cfg.tmem.offset; r[nr].size = e->cfg.tmem.size; r[nr].pre = 0; nr++;
+    snprintf(t, sizeof t, "%s.%d.tmp", p, getpid());
+    FILE *f = fopen(t, "wb"); if (!f) { static int red; if (!red++) LOG("[RED] jit capture cannot write to %s", jit_capture_dir()); return; }
+    uint32_t c32 = (uint32_t)cmd; uint64_t hd[4] = {c0_in->offset, c0_in->size, in_size, data_size};
+    int ok = fwrite("DMJ5", 1, 4, f) == 4 && fwrite(&c32, 4, 1, f) && fwrite(hd, 8, 4, f) == 4 && fwrite(ish, 1, 32, f) == 32 && fwrite(md, 1, 32, f) == 32 && fwrite(d32, 1, 32, f) == 32;
+    uint64_t os = out_size; int32_t rv = ret;
+    ok = ok && fwrite(&os, 8, 1, f) && fwrite(&rv, 4, 1, f) && fwrite(o0, 16, 1, f) && fwrite(o1, 16, 1, f) && fwrite(&nr, 4, 1, f) && fwrite(r, sizeof *r, nr, f) == nr;
+    if (o0->size) ok = ok && fwrite((void *)(e->rx + o0->offset), 1, o0->size, f) == o0->size;
+    if (o1->size) ok = ok && fwrite((void *)(e->ro + o1->offset), 1, o1->size, f) == o1->size;
+    if (out_size) ok = ok && fwrite(out, 1, out_size, f) == out_size;
+    if (in_size <= JIT_KEY_IN_MAX) ok = ok && fwrite(in, 1, in_size, f) == in_size;   // small inputs whole: the image keys on the part a request used
+    ok &= fclose(f) == 0;
+    if (ok) rename(t, p); else unlink(t);   // whole files only: a capture run may be killed at any time
+    static int n; if (n++ < 64) LOG("jit capture: command %llu → %s (%llu bytes of code)", (unsigned long long)cmd, key, (unsigned long long)o0->size);
+}
+
 HLE_FORCE("_ZN2nn3jit10InitializeEv", "connects to the jit service; the host runs the plugin itself", void, h_jit_Initialize, void) { LOG("init takeover: jit::Initialize (no-op)"); }
 HLE_FORCE("_ZN2nn3jit8FinalizeEv", "Initialize opened no session", void, h_jit_Finalize, void) { }
 
@@ -58,6 +206,23 @@ HLE_FORCE("_ZN2nn3jit20CreateJitEnvironmentEPNS0_9JitHandleERKNS0_27JitEnvironme
     uint64_t rx_size = cfg[0], ro_size = cfg[1], tmem_size = plug[4];
     if (((uintptr_t)work | rx_size | ro_size | tmem_size) & 0x1fffff || rx_size + ro_size + tmem_size > work_size) die("jit::CreateJitEnvironment: sizes %#llx / %#llx / %#llx, work %p + %#llx (the SDK aborts)",
         (unsigned long long)rx_size, (unsigned long long)ro_size, (unsigned long long)tmem_size, work, (unsigned long long)work_size);
+    const char *serve = dm_jit_serve_dir();
+    if (serve) {
+        if (!g_nreq) jit_serve_load(serve);
+        uint8_t *base = dm_jit_layout_base();
+        if (!base || rx_size != g_layout_rx || ro_size != g_layout_ro) die("jit: the game asks for %#llx bytes of code memory and %#llx of data memory, the image was built for %#llx / %#llx",
+            (unsigned long long)rx_size, (unsigned long long)ro_size, (unsigned long long)g_layout_rx, (unsigned long long)g_layout_ro);
+        jit_env *e = calloc(1, sizeof *e); pthread_mutex_init(&e->mu, NULL);
+        jit_map_image(base, serve);
+        uint8_t *ro = mmap(NULL, ro_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (ro == MAP_FAILED) die("jit: data memory of %#llx bytes", (unsigned long long)ro_size);
+        e->rx = (uint64_t)base; e->rx_size = rx_size; e->ro = (uint64_t)ro; e->ro_size = ro_size;
+        e->cfg = (jit_config){{e->rx, rx_size}, {e->ro, ro_size}, {(uint64_t)(work + rx_size + ro_size), tmem_size}, {e->rx, rx_size}, {e->ro, ro_size}};
+        *out = e; g_jit_env = e;
+        LOG("jit::CreateJitEnvironment: served from %s: code memory %p + %#llx (the image's first %#llx bytes), data memory %p + %#llx", serve, base, (unsigned long long)rx_size,
+            (unsigned long long)g_img_size, ro, (unsigned long long)ro_size);
+        return 0;
+    }
     // The NRO is one of the two buffers (the NRR the other; Super Mario 64 passes the NRR first)
     const uint8_t *nro = NULL; uint64_t nro_size = 0;
     for (int k = 0; k < 2; k++) { const uint8_t *b = (const uint8_t *)plug[2 * k]; if (b && plug[2 * k + 1] >= 0x80 && !memcmp(b + 0x10, "NRO0", 4)) { nro = b; nro_size = plug[2 * k + 1]; } }
@@ -97,7 +262,7 @@ HLE_FORCE("_ZN2nn3jit20CreateJitEnvironmentEPNS0_9JitHandleERKNS0_27JitEnvironme
     uint32_t flags = 0;
     ((void (*)(uint32_t *))cf)(&flags);
     ((void (*)(jit_config *))op)(&e->cfg);
-    *out = e;
+    *out = e; g_jit_env = e;
     LOG("jit::CreateJitEnvironment: plugin %s (SHA-256 %s…, %u bytes) loaded; code memory %p + %#llx (MAP_JIT), data memory %p + %#llx, plugin state %p + %#llx (the work buffer's last part)",
         m->name, hx, n, rx, (unsigned long long)rx_size, ro, (unsigned long long)ro_size, (void *)e->cfg.tmem.offset, (unsigned long long)tmem_size);
     return 0;
@@ -107,9 +272,12 @@ HLE_FORCE("_ZN2nn3jit21DestroyJitEnvironmentENS0_9JitHandleE", "unload the plugi
     if (!e) return;
     LOG("jit::DestroyJitEnvironment: GenerateCode %llu / %llu / %llu / %llu calls (commands 1-4)", (unsigned long long)e->ncalls[1], (unsigned long long)e->ncalls[2],
         (unsigned long long)e->ncalls[3], (unsigned long long)e->ncalls[4]);
-    if (e->plugin->fini) ((void (*)(void))(e->plugin->base + e->plugin->fini))();
-    e->plugin->loaded = 0;
-    munmap((void *)e->rx, e->rx_size); munmap((void *)e->ro, e->ro_size);
+    if (e->plugin) {
+        if (e->plugin->fini) ((void (*)(void))(e->plugin->base + e->plugin->fini))();
+        e->plugin->loaded = 0;
+        munmap((void *)e->rx, e->rx_size);
+    }   // a served image stays mapped in the layout
+    munmap((void *)e->ro, e->ro_size); if (g_jit_env == e) g_jit_env = NULL;
     pthread_mutex_destroy(&e->mu); free(e);
 }
 
@@ -118,8 +286,52 @@ HLE_FORCE("_ZN2nn3jit21GetJitEnvironmentInfoENS0_9JitHandleE", "where the code a
     return (jit_info){e->rx, e->rx_size, e->ro, e->ro_size};
 }
 
+static int jit_serve(jit_env *e, jit_range *c0_out, jit_range *c1_out, uint64_t cmd, const void *in, size_t in_size, const jit_range *c0_in, const uint8_t d32[32], size_t data_size,
+                     void *out, size_t out_size) {
+    uint8_t ish[32]; in_sha(in, in_size, ish);
+    char key[33]; jit_key(key, cmd, c0_in, in, in_size, d32, data_size, ish);
+    const jit_req *r = jit_find(key);
+    static _Atomic unsigned long nserved, nmiss;
+    if (!r) {
+        unsigned long m = ++nmiss;
+        LOG("[RED] jit::GenerateCode command %llu: request %s (data %08x %08x) is not in the image (miss %lu): capture it on the Mac (DM_JIT_CAPTURE) and rebuild the image",
+            (unsigned long long)cmd, key, *(const uint32_t *)d32, *(const uint32_t *)(d32 + 4), m);
+        const char *md = getenv("DM_JIT_MISS_DUMP");   // the missed request's input, for comparing with the captures
+        if (md && in && in_size <= JIT_KEY_IN_MAX) { char q[1024]; snprintf(q, sizeof q, "%s/miss_%s.in", md, key); FILE *g = fopen(q, "wb"); if (g) { fwrite(in, 1, in_size, g); fclose(g); } }
+        if (c0_out) *c0_out = (jit_range){c0_in->offset, 0};
+        if (c1_out) *c1_out = (jit_range){0, 0};
+        return -1;
+    }
+    if (r->out_size > out_size || r->out_off + r->ro_size + r->out_size > g_out_len || r->ro_off + r->ro_size > e->ro_size) die("jit: request %s does not fit the buffers the game gave", key);
+    if (r->ro_size) memcpy((void *)(e->ro + r->ro_off), g_out + r->out_off, r->ro_size);
+    if (r->out_size) memcpy(out, g_out + r->out_off + r->ro_size, r->out_size);
+    for (uint32_t i = 0; i < r->nrel; i++) {
+        uint64_t v = (r->rel_mod[i] < 0 ? e->rx : (uint64_t)g_mod[r->rel_mod[i]].base) + r->rel_off[i];
+        memcpy((uint8_t *)out + r->rel_at[i], &v, 8);
+    }
+    if (cmd < 8 && g_outcode[cmd].set) {
+        int64_t delta = (int64_t)r->code_off - (int64_t)c0_in->offset; uint32_t cnt = 0;
+        if (delta < 0) die("jit: request %s lies at %#llx in the image, below the offset the game asks for (%#llx)", key, (unsigned long long)r->code_off, (unsigned long long)c0_in->offset);
+        if (g_outcode[cmd].count + 4 <= r->out_size) memcpy(&cnt, (uint8_t *)out + g_outcode[cmd].count, 4);
+        for (uint32_t i = 1; i < cnt && g_outcode[cmd].entries + 4 * i <= r->out_size; i++) {
+            uint32_t v; memcpy(&v, (uint8_t *)out + g_outcode[cmd].entries + 4 * (i - 1), 4); v += (uint32_t)delta; memcpy((uint8_t *)out + g_outcode[cmd].entries + 4 * (i - 1), &v, 4);
+        }
+        if (g_outcode[cmd].size + 4 <= r->out_size) memset((uint8_t *)out + g_outcode[cmd].size, 0, 4);
+    } else if (r->code_off != c0_in->offset) die("jit: request %s lies at %#llx in the image, not at %#llx where the game asks, and the image has no outcode row for command %llu", key,
+                                                (unsigned long long)r->code_off, (unsigned long long)c0_in->offset, (unsigned long long)cmd);
+    unsigned long k = ++nserved;
+    if (k <= 16 || !(k & (k - 1)) || jit_log_all())
+        LOG("jit::GenerateCode #%lu command %llu: served %s, code %#llx + %#llx (asked at %#llx), %u relocations", k, (unsigned long long)cmd, key, (unsigned long long)r->code_off,
+            (unsigned long long)r->code_size, (unsigned long long)c0_in->offset, r->nrel);
+    (void)data_size;
+    if (c0_out) *c0_out = (jit_range){r->code_off, r->code_size};
+    if (c1_out) *c1_out = (jit_range){r->ro_off, r->ro_size};
+    return r->ret;
+}
+
 // Control(handle, command, in, in_size, out, out_size): the plugin's return value (the SDK aborts when the service fails; the plugin's wrapper fails only without a Control)
 HLE_FORCE("_ZN2nn3jit7ControlENS0_9JitHandleEmPKvmPvm", "the plugin's nnjitpluginControl", int, h_jit_Control, jit_env *e, uint64_t cmd, const void *in, size_t in_size, void *out, size_t out_size) {
+    if (!e->plugin) { LOG("jit::Control command %llu: served (the plugin does not run; its state is in the image)", (unsigned long long)cmd); (void)in; (void)in_size; (void)out; (void)out_size; return 0; }
     if (!e->ctl) die("jit::Control: the plugin has no nnjitpluginControl");
     int ret = -1;
     pthread_mutex_lock(&e->mu);
@@ -139,6 +351,7 @@ HLE_FORCE("_ZN2nn3jit12GenerateCodeEPNS0_9CodeRangeES2_NS0_9JitHandleEmPKvmRKS1_
     uint8_t d32[32] = {0}; memcpy(d32, data, data_size < 32 ? data_size : 32);
     jit_range o0 = {0}, o1 = {0};
     int ret = -1;
+    if (!e->plugin) return jit_serve(e, c0_out, c1_out, cmd, in, in_size, c0_in, d32, data_size, out, out_size);
     uint64_t t0 = now_ns();
     pthread_mutex_lock(&e->mu);
 #if !TARGET_OS_IPHONE
@@ -163,13 +376,7 @@ HLE_FORCE("_ZN2nn3jit12GenerateCodeEPNS0_9CodeRangeES2_NS0_9JitHandleEmPKvmRKS1_
             (unsigned long long)cmd, (unsigned long long)e->nbytes[c], e->ns[c] / 1e6);
     if (w) { LOG("[RED] jit::GenerateCode: the plugin's wrapper failed (command %llu)", (unsigned long long)cmd); die("jit::GenerateCode failed (the SDK aborts)"); }
     if (ret) LOG("[RED] jit::GenerateCode command %llu: the plugin returned %d (the service fails the request)", (unsigned long long)cmd, ret);
-    // DM_JIT_DUMP=<dir>: each call's code as <dir>/<n>_<command>_<offset>.bin, for reading offline
-    static const char *dump; static int dump_set, nd;
-    if (!dump_set) { dump = getenv("DM_JIT_DUMP"); dump_set = 1; }
-    if (dump && o0.size) {
-        char p[1024]; snprintf(p, sizeof p, "%s/%05d_%llu_%llx.bin", dump, nd++, (unsigned long long)cmd, (unsigned long long)o0.offset);
-        FILE *f = fopen(p, "wb"); if (f) { fwrite((void *)(e->rx + o0.offset), 1, o0.size, f); fclose(f); }
-    }
+    if (jit_capture_dir()) jit_capture(e, cmd, in, in_size, c0_in, d32, data_size, out, out_size, ret, &o0, &o1);
     if (c0_out) *c0_out = o0;
     if (c1_out) *c1_out = o1;
     return ret;

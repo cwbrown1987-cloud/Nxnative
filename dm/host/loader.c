@@ -9,6 +9,9 @@
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include "hle.h"
+#if TARGET_OS_IPHONE
+#include <mach/mach.h>
+#endif
 
 module_t g_mod[MAX_MOD];
 int g_nmod;
@@ -484,6 +487,65 @@ void loader_hash_log(void) {
     }
 }
 
+// ---- A served nn::jit image (hle_jit.c, dm/tools/jit_capture.py) ----
+// A host that runs no code made at run time (iOS; the Mac with DM_JIT_SERVE=<dir>) serves the JIT plugin's output from an image built on the Mac. Its code reaches the modules
+// with PC-relative addresses, so the modules are mapped at the image's canonical layout: one reservation holding the code memory at 0 and every module at the offset jit.tsv gives
+// it (mod rows), the distances the image was built for. Modules the layout does not name are mapped as before
+static uint8_t *g_jit_base; static uint64_t g_jit_span;
+static struct { char name[16]; uint64_t off, size, pre; } g_jit_mod[MAX_MOD]; static int g_njit_mod;
+// Where the image is: DM_JIT_SERVE; on iOS also the folder "jit" beside the RomFS folder (the app's jit/, staged with the RomFS). NULL: the plugin runs (the Mac's default)
+const char *dm_jit_serve_dir(void) {
+    static int init; static char dir[1024];
+    if (!init) {
+        init = 1; const char *e = getenv("DM_JIT_SERVE");
+        if (e && *e) strlcpy(dir, e, sizeof dir);
+#if TARGET_OS_IPHONE
+        else if (getenv("DM_ROMFS")) {
+            snprintf(dir, sizeof dir, "%s", getenv("DM_ROMFS")); char *sl = strrchr(dir, '/'); if (sl) *sl = 0;
+            strlcat(dir, "/jit", sizeof dir);
+            char t[1100]; snprintf(t, sizeof t, "%s/jit.tsv", dir); if (access(t, R_OK)) dir[0] = 0;
+        }
+#endif
+    }
+    return dir[0] ? dir : NULL;
+}
+uint8_t *dm_jit_layout_base(void) { return g_jit_base; }
+static void jit_layout_init(void) {
+    const char *d = dm_jit_serve_dir(); if (!d) return;
+    char path[1100], line[512]; snprintf(path, sizeof path, "%s/jit.tsv", d);
+    FILE *f = fopen(path, "r"); if (!f) die("DM_JIT_SERVE: no %s", path);
+    unsigned long long rx = 0, ro = 0, img = 0;
+    while (fgets(line, sizeof line, f)) {
+        char nm[32]; unsigned long long off, size, pre;
+        if (sscanf(line, "layout	%llx	%llx	%llx", &rx, &ro, &img) == 3) continue;
+        if (sscanf(line, "mod	%31s	%llx	%llx	%llx", nm, &off, &size, &pre) == 4 && g_njit_mod < MAX_MOD) {
+            strlcpy(g_jit_mod[g_njit_mod].name, nm, 16); g_jit_mod[g_njit_mod].off = off; g_jit_mod[g_njit_mod].size = size; g_jit_mod[g_njit_mod].pre = pre; g_njit_mod++;
+            if (off + size > g_jit_span) g_jit_span = off + size;
+        }
+        if (!strncmp(line, "req	", 4)) break;
+    }
+    fclose(f);
+    if (!rx || !g_njit_mod) die("%s: no layout", path);
+#if TARGET_OS_IPHONE
+    vm_address_t a = 0;
+    if (vm_allocate(mach_task_self(), &a, g_jit_span, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) die("jit layout: cannot reserve %#llx bytes", (unsigned long long)g_jit_span);
+    g_jit_base = (uint8_t *)a;
+#else
+    g_jit_base = mmap(NULL, g_jit_span, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (g_jit_base == MAP_FAILED) die("jit layout: cannot reserve %#llx bytes", (unsigned long long)g_jit_span);
+#endif
+    LOG("jit layout (%s): code memory and %d modules in %#llx bytes at %p", path, g_njit_mod, (unsigned long long)g_jit_span, g_jit_base);
+}
+// The place of module m in the layout (its base), NULL when the layout does not name it. Its size and front patch area must be those the image was built with
+static uint8_t *jit_slot(module_t *m, uint64_t size, uint64_t pre) {
+    for (int i = 0; g_jit_base && i < g_njit_mod; i++) if (!strcmp(g_jit_mod[i].name, m->name)) {
+        if (g_jit_mod[i].size != size || g_jit_mod[i].pre != pre) die("jit layout: %s is %#llx + %#llx bytes here, %#llx + %#llx in the image: rebuild the image (dm/tools/jit_capture.py)", m->name,
+            (unsigned long long)size, (unsigned long long)pre, (unsigned long long)g_jit_mod[i].size, (unsigned long long)g_jit_mod[i].pre);
+        return g_jit_base + g_jit_mod[i].off;
+    }
+    return NULL;
+}
+
 #if TARGET_OS_IPHONE
 // iOS does not allow code loaded at run time to execute, and Apple allows an executable only one segment with execute permission (ITMS-90999): the image is compiled into this executable by dm/ios/tools/gen_embed.py --
 // the two code blocks (original text, patch area) are sections in __TEXT, and W (the rest of ro + data + bss) is a separate RW segment. The three blocks are not adjacent in the file; here one contiguous address range is reserved,
@@ -532,8 +594,9 @@ static void map_image(module_t *m, const char *dir) {
     m->size = front ? m->image_size : m->patch_off + z1;
     uint64_t pre = front ? (uint64_t)-m->patch_off : 0;
     if (front) m->patch_len = z1;
-    vm_address_t base = 0;
-    if (vm_allocate(mach_task_self(), &base, pre + m->size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) die("%s failed to reserve %#llx bytes of address space", m->name, (unsigned long long)(pre + m->size));
+    vm_address_t base = 0; uint8_t *slot = jit_slot(m, m->size, pre);
+    if (slot) base = (vm_address_t)slot - pre;   // inside the jit layout's reservation
+    else if (vm_allocate(mach_task_self(), &base, pre + m->size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) die("%s failed to reserve %#llx bytes of address space", m->name, (unsigned long long)(pre + m->size));
     base += pre;
     remap_at(m, base, x0, z0, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
     remap_at(m, base + z0, w, zw, TRUE, VM_PROT_READ | VM_PROT_WRITE);
@@ -563,7 +626,8 @@ static void map_image(module_t *m, const char *dir) {
         if (sz < fl) die("%s is shorter than FILE_IMAGE_LEN %#llx", path, (unsigned long long)fl);
         m->size = m->image_size; m->patch_len = (sz - fl + 0x3FFF) & ~0x3FFFull;
         if (m->patch_len > pre) die("%s patch area of %#llx bytes does not fit in the %#llx before the base", path, (unsigned long long)m->patch_len, (unsigned long long)pre);
-        uint8_t *a = mmap(NULL, pre + m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        uint8_t *slot = jit_slot(m, m->size, pre);
+        uint8_t *a = mmap(slot ? slot - pre : NULL, pre + m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | (slot ? MAP_FIXED : 0), -1, 0);
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - fl); free(raw); install_key_page(m);
@@ -574,7 +638,8 @@ static void map_image(module_t *m, const char *dir) {
         return;
     }
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
-    m->base = mmap(NULL, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    uint8_t *slot = jit_slot(m, m->size, 0);
+    m->base = mmap(slot, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | (slot ? MAP_FIXED : 0), -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
     memcpy(m->base, raw, sz); free(raw); install_key_page(m);
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
@@ -594,6 +659,7 @@ void load_modules(const char *dir, const char **names, int n) {
         read_layout(m, dir);
     }
     create_keys();
+    jit_layout_init();
     for (int i = 0; i < n; i++) {
         module_t *m = &g_mod[i];
         t = now_ns(); map_image(m, dir); tm += now_ns() - t;   // On return the code area is already read-only+execute; from here on the loader only writes data

@@ -12,6 +12,7 @@ void hlecount_seal(void) {}
 void *hlecount_wrap(const char *kind, const char *name, void *fn) { (void)kind; (void)name; return fn; }
 uint64_t resolve_import(module_t *m, const char *name) { (void)m; (void)name; return 0; }
 int hle_implements(const char *name) { (void)name; return 0; }
+int dm_guest_as_contains(uintptr_t a) { (void)a; return 0; }
 
 enum { S_VER = 1, S_RES, S_CFG, S_PREP, S_GEN, S_CTL, S_WEAK, S_N };
 typedef struct {

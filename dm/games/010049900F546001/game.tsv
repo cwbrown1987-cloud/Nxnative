@@ -26,6 +26,14 @@ shader_versions	v0
 # main imports Vulkan, not NVN: the host's Vulkan layer. The game clears its targets with vkCmdClearColorImage / vkCmdClearDepthStencilImage and sets the stencil state
 # dynamically, specializes one int of its fragment shader, and keeps the N64's textures as linear RGBA8, RGBA5551 and R4G4 images the CPU writes
 
+# ---- JIT ----
+# The image an iPhone serves nn::jit from (dm/tools/jit_capture.py): command 4's request struct is {u32 pc, u32 1, u64 words, u64 offset, u32 count} and 4 bytes of padding the
+# game leaves uninitialised (main+0x52470), so only the pc, the flag and the count make a request
+jit_key_data	4:0-7,24-27
+# command 4's output: the u32 offsets of the block's entry points 1 … count − 1 at +4, the count at +0x20004, the code size at +0x20000; the game computes the entries from the
+# address it asked for (main+0x5256c) and advances that address by the size (main+0x52640)
+jit_out_code	4:entries=4,count=0x20004,size=0x20000
+
 # ---- Files ----
 # not loaded, main takes nothing from them the host does not supply: subsdk0 (NintendoSDK_Vulkan), subsdk1 (NintendoSDK_OpenGL), subsdk2 (GLSLC). The precompiled NRO and the
 # JIT plugin are mapped from patched_v0/nro.tsv (collected by the hashes the RomFS's NRRs register)
