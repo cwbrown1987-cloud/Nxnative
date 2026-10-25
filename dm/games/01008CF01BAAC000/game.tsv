@@ -1,4 +1,4 @@
-# Game profile of The Legend of Zelda: Echoes of Wisdom (Switch, base game 1.0.0 = v0, a cartridge dump). Plays on the Mac (the title, file select and about 4 minutes of play, at 60 fps with sound)
+# Game profile of The Legend of Zelda: Echoes of Wisdom (Switch, base game 1.0.0 = v0, a cartridge dump). Plays on the iPad; on the Mac: the title, file select and about 4 minutes of play, at 60 fps with sound
 # Format: see dm/games/README.md
 # Grezzo's engine on NintendoWare (G3d / Ui2d / Vfx / Atk / Font), as Link's Awakening, SDK 16.2.0, NVN; modules main + subsdk0 (GLSLC, the runtime shader compiler) + subsdk1 (NintendoSDK_movie) + sdk.
 # RomFS (10,963 files, 7.48 GB): bfres models and maps (region_common/map, region_common/actor), shaders in region_common/shader/*.bfsha (BNSH), particle effects in region_common/effect/*.ptcl,
