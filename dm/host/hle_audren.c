@@ -57,12 +57,15 @@ static void render_main(void *arg) {
     for (int i = 0; i < NBUF; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
     dm_pcmout_start(out);
     LOG("audren: render thread started (%d buffers in flight, paced by the output)", NBUF);
-    while (atomic_load(&g_open)) {
+    // The end of the run (an in-process program switch) also ends the loop, between two renders: the thread leaves below, holding no lock, and dm_audio_end_run closes its output
+    // (closing it here takes CoreAudio's teardown, longer than the end of the run waits before it fences guest code). It is seldom in an SVC or caught in guest code by the signal,
+    // and used to leave only from the fenced SDK code (hle_thread.c dm_threads_terminate)
+    while (atomic_load(&g_open) && !dm_terminating()) {
         while (!nfree) {   // wait for the output to hand a block back (silent sink / sound card, one every 5 ms); it signals each release, so the thread sleeps until then (it used to poll every 1 ms)
             gbuf *b = dm_pcmout_released(out);
             if (b) { free_list[nfree++] = b; break; }
             dm_pcmout_wait(out, 10);
-            if (!atomic_load(&g_open)) break;
+            if (!atomic_load(&g_open) || dm_terminating()) break;
         }
         if (!nfree) break;
         const int16_t *src; int got;
@@ -75,6 +78,7 @@ static void render_main(void *arg) {
         b->size = (uint64_t)n * 4;
         if (!dm_pcmout_append(out, b)) free_list[nfree++] = b;
     }
+    dm_thread_term_check();   // the run ends: the thread leaves here
     dm_pcmout_close(out);   // the output would otherwise keep its sound card callback or silent sink running and hold one of the AudioOut slots after the renderer closes
     cq_popped();   // an update waiting for queue space (catch-up pacing) sees g_open cleared
 }

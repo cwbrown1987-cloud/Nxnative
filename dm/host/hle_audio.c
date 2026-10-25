@@ -467,13 +467,15 @@ void dm_audio_reset(void) {
     pthread_mutex_unlock(&g_aos_lock);
 }
 // End of the run (an in-process program switch, progswitch.c), with no guest thread left: every output still open is closed (its AudioUnit disposed, its notify thread
-// joined, the audio renderer's host output among them) and the watchdog stops, before the run's statics are reset
+// joined, the audio renderer's host output among them, whose render thread leaves without closing it) and the watchdog stops, before the run's statics are reset
 void dm_audio_end_run(void) {
     int n = 0;
     for (;;) {
         pthread_mutex_lock(&g_aos_lock); aout *a = NULL; for (int i = 0; i < AOMAX && !a; i++) a = g_aos[i]; pthread_mutex_unlock(&g_aos_lock);
         if (!a) break;
-        au_close(a->key, NULL); n++;
+        void *key = a->key; int host = a->rel_sem != NULL;
+        au_close(key, NULL); n++;
+        if (host) free(key);   // a host output's key (dm_pcmout_open), as dm_pcmout_close frees it
     }
     atomic_store(&g_wd_quit, 1);
     for (int i = 0; i < 100 && atomic_load(&g_wd_up); i++) usleep(WD_TICK_MS * 100);

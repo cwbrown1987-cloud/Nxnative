@@ -84,6 +84,7 @@ typedef struct thr {
     int ctx_ok; uint64_t ctx_x[29], ctx_fp, ctx_lr, ctx_sp, ctx_pc; uint32_t ctx_pstate, ctx_fpcr, ctx_fpsr; __uint128_t ctx_v[32];
     pthread_cond_t pcv;
     sigjmp_buf *term_jb;       // where the thread leaves to when the run ends (dm_threads_terminate): thread_main's frame, or the main thread's (dm_thread_main_exit_point)
+    int term_nf; uint64_t term_f[16];   // a thread that left from fenced guest code (term_fault): its pc, lr, then the return addresses of the frames the siglongjmp skipped
 } thr_t;
 static thr_t *g_all;
 extern __thread _Atomic int dm_host_work;   // declared in hle.h too; defined in hle_nvn.c
@@ -305,6 +306,7 @@ static _Atomic int g_main_ready;   // the main guest thread has its exit point: 
 void dm_thread_set_exit_point(sigjmp_buf *jb) { thr_t *t = pthread_getspecific(g_keythr); if (t) { t->term_jb = jb; atomic_store(&g_main_ready, 1); } }
 int dm_thread_main_ready(void) { return atomic_load(&g_main_ready); }
 void dm_thread_main_left(void) { thr_t *t = pthread_getspecific(g_keythr); if (t) term_mark(t); }
+module_t *module_of(const void *p);
 // End every guest thread (called on a host thread that is not one): wake each from its wait, signal those in guest code, until all have left or timeout_ns passes.
 // Returns how many are still there (0 = all left); with any left, their state is logged and the caller must not take the run down
 int dm_threads_terminate(uint64_t timeout_ns) {
@@ -326,8 +328,25 @@ int dm_threads_terminate(uint64_t timeout_ns) {
         pthread_mutex_unlock(&G);
         if (now - last_sig >= 5000000) { last_sig = now; for (int i = 0; i < ns; i++) pthread_kill(sig[i], SIGUSR2); }   // a stale id of a thread that just left is refused (ESRCH)
         // Threads that keep to host code (HLE functions) are seldom caught in guest code by the signal: after 20 ms guest code loses execute permission, and they leave at their return
-        if (!fenced && now - t0 > 20000000) { void dm_modules_fence(void); fenced = 1; dm_modules_fence(); LOG("end of the run: %d guest thread(s) left after 20 ms; guest code fenced", live); }
+        if (!fenced && now - t0 > 20000000) {
+            void dm_modules_fence(void); fenced = 1; dm_modules_fence(); LOG("end of the run: %d guest thread(s) left after 20 ms; guest code fenced", live);
+            pthread_mutex_lock(&G);
+            for (thr_t *t = g_all; t; t = t->all) if (!t->exited && t->pt) { char nb[48]; LOG("end of the run:   thread %#x '%s'%s last svc %#x, in an SVC %d", t->handle, thr_name(t, nb, sizeof nb), t->host_owned ? " (host-created)" : "", t->last_svc, atomic_load(&t->svc_state) & 1); }
+            pthread_mutex_unlock(&G);
+        }
     }
+    pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t; t = t->all) if (t->exited && t->term_nf) {   // threads that left from the fence: where they were (host frames in the list were skipped)
+        char nb[48], w[640]; size_t o = 0;
+        for (int i = 0; i < t->term_nf && o < sizeof w; i++) {
+            module_t *m = module_of((void *)t->term_f[i]); Dl_info di; const char *tag = i == 0 ? "pc=" : i == 1 ? ", lr=" : i == 2 ? ", frames " : " ";
+            if (m) o += (size_t)snprintf(w + o, sizeof w - o, "%s%s+%#llx", tag, m->name, (unsigned long long)(t->term_f[i] - (uint64_t)m->base));
+            else if (dladdr((void *)t->term_f[i], &di) && di.dli_sname) o += (size_t)snprintf(w + o, sizeof w - o, "%s%s+%#lx", tag, di.dli_sname, (unsigned long)(t->term_f[i] - (uint64_t)di.dli_saddr));
+            else o += (size_t)snprintf(w + o, sizeof w - o, "%s%#llx", tag, (unsigned long long)t->term_f[i]);
+        }
+        LOG("end of the run: thread %#x '%s' left from fenced guest code at %s", t->handle, thr_name(t, nb, sizeof nb), w); t->term_nf = 0;
+    }
+    pthread_mutex_unlock(&G);
     if (live) {
         LOG("[RED] end of the run: %d guest thread(s) still running after %.1f s", live, (now_ns() - t0) / 1e9);
         pthread_mutex_lock(&G);
@@ -350,7 +369,14 @@ void dm_threads_release(void) {
 //   · inside an SVC (the gate frame holds every register): stopped at once, context = the gate frame; if still paused when the SVC returns, the thread waits at the exit for the resume;
 //   · running guest code: send SIGUSR2; the handler saves the ucontext and waits there for the resume (guest code holds no host locks, so the handler may take G);
 //   · inside host code (HLE functions etc.): the handler does not stop it; the requester resends every 100 µs until the thread is back in guest code or enters an SVC.
-module_t *module_of(const void *p);
+// A thread about to leave from fenced guest code: its pc, lr and the frame pointer chain, which tells whether host code below it called into guest code (the frames its siglongjmp skips)
+static void term_record(thr_t *t, const struct __darwin_arm_thread_state64 *ss) {
+    t->term_f[0] = __darwin_arm_thread_state64_get_pc(*ss); t->term_f[1] = __darwin_arm_thread_state64_get_lr(*ss); t->term_nf = 2;
+    for (uint64_t fp = __darwin_arm_thread_state64_get_fp(*ss); t->term_nf < 16 && fp && !(fp & 7); ) {   // read without faulting (vm_read_overwrite), as dm_backtrace does
+        uint64_t fr[2]; vm_size_t got = 0; if (vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &got) || got != 16) break;
+        t->term_f[t->term_nf++] = fr[1]; if (fr[0] <= fp) break; fp = fr[0];
+    }
+}
 static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si;
     thr_t *t = pthread_getspecific(g_keythr);
@@ -397,8 +423,9 @@ void thr_svc_leave(void) {
 static int term_fault(void *addr, int is_write, void *uc_) {
     (void)addr; (void)is_write;
     thr_t *t = pthread_getspecific(g_keythr); if (!atomic_load(&g_term) || !t || !t->term_jb) return 0;
-    ucontext_t *uc = uc_; if (module_of((void *)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss))) term_self(t);
-    return 0;
+    ucontext_t *uc = uc_; const struct __darwin_arm_thread_state64 *ss = &uc->uc_mcontext->__ss;
+    if (!module_of((void *)__darwin_arm_thread_state64_get_pc(*ss))) return 0;
+    term_record(t, ss); term_self(t);
 }
 void dm_fault_hook_register(int (*fn)(void *addr, int is_write, void *uc));
 static void pause_install(void) {
