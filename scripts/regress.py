@@ -57,7 +57,8 @@ ROOT = Path(os.environ.get('REGRESS_ROOT', '/Volumes/NX/harness'))
 GAMES = Path(os.environ.get('REGRESS_GAMES', '/Volumes/NX/games'))
 HOST_DIRS = ('dm/host', 'dm/gfx', 'dm/gfx/nvn', 'dm/gfx/nvn/include', 'dm/gfx/tex', 'dm/gfx/vk', 'dm/gfx/gl')   # as build_ipa_from_nsp.py: the host's sources and headers
 REWRITER = ('dm/tools/patch_nso.py', 'dm/tools/nso_code.py', 'dm/tools/nso_asm.py', 'dm/tools/nso_match.py', 'dm/tools/sdk_patches.py')
-HEAVY = r'clang|make|xcodebuild|ld64|swift-frontend|dmsh_build|shader_split|dotnet|metal-tt'   # jobs that skew a measurement (the shared measuring rule)
+HEAVY_EXE = {'clang', 'make', 'xcodebuild', 'ld', 'ld64', 'swift-frontend', 'dotnet', 'metal', 'metal-tt', 'air-tt', 'applegpu-nt', 'dmsh_xlate', 'spirv-cross'}   # jobs that skew a measurement
+HEAVY_PY = r'(dmsh_build|shader_split|own_compilers|patch_nso|vk_shaders)\.py'   # (the shared measuring rule)
 # Tolerances, from runs of one revision against itself (docs/development.md, The regression harness)
 TOL = {'fps_pct': 10.0, 'p99_pct': 30.0, 'p99_ms': 4.0, 'footprint_pct': 15.0, 'footprint_mb': 300.0, 'prepare_s': 10.0, 'prepare_x': 1.5, 'prebuild_x': 1.5, 'prebuild_s': 30.0,
        'dhash_bits': 12, 'rgb_diff': 12.0}
@@ -481,9 +482,14 @@ def own_tree():
     return kids
 
 
-def heavy_jobs():
-    r = sh(['pgrep', '-fl', HEAVY]); mine = own_tree()
-    return [ln for ln in r.stdout.splitlines() if ln.split()[0].isdigit() and int(ln.split()[0]) not in mine and 'pgrep' not in ln]
+def heavy_jobs():   # other builds now running: not this process's, not stopped, not another regress.py's (whose builds pause while the measuring lock is held)
+    r = sh(['ps', '-axo', 'pid=,stat=,command=']); mine = own_tree(); out = []
+    for ln in r.stdout.splitlines():
+        pid, stat, cmd = (ln.split(None, 2) + ['', ''])[:3]
+        exe = os.path.basename(cmd.split(' ')[0]) if cmd else ''
+        if not pid.isdigit() or int(pid) in mine or stat.startswith('T') or not (exe in HEAVY_EXE or re.search(HEAVY_PY, cmd)) or 'regress.py' in cmd or str(ROOT) + '/' in cmd: continue
+        out.append(f'{pid} {cmd}')
+    return out
 
 
 def wait_idle(limit):   # the shared rule: measure only while no build or other heavy job runs
@@ -722,7 +728,7 @@ def run_watched(cmd, env, cwd, log, a, limit, hang, kind, what, shots=(), frames
             stopped = True
         else: stopped = False
         if caf is not None and caf.poll() is None: caf.terminate()
-        if a.lock: a.lock.unlink(missing_ok=True)
+        if a.lock and bench.lock_holder(a.lock) == os.getpid(): a.lock.unlink(missing_ok=True)   # only a lock this process holds
     rc = None if stopped else p.returncode
     ft = st['frame_t']
     def frame_at(t):
@@ -912,6 +918,9 @@ def cmd_check(a, smoke=True):
             if route:
                 t1 = time.time(); mode = 'quick' if a.quick else 'full'
                 bf = baseline_dir(base, g) / f'smoke-{mode}.json'
+                same = lambda r: all(r.get(k) == route[k] for k in ('save', 'keys', 'secs' if mode == 'full' else 'quick'))
+                if bf.is_file() and not same(json.loads(bf.read_text())['route']):
+                    say(f'  {g.id}: the stored {mode} baseline of {base.id} ran another route (save, keys or length): recording it again'); bf.unlink()
                 if not bf.is_file():
                     say(f'  {g.id}: no stored {mode} baseline for {base.id}: recording it')
                     runs = smoke_series(g, base, bart, route, a.quick, 'baseline', a, a.runs)
