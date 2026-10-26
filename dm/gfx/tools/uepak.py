@@ -35,7 +35,8 @@
 #        uepak.py job <RomFS> <main NSO> <work dir> [<Mac host> <rewritten modules>]   the shader code archives of every pak, and an Oodle job of their Oodle-compressed shaders (LZ4 ones
 #                                                                       decoded at once); IoStore shader libraries (UE 5.6) decoded at once through the game's Oodle in the host (OodleHost)
 #        uepak.py finish <work dir> <out dir>                           after the host has run the job: the archives with every shader decoded
-import ctypes, json, os, struct, sys
+import ctypes, json, mmap, os, re, struct, sys
+from typing import NamedTuple
 
 PAK_MAGIC, ARCHIVE_VERSION = 0x5A6F12E1, 2
 JOB_MAGIC, OUT_MAGIC = 0x4a4f4d44, 0x524f4d44   # "DMOJ", "DMOR" (hle_oodle.c)
@@ -535,6 +536,18 @@ def io_records(data):
         pos = i + 4
     return out
 
+class IoRecord(NamedTuple):
+    """A shader record of a UE5 IoStore .ucas: its stage, name and hash, where its code area and control section lie, its size field and whether its code is compressed"""
+    stage: str
+    name: str
+    hash: str
+    code_at: int
+    code_len: int
+    ctl_at: int
+    ctl_len: int
+    size: int
+    compressed: bool
+
 def io_record(data, off, limit):
     """A shader record: the stage, the name, the shader's hash, the code area's offset and length, the record's
     size field and whether the record's code is compressed.  The record is: 'LSLG', the stage tag, two flag bytes,
@@ -571,8 +584,8 @@ def io_record(data, off, limit):
     # the code area ends where the control section begins (the magic 0x98761234), as in the shader code archives
     ct = s.find(CTL_MAGIC_B, k)
     if ct < 0: return None
-    return dict(stage=IO_STAGE[tag], name=name, hash=s[b-20:b].hex() if b >= 20 else '',
-                code_at=off + k, code_len=ct - k, ctl_at=off + ct, ctl_len=0x880, size=size, compressed=compressed)
+    return IoRecord(stage=IO_STAGE[tag], name=name, hash=s[b-20:b].hex() if b >= 20 else '',
+                    code_at=off + k, code_len=ct - k, ctl_at=off + ct, ctl_len=0x880, size=size, compressed=compressed)
 
 def io_extract(ucas, out):
     """The shader records of a UE5 IoStore .ucas into <out>: every shader as a file named
@@ -593,12 +606,12 @@ def io_extract(ucas, out):
             if data[off + 8] & 0x40:   # a shader whose code is compressed
                 listing.append(dict(stage=stage, name='', file='', plain=False, code=0, compressed=True))
             continue
-        base = f'{k:05d}_{r["stage"]}_' + re.sub(r'[^A-Za-z0-9_.-]', '_', os.path.basename(r['name']))[:80]
+        base = f'{k:05d}_{r.stage}_' + re.sub(r'[^A-Za-z0-9_.-]', '_', os.path.basename(r.name))[:80]
         with open(os.path.join(out, base + '.lsg'), 'wb') as f:
-            f.write(data[r['code_at']:r['code_at'] + r['code_len']])
-            f.write(data[r['ctl_at']:r['ctl_at'] + r['ctl_len']])
-        listing.append(dict(stage=r['stage'], name=r['name'], file=base + '.lsg', plain=True,
-                            code=r['code_len'], hash=r['hash'], size=r['size']))
+            f.write(data[r.code_at:r.code_at + r.code_len])
+            f.write(data[r.ctl_at:r.ctl_at + r.ctl_len])
+        listing.append(dict(stage=r.stage, name=r.name, file=base + '.lsg', plain=True,
+                            code=r.code_len, hash=r.hash, size=r.size))
     json.dump(listing, open(os.path.join(out, 'shaders.json'), 'w'), indent=1)
     return listing
 
