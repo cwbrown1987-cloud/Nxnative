@@ -96,6 +96,12 @@ HLE_FORCE("_ZN2nn2oe13MuteRecordingEv", "mute the sound of system video recordin
 HLE_FORCE("_ZN2nn2oe15UnmuteRecordingEv", "unmute the sound of system video recording; the host has no system recording", void, h_oe_UnmuteRec, void) {}
 HLE_FORCE("_ZN2nn2oe16EnableScreenShotEv", "screenshot switch; the host has no system screenshot", void, h_oe_EnableShot, void) {}
 HLE_FORCE("_ZN2nn2oe17DisableScreenShotEv", "screenshot switch; the host has no system screenshot", void, h_oe_DisableShot, void) {}
+// oe::Initialize is taken over, so the native wrappers cannot use am::GetSelfController(). SDK 13's enable/disable call
+// ISelfController::SetAlbumImageTakenNotificationEnabled(bool) (command 100). There is no system album capture service
+// on the host, hence no album-image-taken events to deliver; changing this subscription produces no queue message.
+// Found on Sparks of Hope 1.6.2225577: sdk+0x36ec60 dereferenced the absent self-controller before nnMain startup completed.
+HLE_FORCE("_ZN2nn2oe33EnableAlbumImageTakenNotificationEv", "subscribe to album capture notifications; the host has no system album capture events", void, h_oe_EnableAlbumNotify, void) {}
+
 // Super Mario Odyssey: HOME button blocking around its own menus, screenshot orientation, and the auto-sleep query (all through am)
 HLE_FORCE("_ZN2nn2oe23BeginBlockingHomeButtonEv", "temporarily block the HOME button (through am); the host has no HOME button", void, h_oe_BlockHome, void) {}
 HLE_FORCE("_ZN2nn2oe21EndBlockingHomeButtonEv", "restore the HOME button (through am)", void, h_oe_UnblockHome, void) {}

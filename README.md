@@ -26,6 +26,8 @@ Needs iOS / iPadOS 26 or later on an iPhone 15 Pro or newer (A17 Pro chip or lat
 
 Under each game: the IPA's size, and "60 fps with 1.2.0" where the game runs at 60 fps (30 on the Switch) with that update.
 
+Mac-only testing is identified when no IPA has been built.
+
 <table>
 <tr>
 <td align="center" valign="top" width="33%"><img src="docs/images/mario-kart-8-deluxe.jpg" width="256" alt="Mario Kart 8 Deluxe"><br>Mario Kart 8 Deluxe<br><sub>~11.9 GB · no Mii heads</sub></td>
@@ -150,6 +152,7 @@ Under each game: the IPA's size, and "60 fps with 1.2.0" where the game runs at 
 <tr>
 <td align="center" valign="top" width="33%"><img src="docs/images/zelda-echoes-of-wisdom.jpg" width="256" alt="The Legend of Zelda: Echoes of Wisdom"><br>The Legend of Zelda: Echoes of Wisdom<br><sub>~7.8 GB</sub></td>
 <td align="center" valign="top" width="33%"><img src="docs/images/donkey-kong-country-returns-hd.png" width="256" alt="Donkey Kong Country Returns HD"><br>Donkey Kong Country Returns HD<br><sub>~11.6 GB</sub></td>
+<td align="center" valign="top" width="33%"><img src="docs/images/mario-rabbids-sparks-of-hope.png" width="256" alt="Mario + Rabbids Sparks of Hope"><br>Mario + Rabbids Sparks of Hope<br><sub>Mac tested · IPA not built</sub></td>
 </tr>
 </table>
 

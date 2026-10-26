@@ -20,6 +20,7 @@
 #   · G2S (Koei Tecmo's KTGL, Hyrule Warriors: Age of Calamity): GLSLC compiler outputs inside the IDRK entries of the RDB data files (zlib in chunks), see idrk_shaders;
 #       ROMANCE OF THE THREE KINGDOMS 8 REMAKE's newer RDB keeps them in .fdata files (a PDRK header, then IDRK entries of zlib or LZ4 chunks)
 #   · SPKG (the older KTGL of Fire Emblem: Three Houses): shader packages of G2S containers, loose and inside the LINKDATA archive DATA0.bin / DATA1.bin, see kt_shaders and linkdata_jobs
+#   · Snowdrop WEST/BERG v22: indexed NVN mcache resources (snowdrop.py), including separate DLC roots
 #   · SDF (Capcom's RE Engine, Monster Hunter Rise): shader definitions inside the PAK archives (KPKA, entries zstd / deflate compressed), only the newest copy of each path, see kpka_jobs and sdf_shaders
 #   · Trinity packs (Game Freak, Pokémon Legends: Z-A): BNSH inside the files of arc/data.trpfs (Oodle Mermaid, decoded by the game's own decoder in the Mac host), see trpfs_jobs and trinity_shaders
 #   · SPK (Capcom's MT Framework, The Great Ace Attorney Chronicles): the shader package inside an ARC archive (zlib entries), code area + control section per shader, see mtarc_members and mtspk_shaders
@@ -1753,7 +1754,7 @@ def ps_inputs(code):
     """Generic attributes a pixel shader reads: SPH words 6–13 are the input map, 8 bits for each of the 32 attributes (Ryujinx ShaderHeader.ImapTypes), non-zero = read; the translated MSL inputs are exactly user(locn<attribute>)"""
     return {i for i in range(32) if struct.unpack_from('<I', code, 0x30 + 4 * (6 + (i >> 2)))[0] >> ((i & 3) * 8) & 0xff}
 
-SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
+SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#MCACHE@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
 # MonoGame's effects, whose passes may name no vertex shader and keep the one bound (Celeste: 10 of its 13 effects draw through SpriteBatch's vertex shader, which is in main); Next Level Games'
 # archives (Luigi's Mansion 3 makes 5,317 programs of one stage each at boot); PlatinumGames' shader objects (Bayonetta 3: one stage each, pg_shader); control sections loose in main
 # (Advance Wars 1+2: Re-Boot Camp's Bink shaders, raw_shaders), which no file pairs; and YEBIS's effect file (tfxo_shaders)
@@ -1762,7 +1763,7 @@ def separable_pairs(keys):
     from the pipeline state) have their real pairs only at draw time. vs_pad uses only the union of the locations the paired pixel shaders read, so every single-stage vertex shader is paired with
     a "cover": the fewest pixel shaders whose read locations together equal those of all pixel shaders (greedy, ties go to the smaller key); padded that way, a vertex shader links with any pixel shader.
     All pairs would be 376 × 375 rows; the cover needs a few rows × 376. No single-stage vertex shader, no cover"""
-    single = [v for v in keys if keys[v][1] == 'vs' and any(s in keys[v][0] for s in SINGLE_STAGE) and '#var' not in keys[v][0]]   # '#var': a GLSLC output of several stages (glslc_program)
+    single = [v for v in keys if keys[v][1] == 'vs' and any(s in keys[v][0] for s in SINGLE_STAGE) and ('#var' not in keys[v][0] or '#MCACHE@' in keys[v][0])]   # multi-stage GLSLC outputs retain exact partners; Snowdrop stages can be reused by stage mask
     if not single: return set(), []
     ins = {k: ps_inputs(v[3]) for k, v in keys.items() if v[1] == 'ps'}
     left, cover = set().union(*ins.values()) if ins else set(), []
@@ -1808,6 +1809,43 @@ def var_pairs(found):
         if g: var[g][st] = skey(ctl, code)
     return {(v['vs'], v['ps']) + (('prog',) if '#BAHS#prog' in g else ()) for g, v in var.items() if 'vs' in v and 'ps' in v}
 
+def snowdrop_jobs(files):
+    """WEST directories supply exact BERG resources; never scan packed bytes."""
+    import snowdrop
+    jobs, taken = [], set()
+    for path, rel in files:
+        if not path.endswith('.sdftoc'): continue
+        with open(path, 'rb') as f: magic = f.read(4)
+        if magic != snowdrop.WEST: red(f'{rel}: invalid WEST directory signature')
+        try:
+            archive = snowdrop.Archive(path)
+            entries = [e for e in archive.entries if '/nvn/' in e.name and e.name.endswith('.mcache')]
+            for i in range(0, len(entries), 256): jobs.append((path, rel, (snowdrop.WEST, entries[i:i + 256])))
+            taken.add(path); taken.update(map(str, archive.files.values()))
+        except (OSError, ValueError) as e: red(f'{rel}: {e}')
+    return jobs, taken
+
+def snowdrop_shaders(path, rel, entries, out):
+    import snowdrop
+    archive = snowdrop.Archive(path, entries)
+    for entry in entries:
+        label = f'/{rel}/{entry.name}'
+        try: records = snowdrop.cache_shaders(archive.read(entry))
+        except (OSError, ValueError) as e: red(f'{label}: {e}')
+        stages = []
+        for ctl, code in records:
+            st = 'cs' if code[:4] == CS_MAGIC else sph_stage(code)
+            why = check(label, st, ctl, code) if st else 'unrecognized NVN shader stage'
+            if why: red(f'{label}: {why}')
+            stages.append(st)
+        # The serialized program can carry a vertex and pixel stage together.
+        # Stage masks can reuse either stage with another cache program at draw
+        # time, so both single- and dual-stage caches also need varying coverage.
+        paired = len(records) == 2 and set(stages) == {'vs', 'ps'}
+        for i, ((ctl, code), st) in enumerate(zip(records, stages)):
+            where = label + ('#MCACHE@program#var' if paired else f'#MCACHE@{i}')
+            out.append((where, st, ctl, code))
+
 def scan_file(args):
     """→ (relative path, {key: …}, pairs, extra); extra = this file's Unity type trees, or 'defer' (no type tree, scanned again in the second pass)"""
     path, rel = args[:2]
@@ -1820,6 +1858,9 @@ def scan_file(args):
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:8] in (IDRK, PDRK):
         idrk_shaders(path, '/' + rel, found)
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if len(args) > 2 and head[:4] == b'WEST' and args[2][0] == b'WEST':
+        snowdrop_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and head[:8] == ONEPACK:   # a range of Trinity packs (trpfs_jobs)
         trinity_shaders(path, rel, args[2], found)
@@ -1938,6 +1979,11 @@ def main():
         if not names and uepak.unreal_paks(romfs, inline=False): red(f'the RomFS has Unreal paks, but there are no decoded shader code archives in {ued} (the NSP script writes them)')
         for nm in names: found += ue_shaders(open(os.path.join(ued, nm), 'rb').read(), f'/ue_shaders/{nm}')
         results.append(('main', {skey(c, k): (w, s, c, k) for w, s, c, k in found}, var_pairs(found), {}))
+    # Optional asset roots (e.g. extracted DLC) have no additional executable.
+    for i, root in enumerate(filter(None, os.environ.get('DM_SHADER_EXTRA_ROOTS', '').split(os.pathsep))):
+        if not os.path.isdir(root): red(f'additional shader asset root does not exist: {root}')
+        files += sorted((os.path.join(dp, f), f'extra{i}/' + os.path.relpath(os.path.join(dp, f), root))
+                        for dp, _, fs in os.walk(root) for f in fs)
     zdicts = {k: v for r in romfs_v for k, v in zs_dicts(r).items()}   # Tears of the Kingdom's zstd dictionaries (zs_dicts)
     keys = {}
     # First pass: every file; Unity bundles carry type trees, and the Shader trees are collected on the way. Second pass: Unity serialized files without type trees are scanned again with the borrowed trees
@@ -1951,8 +1997,9 @@ def main():
     pz_jobs, pkzs = pkz_jobs(files)   # Bayonetta 3's PKZ archives, Oodle Kraken decoded by the game's own decoder in the Mac host
     ck_jobs, cpks = cpk_jobs(files)   # Bayonetta 2's CRI CPK archives (CRILAYLA entries)
     zp_jobs, zips = zip_jobs(files)   # Portal's game.zip (Deflate members)
-    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs + zp_jobs
-    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks and p not in zips]
+    sd_jobs, sdfs = snowdrop_jobs(files)
+    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs + zp_jobs + sd_jobs
+    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks and p not in zips and p not in sdfs]
     with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, {}, zdicts)) as ex:
         results += list(ex.map(scan_file, big)) + list(ex.map(scan_file, files, chunksize=16))
     trees, defer = {}, []

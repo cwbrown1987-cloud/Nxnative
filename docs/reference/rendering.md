@@ -12,6 +12,20 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Note:** the first red lines name the call site and the object's first bytes. In Engage those bytes were 32-bit triangle indices, i.e. another write had already overrun into the texture object; that stopped once the alias region had address space left ([Size-aligned regions exhaust the alias address space](memory.md#size-aligned-regions-exhaust-the-alias-address-space)).
 - **Found on:** [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md).
 
+### Compute image stores rejected by initial read-only texture usage
+
+- **Symptom:** writable compute images bind `dummy` and their intended outputs stay unchanged.
+- **Cause:** the game binds COMPRESSIBLE textures without IMAGE as compute store destinations. Their Metal textures initially lack ShaderWrite, so `img_binding` substitutes a dummy.
+- **Fix:** `img_prepare` scans reflected writable compute images before opening the dispatch encoder and adds ShaderWrite through the existing `tex_upgrade`, preserving all levels, slices and storage aliases. Buffer views retain their pool backing. Compressed and depth formats remain subject to the existing checks. `t_pfv` verifies a real binding and preservation of prior pixels; `t_upgrade_alias` checks aliases and GPU readback.
+- **Found on:** [Mario + Rabbids Sparks of Hope](../../dm/games/0100317013770000/README.md#rendering).
+
+### Buffer image stores lose their pool backing when replaced by a dummy
+
+- **Symptom:** a histogram-clear compute shader binds a dummy image while a later image-atomic shader updates the real buffer; exposure depends on stale histogram data.
+- **Cause:** a buffer texture created without the IMAGE flag has a read-only Metal view. `img_binding` rejected an image store to that view, although the same pool is writable through the atomic pointer. Clearing the dummy cannot reset that pool.
+- **Fix:** on the first reflected image store to a buffer texture, add ShaderWrite through `tex_upgrade` over the same buffer and offset. No copy or encoder break is needed. Keep the format, backing, capacity and non-buffer write checks. `t_pfv` checks backing, retained data and GPU writes to the original pool.
+- **Found on:** [Mario + Rabbids Sparks of Hope](../../dm/games/0100317013770000/README.md#rendering).
+
 ### New textures start as zero
 
 - **Symptom:** a decoded movie stays black even though its YUV textures contain the picture; disabling its depth test makes it visible.
@@ -19,6 +33,20 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** non-packaged colour textures are zero-filled from a shared zero buffer when created (`tex_zero_fill`, batched with the uploads). Depth and stencil textures, including multisample textures, are cleared to zero in render passes in the same upload batch, for every level and slice. Upload-failure recovery tracks these destinations too.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md); [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md): the opening movie's YUV conversion uses GEQUAL against a new 1920×1080 depth texture that the game never clears. Metal supplied depth 1, discarding the movie; zero initialization restores it without a shader override.
 - **Check:** `t_clear_ds` poisons depth and stencil before calling the real initializer and checks both become zero; depth clear, stencil-view and upload-budget tests cover the related paths.
+
+### Image bindings follow reflected access and texture shape
+
+- **Symptom:** a load-only image is rejected for lacking shader-write usage; image atomics then abort with `real image is not a resolved R32 integer IMG`, or `unsupported or overflowing IMG extent` on a valid buffer texture.
+- **Cause:** `img_binding` required ShaderWrite even when reflection marks the IMG read-only. SPIRV-Cross's MSL 2.3 buffer atomics use a read-only `texture_buffer<uint>` plus a separate writable atomic pointer; pointer backing/capacity is checked independently. Reflection also omitted `texture_buffer` from its type mapping and mislabeled it 2D.
+- **Fix:** require ShaderWrite only for reflected write/read-write IMG bindings and map `texture_buffer` to Metal's texture-buffer type. Keep all atomic extent, format, backing and capacity checks. `t_pfv` covers read-only 2D/buffer images and rejects unsupported 2D writes without usage; `t_refl` covers a buffer image plus its atomic pointer.
+- **Found on:** [Mario + Rabbids Sparks of Hope](../../dm/games/0100317013770000/README.md#rendering).
+
+### A sampled texture later attached as a render target
+
+- **Symptom:** Metal render-pass validation reports a colour attachment with usage `0x01` lacking `MTLTextureUsageRenderTarget`.
+- **Cause:** packaged/CPU-uploaded textures are initially created for sampling only. That initial classification does not prevent later NVN render-target use; attachment resolution did not perform the usage upgrade already used for clears and copies.
+- **Fix:** at attachment resolution, after compressed/depth shadow handling and before opening the render encoder, upgrade a texture missing render-target usage. Reuse `tex_upgrade` to copy its levels/slices and replace its storage aliases; do not discard existing contents. `t_pfv` covers attachment usage and serial replacement; `t_upgrade_alias` checks shared/retired aliases.
+- **Found on:** [Mario + Rabbids Sparks of Hope](../../dm/games/0100317013770000/README.md#rendering).
 
 ### Texture swizzle through swizzled Metal views
 

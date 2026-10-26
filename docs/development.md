@@ -270,6 +270,8 @@ To add a game:
 
 ## Build by hand (Mac)
 
+For additional shader asset roots (`DM_SHADER_EXTRA_ROOTS`, including extracted Snowdrop DLC), see [archive build integration](reference/shaders.md#snowdrop-westberg-v22-and-nvn-mcache-resources).
+
 `scripts/build_ipa_from_nsp.py --platform mac` does steps 1 to 4 in the game's NSP folder and prints the command of step 5 ([A Mac-only build for development](#a-mac-only-build-for-development)). The steps by hand follow. You need the same tools as the script. The shader translator is the prebuilt `dm/gfx/tools/dmsh_xlate_bin`, the build that matches `dmsh_chain.lock`; a fresh `dotnet publish` gives different fingerprints. Its launcher `dmsh_xlate` is a universal binary (arm64 and x86_64), so an Intel Mac runs it too, with the same output; after a rebuild, join the new launcher with lipo to the one `dotnet build -r osx-x64` makes of the same .NET version (the lock does not cover the launcher). What an Intel Mac cannot run is the Mac host, which runs the game's own arm64 code: the NSP script stops at a step that boots the game there (a run-time shader capture, a decode with the game's own Oodle or LZ5) and skips a provisional profile's heap check. The commands use three variables:
 - `G`, the profile;
 - `W`, the game's work folder: `<title ID>-work` inside the game's NSP folder, outside this repository and off the home folder (it grows to the size of the game files);

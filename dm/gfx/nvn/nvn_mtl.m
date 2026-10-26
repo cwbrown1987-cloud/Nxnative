@@ -1795,7 +1795,7 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> base, MTLTextur
         if (!named) tex_put(t->serial, upgraded);
         defer_obj_release(base);
     }
-    MLOG("texture upgraded to allow %s ser=%llu base format %lu → view format %lu (upgrades=%llu)", add & MTLTextureUsageRenderTarget ? "render-target use" : "format views", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, ++g_pfv_upgrades);
+    MLOG("texture upgraded to allow %s ser=%llu base format %lu → view format %lu (upgrades=%llu)", add & MTLTextureUsageRenderTarget ? "render-target use" : add & MTLTextureUsageShaderWrite ? "shader writes" : "format views", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, ++g_pfv_upgrades);
     return upgraded;
 }
 static id<MTLTexture> tex_upgrade_pfv(const tex_t *t, id<MTLTexture> base, MTLPixelFormat view_pf) { return tex_upgrade(t, base, MTLTextureUsagePixelFormatView, view_pf); }
@@ -2974,6 +2974,11 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
     if (has_v && v->set_layers) { if (t->d.target == 2) a.depthPlane = v->min_layer; else a.slice = v->min_layer; }
     if (base && mtl_fmt_block(base.pixelFormat)) { if (!bcrt_attach(a, base, v, has_v)) { rt_view_fmt(base, v, has_v); a.texture = nil; } return; }   // compressed formats: a shadow or nothing (see rt_view_fmt)
     if (base && mtl_fmt_depth(base.pixelFormat) && bcrt_attach(a, base, v, has_v)) return;   // a depth texture through a colour view: a shadow (see shrt_block)
+    // Packaged/CPU-uploaded storage can later be a render target: NVN attachment use supersedes the initial read-only hint.
+    // As for ClearTexture, preserve every level/slice and update storage aliases before attaching (no render encoder is open).
+    if (base && !(base.usage & MTLTextureUsageRenderTarget)) {
+        base = tex_upgrade(t, base, MTLTextureUsageRenderTarget, base.pixelFormat); a.texture = base;
+    }
     // A view that changes the format is attached as a Metal view of that format (pipeline formats follow the attachment). SMBW's last pass writes the RGBA8 swapchain texture through an RGBA8_SRGB view, so the hardware encodes sRGB on write;
     // attaching the base texture instead stored the linear values as they were and the whole picture came out dark (every value decoded from sRGB once more, on the Mac and the iPhone). The view lives until this submission completes
     if (base && has_v && v->set_format) {
@@ -5872,8 +5877,18 @@ static id<MTLBuffer> atom_scratch(const tex_t *t, uint64_t image_bytes) {
 static id<MTLTexture> img_binding(int tid, const nvn_rbind *b, uint64_t *rid, int *real) {
     void *tv = NULL; *rid = tid ? tex_fast_rid(tid, &tv) : 0;
     id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
+    // Buffer images alias pool memory. Add write usage on the same backing when a
+    // store first uses one: IMAGE is not set on every buffer the game stores to.
+    // No copy or encoder break is needed, unlike an upgrade of a tiled texture.
+    if (t && b->rw && t.textureType == MTLTextureTypeTextureBuffer && !(t.usage & MTLTextureUsageShaderWrite)
+        && t.buffer && tid > 0 && tid < g_ntreg && g_treg[tid].ok) {
+        t = tex_upgrade(&g_treg[tid].t, t, MTLTextureUsageShaderWrite, t.pixelFormat);
+        *rid = t.gpuResourceID._impl;
+    }
     int swz_only = t && !(t.usage & MTLTextureUsageShaderWrite) && (t.parentTexture.usage & MTLTextureUsageShaderWrite);
-    if (t && !(t.usage & MTLTextureUsageShaderWrite) && !swz_only) { RED_ONCE(32, "texture bound to an image slot lacks the shader-write usage (texture ID %d)", tid); t = nil; }
+    // Load-only IMG views need ShaderRead, including texture_buffer reads beside an IMGA atomic pointer.
+    // The pointer write is validated independently against its backing in the IMGA path below.
+    if (t && b->rw && !(t.usage & MTLTextureUsageShaderWrite) && !swz_only) { RED_ONCE(32, "texture bound to an image slot lacks the shader-write usage (texture ID %d)", tid); t = nil; }
     if (t && (swz_only || (b->dpf != NVN_DPF_FLOAT && mtl_pf_dpf(t.pixelFormat) != b->dpf))) {
         uint64_t r2 = 0; id<MTLTexture> v = img_fit(tid, t, b->dpf, &r2);
         if (v) { t = v; *rid = r2; } else if (swz_only) t = nil;
@@ -8760,6 +8775,22 @@ static id<MTL4ComputeCommandEncoder> dispatch_enc(void) {
     args_dirty_all();
     return e;
 }
+// Resolve compute store capabilities before opening its encoder: a tiled image's
+// usage upgrade copies all levels/slices and must precede the dispatch itself.
+static void img_prepare(NvShader *sh, int stage) {
+    os_unfair_lock_lock(&g_rmu);
+    for (int i = 0; i < sh->rf.nb; i++) {
+        const nvn_rbind *b = &sh->rf.b[i];
+        if (b->kind != NVN_RB_IMG || !b->rw || b->reg >= 32) continue;
+        int tid = (int)(S.img[stage][b->reg] & 0xfffff);
+        if (tid <= 0 || tid >= g_ntreg || !g_treg[tid].ok) continue;
+        id<MTLTexture> t = tex_by_id(tid);
+        if (t.parentTexture) t = t.parentTexture;
+        if (t && !(t.usage & MTLTextureUsageShaderWrite) && !mtl_fmt_block(t.pixelFormat) && !mtl_fmt_depth(t.pixelFormat))
+            tex_upgrade(&g_treg[tid].t, t, MTLTextureUsageShaderWrite, t.pixelFormat);
+    }
+    os_unfair_lock_unlock(&g_rmu);
+}
 static void dispatch(const p_dispatch *dp) {
     zskip_clear();
     g_wr_epoch++; g_mdx_epoch++;
@@ -8801,6 +8832,7 @@ static void dispatch(const p_dispatch *dp) {
     if (!tg[0]) { RED_ONCE(29, "compute shader lacks threadgroup size reflection"); return; }
     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
     rp_end();
+    img_prepare(cs, 5);
     int own = dispatch_own();
     if (own && g_blit) { enc_b_end(g_blit); g_blit = nil; }
     id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc();
