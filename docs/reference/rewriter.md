@@ -70,6 +70,14 @@ To enroll a cut for any game's own module:
 - **Found on:** ASTRAL CHAIN 1.0.1 (SDK 6) `main+0x6db4a0`: three of that `main`'s five `br x18` sites need it.
 - **Check:** modules that rewrote before come out the same (Tears of the Kingdom, Age of Calamity, Cuphead, DARK SOULS: REMASTERED, Luigi's Mansion 3 and Metroid Dread `main`s: byte-identical).
 
+### Offset-table setup after its dispatch
+
+- **Symptom:** `jump table <addr>` assertion on a checked offset table whose base is initialized later in the function's instruction order (`cmp w18,#9; b.hi; ldrsw x18,[x17,x18,lsl #2]; add x18,x18,x17; br x18`).
+- **Cause:** the SDK's table-base `adrp` + `add` follows the dispatch block in address order, so neither the local writer-chain search nor its backward function-wide walk can find it.
+- **Fix:** as a last attempt, `jump_offsets` checks the function's `adrp` + `add` candidates and accepts only one table whose bounded entries all land on instructions in that function. Ambiguous candidates are rejected.
+- **Found on:** [Blasphemous](../../dm/games/0100698009C6E000/README.md), update 1.0.8, SDK 8.3.1 `sdk+0xae95f8`.
+- **Check:** `test_jump_table_base_order.py` covers the unique candidate and rejects an ambiguous one.
+
 ### Far table base passed through other registers
 
 - **Symptom:** `jump table <addr>` assertion on an offset table whose base was set far back and moved through other registers (`ldrb w18,[x14]; sub w18,w18,#1; cmp w18,#6; b.hi; ldrsw x18,[x7,x18,lsl #2]; add x18,x18,x7; br x18`).
@@ -121,7 +129,7 @@ To enroll a cut for any game's own module:
 - **Symptom:** `jump table 53e9c` while rewriting Warm Snow 2.1.4's Unity IL2CPP `main`.
 - **Cause:** a framed thunk loads a method pointer into `x18`, moves arguments, restores its frame and executes `br x18`. A separate null-error call follows it. The terminal-tail recognizer requires the jump to end the function.
 - **Fix:** keep the existing terminal-tail rule unchanged. Only for nonterminal jumps, recognize a contiguous decoded thunk with the standard 16-byte FP/LR frame, a single forward `cbz` to the trailing error call, plain argument moves/transfers, one pointer load into `x18`, and the matching frame restore. Reject additional control flow, stack-pointer/frame-register/link-register writes, pointer clobbers and undecoded gaps. Stores must use a fixed offset of at least 16 from the unchanged `sp` or frame pointer, so they write caller stack arguments above the saved FP/LR. Checking register writes alone does not protect that saved pair; stores through other bases or dynamic offsets may alias it and are rejected. An unframed loaded-pointer jump followed by other blocks remains unsupported: ending a basic block alone does not prove a tail call.
-- **Found on:** Warm Snow 2.1.4, `main` build `306fc054203275803dcbceba7fb7c392`, at `+0x53e9c`. Its game profile is deliberately outside this change.
+- **Found on:** Warm Snow 2.1.4, `main` build `306fc054203275803dcbceba7fb7c392`, at `+0x53e9c`; [Blasphemous 2](../../dm/games/010040801A4C8000/README.md) update 1.0.8, `main+0x1e86fc`.
 - **Check:** `dm/tools/tests/test_tail_call.py` covers acceptance and rejection with synthetic AArch64 instructions, including saved-frame stores, safe caller argument stores, unproven store addresses, 32-bit and 64-bit SP/FP/LR clobbers (including `wsp`), the unframed guarded block and the previously accepted terminal tail with an intervening conditional branch. Actual game rewrite/build results and remaining coverage are recorded in the PR; no game assets are required by the tests.
 
 ## Exclusive windows
