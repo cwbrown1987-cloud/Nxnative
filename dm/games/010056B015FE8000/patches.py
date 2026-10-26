@@ -11,5 +11,13 @@ CUTS = {
     (0x9bf484, 'ac4781520c40a872', 'ac4781520c30a872', 'dynamic resolution: optimal frame cost 32.01 -> 16.005 ms at 60 fps (first load)'),
     (0x9bf4d4, 'ac4781520c40a87283cc201e8001271e', 'ac4781520c30a87283cc201e8001271e', 'dynamic resolution: optimal frame cost 32.01 -> 16.005 ms at 60 fps (second load)'),
     (0x9bf4f8, '00d0271e', '00d0251e', 'dynamic resolution: good frame cost 30 -> 15 ms at 60 fps'),
+    (0x591198, '20008052', '00008052', 'NieR 1.0.3 frame interval default: 30 -> 60 fps'),
+    (0x9bad68, '41008052', '21008052', 'NieR 1.0.3 NVN present interval default: 30 -> 60 fps'),
+    (0x9bf528, 'ac9999528cd9a772', '0c0080520cf0a772', 'dynamic resolution lower bound follows the selected preset'),
+    (0x9bf534, 'cc648a52aceaa772', '0c0080520cf0a772', 'dynamic resolution lower bound follows the selected preset'),
   ],
 }
+
+# The control appears only for this exact rewritten build, where the native
+# scale/UV path and both configurable preset bounds are verified.
+CAPABILITIES = {'3c10ec35c5ef4c3686b4053afb0e58e7': ('DYNAMIC_RESOLUTION',)}
