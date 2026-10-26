@@ -4,6 +4,17 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 ## Containers by engine
 
+### Snowdrop WEST/BERG v22 and NVN mcache resources
+
+- **Symptom:** the split finds no shaders in `.sdftoc` / `.sdfdata` archives, although startup submits NVN programs.
+- **Cause:** WEST indexes resource parts in BERG archives; NVN mcache payloads have another compression wrapper.
+- **Reader:** `snowdrop.py` supports the verified Switch v22/zstd dialect. It follows declared directory, archive, part and page boundaries; validates identities, extents and exact decoded lengths; and rejects unsupported versions. `Archive.read` returns indexed payloads; DDS templates remain metadata. The splitter validates each serialized control/code record through its existing shader checks, without scanning arbitrary BERG bytes for compression magic.
+- **Pairs:** stored vertex/pixel programs supply exact pairs. All cache vertices also use `separable_pairs` coverage because NVN stage masks can reuse them with other pixel programs. Coverage rows are default-varying requirements, not observed draw pairs.
+- **Build integration:** the splitter excludes consumed archives from raw scanning and unions shader content across RomFS versions. `DM_SHADER_EXTRA_ROOTS` adds asset directories separated by the platform path separator (`:` on macOS), without another executable. The NSP script includes extracted Snowdrop DLC and fingerprints those roots. Registered profiles cover base/update files; additional roots generate local `shader_profile/<id>` tables while retaining registered builds, constants and handwritten rules.
+- **Check:** `test_snowdrop.py` uses synthetic archives for tree branches, raw/multipart resources, mixed compression pages, invalid metadata and shader wrappers. `test_nsp_shader_assets.py` checks local-profile isolation. Neither requires game fixtures.
+- **Found on:** [Mario + Rabbids Sparks of Hope](../../dm/games/0100317013770000/README.md#files-and-shaders).
+- **Format comparison:** [rouge_sdf](https://github.com/GoldFarmer/rouge_sdf/blob/master/main.cpp) helped identify the tree structure; its older zlib dialect differs from this Switch format.
+
 ### BNSH in NintendoWare archives and in main
 
 - BNSH (`BNSH\0\0\0\0` + `grsc` block at +0x60) is found inside `bfsha`, particle effects (`esetb`, VFXB), UI layouts (`blarc`), and `main` itself.
@@ -777,6 +788,14 @@ shader on a GPU.
 - **Fix:** `pso_key_norm` in `nvn_pso_skey.h` clears blend factors when blending is disabled and, for normal passes, the blend-enable bit and write-mask nibble of every target without a format. Merged passes retain their logical blend-enable and mask state because `lmap` maps physical attachments to logical targets; a missing physical format does not imply the same logical target is unused. `pso_key_fill` normalizes live keys, `pso_skey_parse` normalizes historical prewarm rows, and `warm_worker` deduplicates the parsed keys across all input lists before compiling. Depth and stencil formats remain in the key because the `MTLDevice` path needs them, even though Metal 4 bases omit them.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md#files-and-shaders) (disabled blend factors), [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md#files-and-shaders) (absent-target state, reported by MacNativeGames).
 - **Check:** `t_pso_skey` covers normalized round trips, historical rows differing only in unused state, and preservation of merged-pass logical masks and blend bits; `t_pso_archive` checks disabled blend factors with all targets present. `make -C dm/gfx/tests GAME=<id> check_t_pso_warm` loads two synthetic manifests through `warm_worker`, checks compilation counts and draw-time cache hits, and compares GPU pixels with the original descriptors through both MTLDevice and Metal 4. It includes a merged pass whose physical attachment 0 uses logical target 7's blend and mask state.
+
+### Partial vertex builds include their pixel dependencies
+
+- **Symptom:** a successful partial vertex build lacks required default varyings; a later full build restores it from cache and fails pipeline linking.
+- **Cause:** `vs_pad` silently skipped pixel partners whose MSL was absent, then cached the incomplete vertex under a key already covering those partners.
+- **Fix:** `build_keys` includes pixel dependencies before partial-build cleanup and translation. Missing map entries or partner MSL fail the build instead of publishing an incomplete vertex. Regenerate the chain header to invalidate earlier artifacts.
+- **Check:** `test_dmsh_partial.py` covers dependency expansion, missing partners, cycles and fail-closed padding.
+- **Found on:** [Mario + Rabbids Sparks of Hope](../../dm/games/0100317013770000/README.md#files-and-shaders).
 
 ### Shader cache key covering the pairs
 

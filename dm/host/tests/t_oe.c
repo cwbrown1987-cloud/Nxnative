@@ -61,6 +61,12 @@ int main(void) {
     unsetenv("DM_OE_SCRIPT"); reset();
     CHECK(empty(), "empty queue at start: returns false and leaves the output alone");
     dm_focus_set(1); dm_set_opmode(1); CHECK(empty(), "same state sends no notification");
+    // Subscription changes are not album capture events: do not invent a notification or disturb existing messages.
+    h_oe_EnableAlbumNotify(); h_oe_EnableAlbumNotify(); h_oe_AlbumNotifyOff(); h_oe_AlbumNotifyOff();
+    CHECK(empty(), "album notification subscription changes leave an empty queue empty");
+    dm_focus_set(2); h_oe_EnableAlbumNotify(); h_oe_AlbumNotifyOff();
+    CHECK(pop_is(15) && empty(), "album notification subscription changes preserve an existing focus notification");
+    reset();
     dm_focus_set(3); CHECK(h_oe_GetFocus() == 3, "background state 3 can be queried before popping");
     CHECK(pop_is(15) && empty(), "background change notification 15 exactly once");
     dm_focus_set(2); dm_focus_set(1);

@@ -748,6 +748,19 @@ def derive_profile(g, pdir, ver, d, mods, app=None):
     return disp
 
 
+def shader_asset_profile(g, pdir):
+    """Additional asset roots change shader coverage, not registered executable builds.
+    Keep the constants, build rows, patch rules and handwritten tables in a local
+    profile; regenerate shader metadata without changing the repository profile.
+    """
+    if pdir.resolve() == g.dir.resolve(): raise BuildError('additional shader assets need a separate profile directory')
+    rmtree(pdir); pdir.mkdir(parents=True)
+    generated = {'shader_map.tsv', 'shader_map.tsv.conflicts.tsv', 'shader_facts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv', 'c1_full.tsv', 'cb_extent.tsv'}
+    for p in g.dir.iterdir():
+        if p.is_file() and p.name not in generated: shutil.copyfile(p, pdir / p.name)
+    return type(g)(pdir)
+
+
 # ---- Stage reuse: a stage whose inputs are all as at its last successful run keeps its output ----
 def files_under(d):   # (relative path, stat) of every file under d, sorted; [] when it does not exist
     out, todo = [], [str(d)]
@@ -1339,11 +1352,12 @@ def data_rows(b):   # a table's data rows (without # comment lines: the header c
     return [l for l in b.splitlines() if not l.startswith(b'#')]
 
 
-def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, oodle=None):
+def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, oodle=None, extra_roots=()):
     """The shader split into pkg, checked against the profile's tables. The package is reused when the tools, the profile and each version's main, RomFS (paths and sizes) and run-time capture
     are as at the last successful split. Returns the package's content key, the shader build's input (None for damaged files, which never reuse them): a split that runs
     again because a reader of another engine changed writes the same package, and the iOS shaders stay reused.
     oodle: for decoder-backed packs, builds or reuses the Mac host and returns DM_OODLE_HOST / DM_OODLE_MODULES; their current files are split inputs too"""
+    extra_roots = tuple(dict.fromkeys(Path(r) for r in (*extra_roots, *filter(None, env.get('DM_SHADER_EXTRA_ROOTS', '').split(os.pathsep)))))
     names = ('shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv')
     PROG.stage('shader split', step='checking the inputs')   # then a spinner: shader_split.py writes the package and the tables only at the end
     kf = pkg.with_name(pkg.name + '.key')
@@ -1354,9 +1368,11 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, o
     if oodle:   # a host or rewriter fix can change what the game's decoder produces
         PROG.set(step='building the Mac host for the game\'s Oodle decoder'); env = dict(env, **oodle())
         inputs += [('files', [env['DM_OODLE_HOST']]), ('stat', Path(env['DM_OODLE_MODULES']))]
+    inputs += [('tree', r) for r in extra_roots]
     key = None if ALLOW_DAMAGED else fingerprint(*inputs, ('files', profile_files(g)))
     if key and pkg.is_dir() and (note := reused(kf, key)) is not None:
         PROG.end(f'{note}, reused (inputs unchanged)'); return package_key(pkg)
+    if extra_roots: env = dict(env, DM_SHADER_EXTRA_ROOTS=os.pathsep.join(map(str, extra_roots)))
     PROG.set(step='splitting')
     tmp = pkg.with_name(pkg.name + '.partial'); rmtree(tmp); (tmp / 'tables').mkdir(parents=True)
     run([py, repo / 'dm/gfx/tools/shader_split.py', ','.join(map(str, roms)), ','.join(map(str, mains)), tmp / 'pkg'] + [tmp / 'tables' / n for n in names + ('pso_pairs.tsv',)],
@@ -1925,6 +1941,14 @@ def main(args=None):
         if on: say(src[k][1])
     PROG.add(glslc + vkcap + glcap + uedec + (gfx == 'nvn'))
     aoc = extract_aoc(nx, keys, repo, work, app, fam, logs)
+    shader_roots = tuple(dict.fromkeys([*filter(None, env.get('DM_SHADER_EXTRA_ROOTS', '').split(os.pathsep)),
+                                      *([str(aoc)] if aoc and any(aoc.rglob('*.sdftoc')) else [])]))
+    asset_profile = bool(gfx == 'nvn' and shader_roots and not (provisional or derived))
+    if asset_profile:
+        g = shader_asset_profile(g, work / 'shader_profile' / g.id)
+        os.environ['DM_GAMES_DIR'] = env['DM_GAMES_DIR'] = os.pathsep.join([str(g.dir.parent)] + [d for d in env.get('DM_GAMES_DIR', '').split(os.pathsep) if d and d != str(g.dir.parent)])
+        os.environ['DM_GAMES_FIRST'] = env['DM_GAMES_FIRST'] = '1'
+        say(f'additional shader assets: regenerating tables in {g.dir}; registered executable builds and settings retained')
     base = next((dirs[v] for v in versions if picks[v][1] is None), dirs[versions[0]])   # the folder the base game was extracted to alone
     # the app name and bundle ID both come from the base NSP: the game name in its control data, and a bundle ID from its title ID; a setting / the command line overrides them
     app_name = args.app_name or APP_NAME or nacp.name(base / 'control.nacp')
@@ -1965,8 +1989,8 @@ def main(args=None):
     else:
         # Trinity packs and legacy Unreal paks: the split decodes them with the packed version's own decoder (Oodle, LZ5), in the Mac host built for the profile
         oodle = (lambda: {'DM_OODLE_HOST': str(build_mac_host(repo, work / 'tools/dmhost', env, logs, g)), 'DM_OODLE_MODULES': str(patched)}) if src['oodle_packs'][0] or src['ue_legacy'][0] else None
-        own = bool(provisional or derived)   # the shader tables come from this build's split (the profile's are checked otherwise)
-        pkey = split_shaders(py, repo, [dirs[v] / 'RomFS' for v in sv], [dirs[v] / 'ExeFS/main' for v in sv], sh / 'pkg', env, logs, g, own, oodle)
+        own = bool(provisional or derived or asset_profile)   # the shader tables come from this build's split (the profile's are checked otherwise)
+        pkey = split_shaders(py, repo, [dirs[v] / 'RomFS' for v in sv], [dirs[v] / 'ExeFS/main' for v in sv], sh / 'pkg', env, logs, g, own, oodle, extra_roots=shader_roots)
         ios = build_shaders(py, repo, sh, xlate, env, logs, g, pkey, mac)
     icon = next((d / 'icon.jpg' for d in (game, base) if (d / 'icon.jpg').exists()), None)   # the game icon nx_extract saved from the control data (English, icon.jpg); the packed version's first, then the base game's
     if mac_pack:   # a Mac app: the Mac host, then the app packed from it and the build's files

@@ -396,6 +396,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Found on:** [Super Mario Galaxy 2](../../dm/games/0100FD8022DAA000/README.md) (one of two causes of the freeze; the other is [Guest clock reads wait while the app is in the background](#guest-clock-reads-wait-while-the-app-is-in-the-background)).
 - **Note:** modes seen: 1 Monster Hunter Rise; 2 Wonder, Breath of the Wild, Tears of the Kingdom, Link's Awakening, Cuphead; 3 Galaxy, Galaxy 2, 3D World, Odyssey.
 
+### Album capture notification subscriptions
+
+- **Symptom:** null-pointer crash in `nn::oe::EnableAlbumImageTakenNotification` during startup.
+- **Cause:** the SDK wrapper calls `am::GetSelfController()` and dereferences its null result. The host takes over `oe::Initialize`, so it does not construct the SDK's applet service proxies. The enable and disable wrappers call `ISelfController::SetAlbumImageTakenNotificationEnabled(bool)` (command 100).
+- **Fix:** answer both public SDK entry points in `hle_oe.c`, as for the other applet screenshot controls. The host has no system album capture service, so no album-image-taken events are generated; enabling or disabling this subscription must neither enqueue a message nor consume an existing one. This does not implement album capture. A future host album producer must honor the subscription.
+- **Found on:** [Mario + Rabbids Sparks of Hope](../../dm/games/0100317013770000/README.md#found-on-this-game).
+
 ### Album calls fail with no album
 
 - **Symptom:** abort in `sm::Initialize` under `capsrv::InitializeForApplication` (`album::Initialize`); calls that reach the album service, found in the imports before they were met.

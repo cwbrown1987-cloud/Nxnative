@@ -39,6 +39,18 @@ int main(void) { @autoreleasepool {
         printf("%-60s %s\n", "negative control: PC chain reflection rejected (route A retired)", fail == f0 ? "✓" : "✗");
     }
 
+    {   // A buffer image and SPIRV-Cross's separate atomic pointer (Sparks of Hope histogram).
+        NSDictionary *j = @{@"route": @"B", @"bindings": @[
+            @{@"kind": @"img", @"reg": @0, @"arg_id": @0, @"msl_name": @"cp_i_cb2_48_r32ui", @"msl_type": @"texture_buffer<uint>"},
+            @{@"kind": @"img", @"reg": @0, @"arg_id": @1, @"msl_name": @"cp_i_cb2_48_r32ui_atomic", @"msl_type": @"device atomic_uint*"}]};
+        check("B buffer image: conversion", 0, nvn_refl_from_json(j,&r,err,sizeof err));
+        check("B buffer image: texture type", MTLTextureTypeTextureBuffer, r.b[0].dtt);
+        check("B buffer image: unsigned pixel class", NVN_DPF_UINT, r.b[0].dpf);
+        check("B buffer image: load-only view", 0, r.b[0].rw);
+        check("B buffer image: separate atomic pointer", NVN_RB_IMGA, r.b[1].kind);
+        check("B buffer image: atomic pointer writes", 1, r.b[1].rw);
+    }
+
     // Route B (translation of the original Switch shaders, produced by tools/dmsh_build.py): real reflection ps_models_p#0 / vs_models_v#0, expectations hand-copied from the json text
     {   NSDictionary *j = load("5c1ca4e7c3e4657c_b");
         if (j) { int f1 = fail;

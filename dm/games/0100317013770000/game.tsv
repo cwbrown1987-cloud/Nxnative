@@ -1,0 +1,38 @@
+# Mario + Rabbids Sparks of Hope, update v393216 (1.6.2225577), SDK 13.3.5.
+# Snowdrop / NVN. Opening garden exploration tested on Mac; iOS unverified.
+# See README.md for evidence, memory limits and remaining rendering warnings.
+
+# ---- Identity ----
+title_id	0100317013770000
+program_id	0100317013770000
+
+# ---- App ----
+name	Mario + Rabbids® Sparks of Hope
+ipa	MarioRabbidsSparksOfHope.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v393216	1.6.2225577	main=5b76a43b231e0640521ac66203f7c178	sdk=43211771ed39e7fcef03d88e27091831
+package	v393216
+shader_versions	v393216
+
+# ---- Files ----
+# Load order: game executable, then Nintendo SDK.
+modules	main sdk
+romfs_marker	moria/sdf/nx/data/sdf_A_0000.sdfdata
+zip_store	.sdfdata:.sdftoc:.metallib
+
+# ---- Memory ----
+# Mac-tested virtual layout: the game reserves a 12 GiB region plus allocator metadata.
+# 16 GiB alias space inside a 20 GiB reservation avoids the provisional alias exhaustion.
+# Virtual address capacity, not physical RAM; not a measured minimum or an iOS-tested layout.
+mem_reserve	0x500000000
+mem_alias	0x400000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 16 MB of system resource
+sys_resource	0x1000000
+
+# ---- Shader split ----
+shader_groups	/moria/=moria
+shader_note	Mario + Rabbids® Sparks of Hope shaders

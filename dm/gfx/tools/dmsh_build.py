@@ -604,11 +604,12 @@ def vs_pad(key, src):
     """Give a vertex shader the outputs its paired pixel shaders read but it does not write, with the value (0,0,0,1).
     Maxwell attributes are untyped 32-bit slots, and a pixel shader reading a location the vertex shader did not write only gets a default; Ryujinx also fills them with (0,0,0,1) when it links stages. Here every shader is translated
     offline on its own without knowing what the next stage reads, and Metal requires every pixel shader input to be a vertex output: 331 of 9043 pairs failed to link and their draws were skipped
-    (over 10,000 "Fragment input(s) user(locnN) ... not written by vertex shader" in one iPhone session after the opening course). Returns (new source, padded locations); pairs whose pixel MSL cannot be read are skipped."""
+    (over 10,000 "Fragment input(s) user(locnN) ... not written by vertex shader" in one iPhone session after the opening course). Returns (new source, padded locations); a missing pixel MSL fails the build instead of caching an unpadded vertex."""
     want = set()
     for ps in PAIRS.get(key, ()):
         fn = os.path.join(out, ps + '_b.metal')
-        if os.path.exists(fn): want |= {int(x) for x in re.findall(r'\[\[user\(locn(\d+)\)', open(fn).read())}
+        if not os.path.exists(fn): raise ValueError(f'{key}: paired pixel shader {ps} has no MSL; cannot determine default vertex outputs')
+        with open(fn) as f: want |= {int(x) for x in re.findall(r'\[\[user\(locn(\d+)\)', f.read())}
     miss = sorted(want - {int(x) for x in re.findall(r'\[\[user\(locn(\d+)\)', src)})
     i = src.find('struct main0_out\n{\n'); j = src.find('\n};', i); k = src.find('main0_out out = {};')
     if not miss or i < 0 or j < 0 or k < 0: return src, []
@@ -904,7 +905,22 @@ def finish(key, w, j, c1):
     fetch_finish(key, src, refl)
     return 'ok', '', refl
 
-keys = sorted(want) if want else sorted(loc)
+def build_keys(requested, available, pairs):
+    """Partial vertex builds need their pixel partners before vs_pad runs.
+    Otherwise a successful partial build can publish an unpadded vertex under
+    the same cache key a later full build trusts."""
+    selected = set(requested) if requested else set(available)
+    pending = list(selected)
+    while pending:
+        key = pending.pop()
+        if key not in available: raise ValueError(f'unknown shader key {key}')
+        for pixel in pairs.get(key, ()):
+            if pixel not in available: raise ValueError(f'{key}: paired pixel shader {pixel} is absent from the shader map')
+            if pixel not in selected: selected.add(pixel); pending.append(pixel)
+    return sorted(selected)
+
+keys = build_keys(want, loc, PAIRS)
+if want: want = set(keys)   # dependency outputs must also be removed before a partial build
 NJ = int(os.environ.get('J', '8'))
 os.makedirs(out, exist_ok=True)
 # A full build starts from no shader outputs, a partial one from none of the keys it builds, so what a run leaves is what it built: every output is restored from the cache anyway.
@@ -962,6 +978,8 @@ def fin(key):
         if refl['stage'] == 'vs': write_refl(key, pull_finish(key, src, vin_finish(key, src, refl)))
         return key, 'ok', '', fetch_finish(key, src, refl)
     if key in xerr or not os.path.exists(os.path.join(w, key + '.spv')): return key, 'translation failed', xerr.get(key, 'no spv'), None
+    missing = [p for p in PAIRS.get(key, ()) if not os.path.exists(os.path.join(out, p + '_b.metal'))]
+    if missing: return key, 'dependency failed', 'paired pixel MSL missing: ' + ','.join(sorted(missing)), None
     result = (key,) + finish(key, w, jobs[key], c1s[key])
     if result[1] == 'ok': publish_cache(key, digests[key], rule_fps[key], CODE_FP)
     return result
