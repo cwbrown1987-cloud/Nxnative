@@ -9,6 +9,7 @@
 # masks wider than the data passed, and compute shaders (cp_c1) were never checked.
 import datetime
 import json
+import multiprocessing
 import os
 import re
 import sys
@@ -200,25 +201,25 @@ def proven(index, definitions, span):
     return span is not None and known(low, high) and low >= 0 and 16 * (high + 1) <= span
 
 
+def unproven(path):   # the shader's key when one of its c1 reads is not proven inside its span, else None
+    with open(path, encoding="utf-8") as stream:
+        source = stream.read()
+    accesses = set(ACCESS.findall(source))
+    if not accesses:
+        return None
+    name = os.path.basename(path)
+    key = name[:-len("_b.metal")] if name.endswith("_b.metal") else name[:-6]
+    definitions = definitions_of(source)
+    span = c1_span(os.path.join(os.path.dirname(path), key + "_b.json"))
+    return None if all(proven(index, definitions, span) for index in accesses) else key
+
+
 def main():
     if len(sys.argv) != 3:
         raise SystemExit(f"usage: {sys.argv[0]} <dmsh_b version dir> <output tsv>")
     version_dir, output = map(os.path.abspath, sys.argv[1:])
-    keys = []
-    for name in sorted(os.listdir(version_dir)):
-        if not name.endswith(".metal"):
-            continue
-        path = os.path.join(version_dir, name)
-        with open(path, encoding="utf-8") as stream:
-            source = stream.read()
-        accesses = set(ACCESS.findall(source))
-        if not accesses:
-            continue
-        key = name[:-len("_b.metal")] if name.endswith("_b.metal") else name[:-6]
-        definitions = definitions_of(source)
-        span = c1_span(os.path.join(version_dir, key + "_b.json"))
-        if not all(proven(index, definitions, span) for index in accesses):
-            keys.append(key)
+    paths = [os.path.join(version_dir, n) for n in sorted(os.listdir(version_dir)) if n.endswith(".metal")]
+    with multiprocessing.Pool() as pool: keys = [k for k in pool.map(unproven, paths, chunksize=64) if k]   # each shader on its own: tens of thousands of them, on every core
     os.makedirs(os.path.dirname(output), exist_ok=True)
     with open(output, "w", encoding="utf-8", newline="") as stream:
         stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
