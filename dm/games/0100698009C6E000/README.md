@@ -2,7 +2,7 @@
 
 Update 1.0.8 (v524288), The Game Kitchen's Unity 2017.1 / IL2CPP game on NVN, SDK 8.3.1 (NVN API 53.313), with FMOD. The loaded modules are `main`, `subsdk0` (NintendoSDK_movie) and `sdk`. The DLC NSP in the supplied folder is licence-only and contains no game data.
 
-On the Mac, the update boots through its title and opening, reaches the first playable scene, and creates save data. The tested scene renders with its HUD and interaction prompt. The run reached about five minutes; early frame-time p50 was 16.67 ms, while later samples varied between about 16.7 and 34 ms. Resident memory grew from about 1.5 GB at frame 300 to 2.4 GB at frame 10,500 while the opening assets loaded; finalized memory-pool buffers remained at zero. The user reports stable performance on both Mac and iPhone. Their iPhone capture shows an A18 Pro running iOS 27.2 at 59.99 fps with a 16.67 ms frame interval. Sustained story progression and a second boot / load remain unchecked.
+On the Mac, the update boots through its title and opening, reaches the first playable scene, and creates save data. The tested scene renders with its HUD and interaction prompt. The run reached about five minutes; early frame-time p50 was 16.67 ms, while later samples varied between about 16.7 and 34 ms. Resident memory grew from about 1.5 GB at frame 300 to 2.4 GB at frame 10,500 while the opening assets loaded; finalized memory-pool buffers remained at zero. The user reports stable performance on both Mac and iPhone. Their iPhone capture shows an A18 Pro running iOS 27.2 at 59.99 fps with a 16.67 ms frame interval. A later Mac boot loaded the existing save into the Brotherhood of the Silent Sorrow. Sustained story progression remains unchecked.
 
 ## Profile
 

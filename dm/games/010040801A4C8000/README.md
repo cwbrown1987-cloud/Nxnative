@@ -16,12 +16,14 @@ The shader split found 4,354 shaders: 2,178 pixel, 2,174 vertex, one geometry an
 
 ## Mac route
 
-Start the Mac host with `DM_CTL` and advance through the opening into combat. The run reached frame 11,700, created save data, and rendered combat with its HUD and attack effects. The last 300-frame timing sample reported a 16.67 ms p50 and 17.24 ms p99. A second boot and save reload remain unchecked.
+Start the Mac host with `DM_CTL` and advance through the opening into combat. The run reached frame 11,700, created save data, and rendered combat with its HUD and attack effects. The last 300-frame timing sample reported a 16.67 ms p50 and 17.24 ms p99.
+
+After adopting the upstream framed-thunk recognizer, all three modules (`main`, `subsdk0`, `sdk`) were rewritten completely and were byte-identical to the earlier tested outputs. With rebuilt shader libraries and a rebuilt Mac host, a new run reached the opening playable scene with its HUD and interaction prompt. Progress save reload remains unchecked.
 
 ## Found on this game
 
-- `main+0x1e86fc` branches through `br x18` to an indirect tail call; the same function has another code block after that branch in the linear disassembly. The rewriter now recognizes the tail call at the end of its basic block instead of requiring it to be the last instruction in the function: [Indirect tail calls through x18 in IL2CPP thunks](../../../docs/reference/rewriter.md#indirect-tail-calls-through-x18-in-il2cpp-thunks).
+- `main+0x1e86fc` is a framed method-pointer tail call followed by a separate null-error call. It saves FP/LR, guards against a null argument, loads the pointer, moves arguments into registers and fixed caller stack slots, and restores FP/LR before `br x18`. The upstream framed-thunk recognizer covers this shape without relaxing the terminal-tail rule: [Loaded method-pointer tail call before an error block](../../../docs/reference/rewriter.md#loaded-method-pointer-tail-call-before-an-error-block).
 
 ## Open
 
-- Validate the iOS build, a second boot and save reload, the base build and update 1.0.7.
+- Validate the iOS build, progress save reload, the base build and update 1.0.7.
