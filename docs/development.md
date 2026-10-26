@@ -221,6 +221,31 @@ Why the host is a child process: macOS privacy checks (TCC) cover files on remov
 
 Signing: `pack_app.py` signs the inner host first, then the bundle (`codesign --force --sign <identity>`). It signs ad-hoc by default; `--mac-sign "<identity>"` (`MAC_SIGN` in Spyder) names a Developer ID or another identity. It never uses the hardened runtime: `--options runtime` refuses the executable memory the host maps for the game's code. Notarization needs the hardened runtime, so the app is not notarized. Gatekeeper blocks it on a Mac it was downloaded to until it is allowed in System Settings › Privacy & Security. `dm/tools/tests/test_nsp_mac_app.py` tests the packer and the launcher with a stand-in host, without game files.
 
+### A disk image of a Mac app
+
+`scripts/mac_dmg.py` packs a Mac app into a disk image (a `.dmg`) that opens with a ready-made window: the game on the left, a symlink to `/Applications` on the right, an arrow between the two, the game's name on the background, and the game's own icon on the volume. Dragging the app to `/Applications` copies it there; nothing is installed.
+
+```
+# a disk image of the app, next to it
+python3 scripts/mac_dmg.py "<NSP folder>/<game name>.app"
+
+# the three games of a drive, each in its own folder
+python3 scripts/mac_dmg.py "<NSP folder>/A.app" "<NSP folder>/B.app" "<NSP folder>/C.app"
+
+# another name, another folder, another compression, and a check of the finished image
+python3 scripts/mac_dmg.py --name "Super Mario" --out ~/Desktop --format ulfo --verify "<NSP folder>/<game name>.app"
+```
+
+The app bundle is not changed: it is copied into the image. The image is built read-write (the window's layout and the volume's icon are written into it) and then converted to a compressed read-only image, so the finished `.dmg` opens with the same window on every Mac. It needs a Mac with Apple silicon, and the disk space of the app's size twice (the read-write image and the compressed one).
+
+The options: `--out` (where the image is written, the app's own folder by default), `--name` (the image's name without the extension, the app's display name by default), `--format` (`udzo` by default, `ulfo` smaller but slower, `u3zo` larger, `udrw` none), `--title` (the name on the background), `--window W H` (the window's size in points, `600 400` by default), `--icon-size` (the icons' size in the window, `128` by default), `--no-layout` (no window layout at all: a plain volume with the app and the symlink, and no permission to control the Finder needed), `--verify` (check the finished image with `hdiutil verify`) and `--keep` (keep the read-write image and the volume's layout for a look).
+
+The window's layout is written by the Finder over AppleScript, so the Finder has to allow the automation (System Settings › Privacy & Security › Automation). Without that permission the image is still built, but it opens in the Finder's own view. The layout is written in two passes: the Finder places the two icons and reads back where it put them, and the background is drawn in those places, so the arrow sits between the icons on every Mac.
+
+The helper folder `.background` (the picture the Finder draws) and the file `.VolumeIcon.icns` (the volume's icon) are hidden. A Finder that shows all files (Cmd+Shift+.) shows them anyway.
+
+The background is drawn with Pillow (`python3 -m pip install pillow`). Without it the image is built without one, the rest of the layout unchanged.
+
 ## Build and run on a device with Xcode
 
 With an Apple developer account, Xcode can sign and install the app itself:
