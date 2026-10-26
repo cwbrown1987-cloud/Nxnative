@@ -56,6 +56,30 @@ static size_t tex_size(int fmt, int w, int h, int flags, size_t *align) {
 }
 
 int main(void) {
+    // Engine-native frame limits have no frame-step state page, but the
+    // player-selected cap still controls presentation pacing.
+    {
+        win_t w = {.interval = 1};
+        nvn_present_config(60, 1);
+        dm_fps_state = NULL;
+        setenv("DM_FPS_TARGET", "30", 1); g_present_cap = -1;
+        EXPECT("native 30 cap: display interval", 2, present_itv(&w));
+        EXPECT("native 30 cap: period", 33333333, present_period(&w));
+        EXPECT("native 30 cap: display-link target", 30, nvn_game_fps());
+        EXPECT("native cap does not enable frame-step stubs", 0, fstep_on());
+        setenv("DM_FPS_TARGET", "60", 1); g_present_cap = -1;
+        EXPECT("native 60 cap: period", 16666666, present_period(&w));
+        EXPECT("native 60 cap: display-link target", 60, nvn_game_fps());
+        setenv("DM_FPS_TARGET", "0", 1); g_present_cap = -1; w.interval = 2;
+        EXPECT("no cap preserves display pacing", 1, present_itv(&w));
+        nvn_present_config(60, 0);
+        EXPECT("no cap preserves game pacing", 2, present_itv(&w));
+        _Alignas(8) uint8_t state[64] = {0}; float cap = 60; memcpy(state, &cap, 4); dm_fps_state = state;
+        EXPECT("frame-step state takes precedence", 60, fps_present_cap());
+        *(uint32_t *)(state + 4) = 1;
+        EXPECT("movie flag keeps the 30 cap", 30, fps_present_cap());
+        dm_fps_state = NULL; unsetenv("DM_FPS_TARGET"); g_present_cap = -1; nvn_present_config(0, 0);
+    }
     crash_install();   // the same SIGSEGV / SIGBUS handling as production (the page-fault hook is dispatched from within it)
     // 1. Bootstrap address lookup: bootstrap gets GetProcAddress, then uses it to get all the names
     PFNNVNBOOTSTRAPLOADERPROC boot = (PFNNVNBOOTSTRAPLOADERPROC)h_nvnBootstrapLoader;

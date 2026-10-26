@@ -1,6 +1,6 @@
 # NieR:Automata The End of YoRHa Edition (`010056B015FE8000`)
 
-Update 1.0.3 (v131072) over the base cartridge dump. PlatinumGames' engine, SDK 12.3.9, NVN, CRI CPK archives and Sofdec USM movies, Wwise audio through `AudioOut`. Modules `main`, `subsdk0` (NintendoSDK_movie) and `sdk`. Mac startup, save creation/loading and opening flight gameplay pass; iPhone testing is pending.
+Update 1.0.3 (v131072) over the base cartridge dump. PlatinumGames' engine, SDK 12.3.9, NVN, CRI CPK archives and Sofdec USM movies, Wwise audio through `AudioOut`. Modules `main`, `subsdk0` (NintendoSDK_movie) and `sdk`.
 
 ## What it needs
 
@@ -12,6 +12,8 @@ Update 1.0.3 (v131072) over the base cartridge dump. PlatinumGames' engine, SDK 
 | `tex_flush_upload on` | `game.tsv` | CPU-filled texture storage is published through mapped-range flushes; without uploads the title background is magenta |
 | `feedback_snap fd2c47b73f0e7e24` | `game.tsv` | `filter09.pso` samples the HDR attachment it writes through separate texture slot 128; a snapshot prevents NaNs spreading through bloom |
 | `present_interval display` | `game.tsv` | replaces the game's interval-two presentation target with 60 Hz; the native clock already measures elapsed time |
+| `fps_target 60` | `game.tsv`, editable **Frame rate** launcher choice | starts at 60 fps; the player can select 30 fps |
+| `DM_DYNAMIC_RESOLUTION` | editable launcher toggle, default off | enables the native 70–100% resolution controller when on; holds full resolution when off |
 | `gpu_timestamps segment` | `game.tsv` | the renderer subtracts two raw timestamp reports; one timestamp for the whole submission makes its measured GPU cost zero |
 | Four dynamic-resolution threshold cuts | [`patches.py`](patches.py) | the verified 1.0.3 main build uses 22.5 / 16.005 / 15 ms thresholds for a 60 fps budget |
 
@@ -53,7 +55,9 @@ These are measured windows, not a full-game or iPhone frame-rate guarantee. The 
 
 Reproduce the save-load route with `DM_KEYS=40:A,45:A,50:A,52:Left,53:A,60:A`, `DM_PRESENT_LINK=0` and sound enabled. Headless timing runs unset `DM_WINDOW`. To compare the original presentation target, set `DM_PRESENT_INTERVAL=game`; `display` selects 60 Hz. `DM_OPMODE=0` selects the game's native 720p handheld mode; `1` selects 1080p console mode.
 
-**Resolved: dynamic-resolution cost reads zero or 32 times too small.** The renderer's producer at `main+0x9ba6d4` waits for a ring fence, maps its counter buffer and subtracts timestamp fields at +8 and +0x18; its inline conversion publishes milliseconds through renderer +0x10c4. Submission timestamps gave zero. Segment timestamps need the shared raw-unit fix linked below: this consumer expects 614.4 MHz, while the host previously wrote 19.2 MHz. Both report paths and the nanosecond API now use the proper rate. The native scale floor is currently 1.0; its existing preset setter can select 0.7. No floor override is applied.
+**Resolved: dynamic-resolution cost reads zero or 32 times too small.** The renderer's producer at `main+0x9ba6d4` waits for a ring fence, maps its counter buffer and subtracts timestamp fields at +8 and +0x18; its inline conversion publishes milliseconds through renderer +0x10c4. Submission timestamps gave zero. Segment timestamps need the shared raw-unit fix linked below: this consumer expects 614.4 MHz, while the host previously wrote 19.2 MHz. Both report paths and the nanosecond API now use the proper rate. The iPhone launcher lets me turn dynamic resolution on or off. Off holds the preset floor at 1.0; on selects 0.7 while leaving the game's current-scale and UV controller intact.
+
+The **Frame rate** choice starts at 60 fps and remains editable, with 30 fps available. The frame-rate choice and resolution toggle work independently.
 
 ## Found on this game
 
@@ -73,4 +77,16 @@ Reproduce the save-load route with `DM_KEYS=40:A,45:A,50:A,52:Left,53:A,60:A`, `
 ## Open
 
 - Conditional rendering is still drawn unconditionally (`SetRenderEnableConditional` is the route's only `[RED]` warning); no visible fault was found from it in this route.
-- Validate on an iPhone and test beyond the opening flight; full-game coverage is pending.
+- iPhone performance varies by scene and remains below a consistent 60 fps in the demanding scenes tested; see the capture below.
+
+## Device results
+
+### Mac — M4 Pro
+
+I played through the game from start to finish on my M4 Pro and observed stable 60 fps throughout. The measured opening-flight and combat windows in the table above ranged from 59.79 to 60.03 fps.
+
+### iPhone — 17 Pro Max
+
+I observed 60 fps in some parts, with lower rates in heavier scenes. This in-game capture reads 39.13 fps (25.56 ms per frame).
+
+![NieR:Automata running in gameplay on iPhone 17 Pro Max; performance HUD reads 39.13 FPS and 25.56 ms per frame](../../../docs/images/nier-iphone-gameplay.jpg)
