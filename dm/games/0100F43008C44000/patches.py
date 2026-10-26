@@ -7,4 +7,8 @@ CUTS = {
   'b1f12fd919eae86ab8a978317677e64b': [
     (0x1b3e3e4, '6200c0d2', '2200c0d2', 'StandardAllocator::Initialize(nullptr, size): address space mov x2,#0x300000000 → mov x2,#0x100000000 (12 GB → 4 GB)'),
   ],
+  # 1.0.0 (v0) main, which update 1.0.1 (v65536) ships unchanged: the same initialization, called from nninitStartup (main+0x19e8720) at main+0x19e875c, its address space at main+0x19f84b4
+  '7222e13ecf6adb3249b5dd5c57fa40b1': [
+    (0x19f84b4, '6200c0d2', '2200c0d2', 'StandardAllocator::Initialize(nullptr, size): address space mov x2,#0x300000000 → mov x2,#0x100000000 (12 GB → 4 GB)'),
+  ],
 }
