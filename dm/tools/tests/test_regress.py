@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # scripts/regress.py: the parts that need no game, GPU or git revision: the MSL interface reader (GitHub issue #283), the [RED] normalization, the routes, and the comparisons
-import importlib.util, tempfile, unittest
+import importlib.util, unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-spec = importlib.util.spec_from_file_location('regress', REPO / 'scripts/regress.py'); regress = importlib.util.module_from_spec(spec); spec.loader.exec_module(regress)
+spec = importlib.util.spec_from_file_location('regress', REPO / 'scripts/regress.py')
+assert spec is not None and spec.loader is not None
+regress = importlib.util.module_from_spec(spec); spec.loader.exec_module(regress)
 
 VS = '''struct main0_out
 {

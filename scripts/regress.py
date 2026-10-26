@@ -54,8 +54,17 @@ import argparse, collections, concurrent.futures as cf, ctypes, datetime, hashli
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location('bench', REPO / 'scripts/bench.py'); bench = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(bench)
-_spec = importlib.util.spec_from_file_location('shader_regressions', REPO / 'dm/gfx/tools/shader_regressions.py'); shader_regressions = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(shader_regressions)
+
+
+def load_module(name, path):   # a module from a file (another script, or a tool of a revision's tree)
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None: raise ImportError(f'cannot load {path}')
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod
+
+
+bench = load_module('bench', REPO / 'scripts/bench.py')
+shader_regressions = load_module('shader_regressions', REPO / 'dm/gfx/tools/shader_regressions.py')
 ROOT = Path(os.environ.get('REGRESS_ROOT', '/Volumes/NX/harness'))
 GAMES = Path(os.environ.get('REGRESS_GAMES', '/Volumes/NX/games'))
 HOST_DIRS = ('dm/host', 'dm/gfx', 'dm/gfx/nvn', 'dm/gfx/nvn/include', 'dm/gfx/tex', 'dm/gfx/vk', 'dm/gfx/gl')   # as build_ipa_from_nsp.py: the host's sources and headers
@@ -356,7 +365,7 @@ def interface_check(tree, g, out):
     pairs = [prof / 'shader_pairs.tsv', prof / 'pso_pairs.tsv' if (prof / 'pso_pairs.tsv').is_file() else g.build / 'shader/pso_pairs.tsv']
     po = tree.path / 'dm/gfx/tools/pso_offline.py'
     if not po.is_file(): return {'checked': 0, 'note': 'no pso_offline.py in this revision', 'bad': []}
-    spec = importlib.util.spec_from_file_location('pso_offline_' + tree.id.replace('-', '_'), po); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    mod = load_module('pso_offline_' + tree.id.replace('-', '_'), po)
     todo = mod.read_pairs(mod.pair_text([p for p in pairs if p.is_file()]))
     zero = depth_zero(g, tree)
     keys = {k for pr in todo for k in pr}
@@ -734,7 +743,7 @@ def run_watched(cmd, env, cwd, log, a, limit, hang, kind, what, shots=(), frames
         else: stopped = False
         if caf is not None and caf.poll() is None: caf.terminate()
         if a.lock and bench.lock_holder(a.lock) == os.getpid(): a.lock.unlink(missing_ok=True)   # only a lock this process holds
-    rc = None if stopped else p.returncode
+    rc = None if stopped or p is None else p.returncode
     ft = st['frame_t']
     def frame_at(t):
         best = -1
@@ -790,9 +799,9 @@ def smoke_diff(base, cand, route):
     if p is not None and p < -TOL['fps_pct']: regress.append(f'fps {b:g} → {c:g} ({p:+g} %)')
     elif p is not None and abs(p) > TOL['fps_pct']: changed.append(f'fps {b:g} → {c:g} ({p:+g} %)')
     p, b, c = pct('frame_p99'); d['frame_p99_change_pct'] = p
-    if p is not None and p > TOL['p99_pct'] and c - b > TOL['p99_ms']: regress.append(f'frame p99 {b:g} → {c:g} ms ({p:+g} %)')
+    if p is not None and b is not None and c is not None and p > TOL['p99_pct'] and c - b > TOL['p99_ms']: regress.append(f'frame p99 {b:g} → {c:g} ms ({p:+g} %)')
     p, b, c = pct('peak_footprint_mb'); d['peak_footprint_change_pct'] = p
-    if p is not None and p > TOL['footprint_pct'] and c - b > TOL['footprint_mb']: regress.append(f'peak footprint {b:g} → {c:g} MB ({p:+g} %)')
+    if p is not None and b is not None and c is not None and p > TOL['footprint_pct'] and c - b > TOL['footprint_mb']: regress.append(f'peak footprint {b:g} → {c:g} MB ({p:+g} %)')
     b, c = med(r.get('prepare_s') for r in base), med(r.get('prepare_s') for r in cand)
     d['prepare_change_s'] = round(c - b, 2) if b is not None and c is not None else None
     if b is not None and c is not None and c > b * TOL['prepare_x'] and c - b > TOL['prepare_s']: regress.append(f'prepare step {b:g} → {c:g} s')
@@ -925,7 +934,7 @@ def cmd_check(a, smoke=True):
             if route:
                 t1 = time.time(); mode = 'quick' if a.quick else 'full'
                 bf = baseline_dir(base, g) / f'smoke-{mode}.json'
-                same = lambda r: all(r.get(k) == route[k] for k in ('save', 'keys', 'secs' if mode == 'full' else 'quick'))
+                same = lambda r, route=route, mode=mode: all(r.get(k) == route[k] for k in ('save', 'keys', 'secs' if mode == 'full' else 'quick'))
                 if bf.is_file() and not same(json.loads(bf.read_text())['route']):
                     say(f'  {g.id}: the stored {mode} baseline of {base.id} ran another route (save, keys or length): recording it again'); bf.unlink()
                 if not bf.is_file():
@@ -953,7 +962,7 @@ def select(a, smoke):
     games = find_games(a.games.split(',') if a.games else None)
     if not a.games and smoke: games = [g for g in games if g.route()] or games
     if not games: raise HarnessError(f'no game with a Mac build under {GAMES}')
-    say(f'games: {", ".join(f"{g.id} ({g.name}, {g.kind}{", route" if g.route() else ""})" for g in games)}')
+    say('games: ' + ', '.join(f"{g.id} ({g.name}, {g.kind}{', route' if g.route() else ''})" for g in games))
     return games
 
 
@@ -997,7 +1006,7 @@ def report_md(rep):
         itf_s = f"{len(itf.get('new', []))} / {len(itf.get('known', []))}" if 'new' in itf else (f"{itf.get('baseline')} bad" if itf else '–')
         runs = sm.get('candidate') or sm.get('baseline') or []
         boot = ('ok' if runs and not any(run_failures(r, sm['route']) for r in runs) else 'FAIL') if runs else '–'
-        def mv(k, sub=None):
+        def mv(k, sm=sm):
             bv = med((r.get(k) for r in sm.get('baseline', []))); cv = med((r.get(k) for r in sm.get('candidate', [])))
             if 'candidate' in sm: return f'{bv} → {cv}'
             return str(bv) if bv is not None else '–'
@@ -1024,7 +1033,7 @@ def report_md(rep):
                 L.append(f"  - {label}: exit {r.get('exit')}, first frame {r.get('first_frame_s')} s, max frame {r.get('max_frame')}, reached {r.get('reached')}, prepare {r.get('prepare_s')} s"
                          + (f", prebuild {pb.get('wall_s')} s ({pb.get('built', 0):g} built, {pb.get('failed', 0):g} failed)" if pb else '')
                          + f", fps {r.get('fps')}, p50/p99 {r.get('frame_p50')}/{r.get('frame_p99')} ms, peak {r.get('peak_footprint_mb')} MB" + (', busy Mac' if r.get('busy') else ''))
-        if g.get('secs'): L.append(f"  - time: " + ', '.join(f'{k} {v:g} s' for k, v in g['secs'].items()))
+        if g.get('secs'): L.append("  - time: " + ', '.join(f'{k} {v:g} s' for k, v in g['secs'].items()))
     return '\n'.join(L) + '\n'
 
 
