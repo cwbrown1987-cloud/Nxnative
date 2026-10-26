@@ -34,7 +34,7 @@ Start Mac runs with the Metal performance HUD (`DM_METAL_HUD=1`). A new title st
 
 ## 4. Checking a change on every game: `scripts/regress.py`
 
-One chain and one host serve every profile, and each contributor owns only some games (GitHub issue #272). `scripts/regress.py` compares a baseline revision (by default the merge base with `main`) with a candidate (by default this checkout, uncommitted files included) on every game the Mac has a `--platform mac` build of. Full description: [The regression harness](../development.md#the-regression-harness).
+One chain and one host serve every profile, and each contributor owns only some games (GitHub issue #272). `scripts/regress.py` compares a baseline revision (by default the merge base with `main`) with a candidate (by default this checkout, uncommitted files included) on every game the Mac has a `--platform mac` build of. Its shader count uses the rule of `shader_regressions.py`, which the NSP script applies to a game you rebuild; the harness adds the other games, the MSL, the pipeline interface and a run. Full description: [The regression harness](../development.md#the-regression-harness).
 
 | Command | What runs | Cost |
 |---|---|---|

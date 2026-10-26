@@ -15,7 +15,8 @@
 #   --lock FILE (DM_MEASURE_LOCK): the measuring lock bench.py --lock shares, held only while a game runs.
 #
 # What it checks, per game:
-# 1. Chain (static): the game's shaders translated by each revision's chain (dmsh_build.py through own_compilers.py; a Vulkan game: vk_shaders.py), compared shader by shader: built or failed,
+# 1. Chain (static): the game's shaders translated by each revision's chain (dmsh_build.py through own_compilers.py; a Vulkan game: vk_shaders.py), compared shader by shader: built or failed
+#    (newly failing by the rule of dm/gfx/tools/shader_regressions.py, which the NSP script applies to one game's previous build; a new shader that fails is listed apart),
 #    the SHA-256 of the MSL (<key>_b.metal), of the reflection (<key>_b.json without its chain fields) and of the variant libraries (_bf, _bv, _bp, _bg*). A build is kept per chain version,
 #    profile inputs and compilers (<root>/<id>/chain/<key>/), so a revision whose chain did not change costs nothing, and dmsh_build.py uses the build's own shader cache (DMSH_CAS), so MSL
 #    that did not change is not compiled again. Then the vertex / pixel interface of every pipeline base pso_offline.py would put into the pipeline archive (shader_pairs.tsv and
@@ -34,7 +35,8 @@
 #   {"schema": "nxnative-regress/1", "command", "mode": "quick"|"full", "status", "exit", "started", "secs", "machine": {model, gpu, macos, xcode},
 #    "baseline": {"rev", "sha"}, "candidate": {"rev", "sha", "dirty"},
 #    "games": {<title ID>: {"name", "status", "reasons": [text], "known": [text], "secs": {"chain", "smoke"},
-#       "chain": {"kind": "nvn"|"vk", "baseline": BUILD, "candidate": BUILD, "newly_failing": [{"key", "status", "error"}], "newly_passing": [key],
+#       "chain": {"kind": "nvn"|"vk", "baseline": BUILD, "candidate": BUILD, "newly_failing": [{"key", "status", "error"}], "added_failing": [same],
+#                 "newly_passing": [key],
 #                 "changed": {"msl", "reflection", "variants", "shaders", "keys": [key, at most 200]}, "added": n, "removed": n,
 #                 "interface": {"baseline": n, "candidate": n, "new": [PAIR], "known": [PAIR, at most 50]}},
 #       "smoke": {"route": {...}, "baseline": [RUN], "candidate": [RUN], "diff": {"new_red": [{"text", "count"}], "shots": {<s>: {"dhash_bits", "rgb_diff", "baseline_noise"}},
@@ -53,6 +55,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location('bench', REPO / 'scripts/bench.py'); bench = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(bench)
+_spec = importlib.util.spec_from_file_location('shader_regressions', REPO / 'dm/gfx/tools/shader_regressions.py'); shader_regressions = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(shader_regressions)
 ROOT = Path(os.environ.get('REGRESS_ROOT', '/Volumes/NX/harness'))
 GAMES = Path(os.environ.get('REGRESS_GAMES', '/Volumes/NX/games'))
 HOST_DIRS = ('dm/host', 'dm/gfx', 'dm/gfx/nvn', 'dm/gfx/nvn/include', 'dm/gfx/tex', 'dm/gfx/vk', 'dm/gfx/gl')   # as build_ipa_from_nsp.py: the host's sources and headers
@@ -383,8 +386,10 @@ def interface_check(tree, g, out):
 def chain_diff(b, c):
     bs, cs = b['shaders'], c['shaders']
     common = bs.keys() & cs.keys()
-    nf = [{'key': k, 'status': cs[k]['st'], 'error': cs[k].get('err', '')} for k in sorted(common) if bs[k]['st'] == 'ok' and cs[k]['st'] != 'ok']
-    nf += [{'key': k, 'status': cs[k]['st'], 'error': cs[k].get('err', '') + ' (new shader)'} for k in sorted(cs.keys() - bs.keys()) if cs[k]['st'] != 'ok']
+    rows = lambda m: [{'key': k, 'st': v['st'], 'err': v.get('err', '')} for k, v in sorted(m.items())]
+    # the rule of shader_regressions.py, which the NSP script runs after each shader build of one game: ok in the earlier build, not ok now; a new key does not count there
+    nf = [{'key': k, 'status': st, 'error': err} for k, st, err in shader_regressions.lost(rows(bs), rows(cs))]
+    af = [{'key': k, 'status': cs[k]['st'], 'error': cs[k].get('err', '')} for k in sorted(cs.keys() - bs.keys()) if cs[k]['st'] != 'ok']
     npass = [k for k in sorted(common) if bs[k]['st'] != 'ok' and cs[k]['st'] == 'ok']
     ch = collections.Counter(); keys = []
     for k in sorted(common):
@@ -392,7 +397,7 @@ def chain_diff(b, c):
         d = [f for f, label in (('msl', 'msl'), ('refl', 'reflection'), ('var', 'variants')) if bs[k].get(f) != cs[k].get(f)]
         for f in d: ch[{'msl': 'msl', 'refl': 'reflection', 'var': 'variants'}[f]] += 1
         if d: keys.append(k)
-    out = {'newly_failing': nf, 'newly_passing': npass, 'changed': {'msl': ch['msl'], 'reflection': ch['reflection'], 'variants': ch['variants'], 'shaders': len(keys), 'keys': keys[:200]},
+    out = {'newly_failing': nf, 'added_failing': af, 'newly_passing': npass, 'changed': {'msl': ch['msl'], 'reflection': ch['reflection'], 'variants': ch['variants'], 'shaders': len(keys), 'keys': keys[:200]},
            'added': len(cs.keys() - bs.keys()), 'removed': len(bs.keys() - cs.keys())}
     bi, ci = b.get('interface'), c.get('interface')
     if bi is not None or ci is not None:
@@ -906,8 +911,10 @@ def cmd_check(a, smoke=True):
             gr['secs']['chain'] = round(time.time() - t0, 1)
             cd = chain_diff(bm, cm)
             gr['chain'] = {'kind': cm['kind'], 'baseline': build_summary(bm), 'candidate': build_summary(cm), **cd}
-            if cd['newly_failing']: levels['NEW-FAIL'].append(f"{len(cd['newly_failing'])} shaders newly fail to build")
-            if cm['failed'] and len(cd['newly_failing']) < cm['failed']: gr['known'].append(f"{cm['failed'] - len(cd['newly_failing'])} shaders fail in both")
+            if cd['newly_failing']: levels['NEW-FAIL'].append(f"{len(cd['newly_failing'])} shaders newly fail to build (shader_regressions.py's rule)")
+            if cd['added_failing']: levels['NEW-FAIL'].append(f"{len(cd['added_failing'])} shaders new in the candidate fail to build")
+            both = cm['failed'] - len(cd['newly_failing']) - len(cd['added_failing'])
+            if both: gr['known'].append(f"{both} shaders fail in both")
             if cd['newly_passing']: levels['CHANGED'].append(f"{len(cd['newly_passing'])} shaders newly build")
             if cd['changed']['shaders']: levels['CHANGED'].append(f"{cd['changed']['shaders']} shaders changed (MSL {cd['changed']['msl']}, reflection {cd['changed']['reflection']}, variants {cd['changed']['variants']})")
             if cd['added'] or cd['removed']: levels['CHANGED'].append(f"shaders added {cd['added']}, removed {cd['removed']}")
@@ -1002,6 +1009,7 @@ def report_md(rep):
         L += [f'- {x}' for x in g['reasons']] + [f'- known (baseline too): {x}' for x in g['known']]
         ch = g.get('chain', {})
         for x in ch.get('newly_failing', [])[:30]: L.append(f"  - newly failing `{x['key']}` {x['status']}: {x['error'][:120]}")
+        for x in ch.get('added_failing', [])[:30]: L.append(f"  - new shader failing `{x['key']}` {x['status']}: {x['error'][:120]}")
         if ch.get('changed', {}).get('keys'): L.append('  - changed shaders: ' + ', '.join(f'`{k}`' for k in ch['changed']['keys'][:40]) + (' …' if ch['changed']['shaders'] > 40 else ''))
         itf = ch.get('interface') or {}
         for x in (itf.get('new', []) + itf.get('known', []))[:20]:

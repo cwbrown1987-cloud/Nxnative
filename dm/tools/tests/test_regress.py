@@ -66,10 +66,11 @@ class Regress(unittest.TestCase):
     def test_chain_diff(self):
         b = {'shaders': {'a': {'st': 'ok', 'msl': '1'}, 'b': {'st': 'ok', 'msl': '2'}, 'c': {'st': 'metal failed'}, 'd': {'st': 'ok', 'msl': '4'}},
              'interface': {'bad': [{'vs': 'v', 'entry': 'main0', 'ps': 'p', 'missing': ['locn1'], 'type': []}]}}
-        c = {'shaders': {'a': {'st': 'ok', 'msl': '1'}, 'b': {'st': 'metal failed', 'err': 'x'}, 'c': {'st': 'ok', 'msl': '3'}, 'd': {'st': 'ok', 'msl': '5'}},
+        c = {'shaders': {'a': {'st': 'ok', 'msl': '1'}, 'b': {'st': 'metal failed', 'err': 'x'}, 'c': {'st': 'ok', 'msl': '3'}, 'd': {'st': 'ok', 'msl': '5'}, 'e': {'st': 'translation failed', 'err': 'y'}},
              'interface': {'bad': [{'vs': 'v', 'entry': 'main0', 'ps': 'p', 'missing': ['locn1'], 'type': []}, {'vs': 'w', 'entry': 'main0', 'ps': 'p', 'missing': ['locn6'], 'type': []}]}}
         d = regress.chain_diff(b, c)
         self.assertEqual([x['key'] for x in d['newly_failing']], ['b']); self.assertEqual(d['newly_passing'], ['c'])
+        self.assertEqual([x['key'] for x in d['added_failing']], ['e'])   # shader_regressions.py does not count a new key; the harness lists it apart
         self.assertEqual(d['changed']['msl'], 1); self.assertEqual(d['changed']['keys'], ['d'])
         self.assertEqual([x['vs'] for x in d['interface']['new']], ['w']); self.assertEqual(len(d['interface']['known']), 1)
 
