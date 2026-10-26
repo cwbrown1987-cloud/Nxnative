@@ -20,5 +20,18 @@ def check_tools():
     return bad
 
 dmsh_chain.check_tools = check_tools   # dmsh_build.py imports the same module object and calls it through the module
+
+# Tens of thousands of compiler runs: Popen takes posix_spawn only for a full path with close_fds off (Python's own fds are non-inheritable anyway, PEP 446);
+# otherwise it forks the whole multithreaded process per run, which is most of the build's kernel time. The program found on PATH is the same one either way.
+import shutil, subprocess
+_popen_init = subprocess.Popen.__init__
+def _spawn_init(self, args, *a, **kw):
+    if not a and isinstance(args, (list, tuple)) and args and 'executable' not in kw and not os.path.dirname(str(args[0])):
+        args = [shutil.which(str(args[0]), path=(kw.get('env') or os.environ).get('PATH')) or args[0], *args[1:]]
+    kw.setdefault('close_fds', False)
+    _popen_init(self, args, *a, **kw)
+subprocess.Popen.__init__ = _spawn_init
+
+
 sys.argv = [os.path.join(HERE, 'dmsh_build.py'), *sys.argv[1:]]
 runpy.run_path(sys.argv[0], run_name='__main__')

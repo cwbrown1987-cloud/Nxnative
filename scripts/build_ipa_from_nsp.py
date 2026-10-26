@@ -1514,9 +1514,10 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False):
     if not mac: rmtree(kf)
     try: PROG.watch(ShaderWatch(g, libs, Path(env['WORK']), pso_pairs))
     except Exception: pass   # progress never stops the build (a missing table is dmsh_build.py's to report)
-    benv = dict(env, XLATE=str(xlate), IOSOUT=str(ios))
+    benv = dict(env, XLATE=str(xlate), IOSOUT=str(ios), PYTHONUTF8='1')   # PYTHONUTF8: no locale lookup (a libc lock every thread waits on) per tool pipe
     if mac: del benv['IOSOUT']   # dmsh_build.py builds the iOS libraries only with IOSOUT
-    run([py, repo / 'dm/gfx/tools/own_compilers.py', sh / 'pkg', sh / 'cache'], log, env=benv)   # dmsh_build.py with this Mac's Metal compiler and spirv-cross
+    sh_py = shutil.which('python3.14t', path=env.get('PATH')) or py   # a free-threaded Python when installed (uv python install 3.14t): dmsh_build.py's per-shader Python work then runs on every core, not one
+    run([sh_py, repo / 'dm/gfx/tools/own_compilers.py', sh / 'pkg', sh / 'cache'], log, env=benv)   # dmsh_build.py with this Mac's Metal compiler and spirv-cross
     PROG.watch(None)
     if not chain_tables(py, repo, sh, env, logs, g, chain): raise BuildError(f'no stamped Mac shader outputs in {sh / "cache" / f"b-{chain}"} (inputs.tsv): dmsh_build.py did not finish a full build')
     what = 'Mac' if mac else 'iOS'
