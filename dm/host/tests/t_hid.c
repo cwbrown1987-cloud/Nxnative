@@ -116,7 +116,9 @@ static void t_vibration(void) {
     dm_vibration v = {0.25, 160, 0.5, 320}, got;
     g_mode = 1; ids((uint32_t[]){0, 1, NPAD_HANDHELD}, 3); dm_pad_players(3);
     CHECK(!h_hid_VibPermit() && !h_hid_VibHandles(h, 2, &id, STYLE_FULLKEY), "no sink: no vibration devices");
-    dm_haptics_init(vibration_sink, 1); dm_haptics_route(0, 1); dm_haptics_route(1, 1);
+    dm_haptics_init(vibration_sink, 1);
+    CHECK(h_hid_VibHandles(h, 2, &id, STYLE_FULLKEY) == 2, "handles before the controller's haptics are routed (games ask once, at startup)");
+    dm_haptics_route(0, 1); dm_haptics_route(1, 1);
     CHECK(h_hid_VibPermit() && h_hid_VibHandles(h, 2, &id, STYLE_FULLKEY) == 2, "two vibration motors available");
     CHECK(h[0] == 3 && h[1] == 0x10003, "SDK vibration handle bytes: style 3, npad 0, motors 0 and 1");
     CHECK(!h_hid_VibHandles(h, 2, &id, STYLE_HANDHELD), "wrong controller style gets no motors");

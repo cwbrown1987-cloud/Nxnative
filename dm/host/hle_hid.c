@@ -365,16 +365,28 @@ static void vib_send(const uint32_t *handles, const dm_vibration *values, int n)
     }
     int count = 0;
     for (int k = 0; k < DM_PLAYERS * 2; k++) if (used >> k & 1) updates[count++] = updates[k];
+    static int vlog = -1; if (vlog < 0) vlog = getenv("DM_RUMBLE_LOG") != NULL;
+    if (vlog) {   // DM_RUMBLE_LOG: once a second, how many values the game sent, how many reached no output, and the strongest amplitude
+        static uint64_t sends, dropped, t0; static float peak; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now = ts.tv_sec; sends += n; if (!count) dropped += n;
+        for (int i = 0; i < n; i++) peak = fmaxf(peak, fmaxf(values[i].amplitude_low, values[i].amplitude_high));
+        if (now != t0) { LOG("rumble: %llu values sent, %llu with no output, peak amplitude %.2f, handle %#x", sends, dropped, peak, handles[0]); sends = dropped = 0; peak = 0; t0 = now; }
+    }
     dm_haptics_send(updates, count);
 }
 HLE_FORCE("_ZN2nn3hid20IsVibrationPermittedEv", "vibration permission: enabled and an output available", unsigned, h_hid_VibPermit, void) { return dm_haptics_available() != 0; }
+// Handles do not wait for a controller: games ask once at startup, before GameController reports the pad, and keep the answer (Unicorn Overlord muted rumble for the
+// whole session). On Horizon they are computed from the npad id and style alone (libnx _hidGetVibrationDeviceHandles); vib_send checks for an output at each send.
 HLE_FORCE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "vibration devices of the connected controller",
           int, h_hid_VibHandles, uint32_t *h, int n, const uint32_t *id, uint32_t style) {
-    if (!h || !id || n <= 0 || !(style & style_of(*id))) return 0;
+    if (!h || !id || n <= 0 || !(style & style_of(*id)) || !dm_haptics_enabled()) {
+        if (getenv("DM_RUMBLE_LOG") && id) LOG("rumble: game asked for vibration handles of npad %u style %#x: none (connected style %#x, rumble %s)", *id, style, style_of(*id), dm_haptics_enabled() ? "on" : "off");
+        return 0;
+    }
     uint32_t base = (*id << 8) | (*id == NPAD_HANDHELD ? 4u : 3u);
-    if (!vib_targets(base)) return 0;
     int count = n < 2 ? n : 2;
     for (int i = 0; i < count; i++) h[i] = base | (uint32_t)i << 16;
+    if (getenv("DM_RUMBLE_LOG")) LOG("rumble: game asked for vibration handles of npad %u style %#x: %d, first %#x", *id, style, count, h[0]);
     return count;
 }
 HLE_FORCE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", "vibration: initialize one channel", void, h_hid_InitVib, const uint32_t *h) {
