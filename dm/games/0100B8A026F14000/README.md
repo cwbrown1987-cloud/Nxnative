@@ -34,6 +34,10 @@ The node area cut (1 GB → 62 MB) is the SDK build's own patch (`dm/tools/sdk_p
 
 From a fresh save, the title screen's `New Game`, the difficulty `Normal` and the tutorial's `Yes` lead to the opening and the first field; the field's `Continue` resumes from the save. The keyboard is the Nintendo layout (`J`=A, `K`=B, `U`=X, `I`=Y, `Q`=L, `E`=R, `Z`=ZL, `C`=ZR, the arrow keys are the D-pad, `WASD` the left stick), the same as the Japanese release's.
 
+## The iPhone
+
+The Japanese release plays on an iPhone, with the same memory layout this one now has (`-SwitchVirtualAddressSpaceSize=4064`, a 5 GB block, the node area cut to 62 MB, Unreal's heap on the host's), so this release should go there as well: the guest's 28 GB reservation fits an iPhone's address space where the old 68 GB did not. What is missing is the iOS shader library (the same MSL compiled with the iPhoneos convention, `dmsh_build.py` with `IOSOUT=`) and the Xcode package; the user sideloads and signs it.
+
 ## Open
 
 - **The Eldrake in a battle is drawn at the top right of the screen**, on the window's edge. It is **not** a missing shader: the shaders of the battle are all in the table and in the library (the 517 that the runtime dumps gave, which cover the first battle, are in the table and compiled), and the crystals of the title screen draw correctly. Two candidates are left: the position or the transform of the HD-2D sprite layer on the host, and the Korean release's own assets (this release differs from the Japanese one only in its resources). The host's `DM_CTL` control channel (`shot`, `passdump`, `key` in `dm/host/hle_hid.c`) can dump the render passes of the frame the Eldrake is in, which says which pass draws it.
