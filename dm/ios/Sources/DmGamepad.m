@@ -17,6 +17,7 @@
 #import <CoreMotion/CoreMotion.h>
 #import <CoreText/CoreText.h>
 #include <pthread.h>
+#include <math.h>
 #include "dm.h"
 #include "dm_input.h"
 #include "front.h"
@@ -40,6 +41,24 @@ static void publish(void) {
 }
 
 // ---- Shaking the phone ----
+// The device's own six-axis (handheld mode = the console's sensor, hle_hid.c): CMDeviceMotion's calibrated gyro + gravity, at 100 Hz.
+static CMMotionManager *g_devmot;
+static void devmotion_start(void) {
+    if (g_devmot) return;
+    g_devmot = [CMMotionManager new];
+    if (!g_devmot.deviceMotionAvailable) { LOG("front end: no device motion (no gyroscope)"); g_devmot = nil; return; }
+    g_devmot.deviceMotionUpdateInterval = 1.0 / 100;
+    NSOperationQueue *q = [NSOperationQueue new]; q.qualityOfService = NSQualityOfServiceUserInteractive; q.maxConcurrentOperationCount = 1;
+    [g_devmot startDeviceMotionUpdatesToQueue:q withHandler:^(CMDeviceMotion *d, NSError *err) {
+        if (!d) return;
+        float acc[3] = { (float)(d.gravity.x + d.userAcceleration.x), (float)(d.gravity.y + d.userAcceleration.y), (float)(d.gravity.z + d.userAcceleration.z) };
+        float gyro[3] = { (float)(d.rotationRate.x / (2 * M_PI)), (float)(d.rotationRate.y / (2 * M_PI)), (float)(d.rotationRate.z / (2 * M_PI)) };
+        float quat[4] = { (float)d.attitude.quaternion.x, (float)d.attitude.quaternion.y, (float)d.attitude.quaternion.z, (float)d.attitude.quaternion.w };
+        dm_motion_set(0, acc, gyro, quat, now_ns());
+    }];
+    LOG("front end: the device's gyroscope is the handheld console's six-axis sensor");
+}
+
 // The accelerometer at 60 Hz (no gyroscope, no permission prompt): gravity is followed by a slow low-pass (about 0.8 s), and a sample whose acceleration beyond it exceeds DM_SHAKE_G
 // (1.5 G by default; Documents/env.txt overrides) is a hit. The controller is shaken until 120 ms after the last hit: a flick is one shake (the host finishes it as a whole cycle)
 // and shaking on keeps it going. Holding the phone and pressing the screen stays far below the threshold. Each detected shake is logged with its peak
@@ -165,6 +184,7 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
         [nc addObserver:self selector:@selector(padsChanged) name:GCControllerDidDisconnectNotification object:nil];
         [self padsChanged];
         motion_start();
+        devmotion_start();
     }
     return self;
 }
@@ -437,6 +457,61 @@ static void read_pad(GCExtendedGamepad *g) {
     for (GCController *c in GCController.controllers) if (c.extendedGamepad) {
         any = YES; c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; read_pad(g); };
         read_pad(c.extendedGamepad);
+        GCMotion *mo = c.motion;   // the controller's own six-axis (Pro Controller, DualShock, DualSense): gyro aiming (hle_hid.c six-axis sensor)
+        if (mo) {
+            static int mot_logged; if (!mot_logged++) LOG("front end: controller motion available (%@)", c.vendorName);
+            if (mo.sensorsRequireManualActivation) mo.sensorsActive = YES;
+            mo.valueChangedHandler = ^(GCMotion *m) {
+                // Launcher-adjustable calibration (dm/games/settings.tsv): read on every callback, the controller can connect before the launcher applies its env.
+                // Defaults calibrated on an NS Pro Controller with TOTK bow aiming: pitch and yaw flipped = a 180 deg turn about the vertical axis.
+                const char *e;
+                int ix = (e = getenv("DM_GYRO_INV_X")) ? atoi(e) : 1, iy = (e = getenv("DM_GYRO_INV_Y")) ? atoi(e) : 1, iz = (e = getenv("DM_GYRO_INV_Z")) ? atoi(e) : 0;
+                float gain = (e = getenv("DM_GYRO_GAIN")) ? (float)atof(e) : 1.5f;
+                double sx = ix ? -1 : 1, sy = iy ? -1 : 1, sz = iz ? -1 : 1;
+                float acc[3] = { (float)(sx * m.acceleration.x), (float)(sy * m.acceleration.y), (float)(sz * m.acceleration.z) };
+                float gyro[3] = { (float)(sx * m.rotationRate.x / (2 * M_PI) * gain), (float)(sy * m.rotationRate.y / (2 * M_PI) * gain), (float)(sz * m.rotationRate.z / (2 * M_PI) * gain) };   // rad/s -> revolutions/s
+                // iPadOS fuses no attitude for a controller (GCMotion.attitude stays the identity), so track the orientation here: integrate the gyro
+                // and nudge it toward the accelerometer's gravity near rest (a complementary filter: no drift, just a slow yaw wander with no reference).
+                static double q[4], pt; static int qset;
+                uint64_t t = now_ns();
+                double wx = sx * m.rotationRate.x * gain, wy = sy * m.rotationRate.y * gain, wz = sz * m.rotationRate.z * gain;   // rad/s
+                double an = sqrt((double)acc[0] * acc[0] + (double)acc[1] * acc[1] + (double)acc[2] * acc[2]);
+                if (an > 0.5) {
+                    double ax = acc[0] / an, ay = acc[1] / an, az = acc[2] / an;
+                    if (!qset) {   // first sample: the tilt taking the measured gravity to (0,0,-1), yaw 0
+                        double ux = -ay, uy = ax, un = sqrt(ux * ux + uy * uy);
+                        if (un < 1e-6) { q[0] = q[1] = q[2] = 0; q[3] = 1; }
+                        else { double th = acos(fmax(-1.0, fmin(1.0, -az))), sn = sin(th / 2) / un; q[0] = ux * sn; q[1] = uy * sn; q[2] = 0; q[3] = cos(th / 2); }
+                        qset = 1;
+                    } else {
+                        double dt = pt && t > pt ? (double)(t - pt) / 1e9 : 0; if (dt > 0.05) dt = 0.05;
+                        double dqx = 0.5 * dt * (q[3] * wx + q[1] * wz - q[2] * wy);
+                        double dqy = 0.5 * dt * (q[3] * wy + q[2] * wx - q[0] * wz);
+                        double dqz = 0.5 * dt * (q[3] * wz + q[0] * wy - q[1] * wx);
+                        double dqw = -0.5 * dt * (q[0] * wx + q[1] * wy + q[2] * wz);
+                        q[0] += dqx; q[1] += dqy; q[2] += dqz; q[3] += dqw;
+                        double qn = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]); q[0] /= qn; q[1] /= qn; q[2] /= qn; q[3] /= qn;
+                        if (an > 0.7 && an < 1.3) {   // gravity correction, only near rest (an accelerating controller's acc is not gravity)
+                            double vx = 2 * (q[3] * q[1] - q[2] * q[0]), vy = -2 * (q[3] * q[0] + q[2] * q[1]), vz = 2 * (q[0] * q[0] + q[1] * q[1]) - 1;   // predicted gravity (0,0,-1) in the body frame
+                            double cx = vy * az - vz * ay, cy = vz * ax - vx * az, cz = vx * ay - vy * ax;   // v × a
+                            double s2 = sqrt(cx * cx + cy * cy + cz * cz);
+                            if (s2 > 1e-6) {
+                                double ph = -atan2(s2, vx * ax + vy * ay + vz * az) * 0.02, sn = sin(ph / 2) / s2;   // 2% of the misalignment a sample (~1 s at 60 Hz); negative: the body-frame right-multiplier whose inverse turns v toward a
+                                double cx2 = cx * sn, cy2 = cy * sn, cz2 = cz * sn, cw = cos(ph / 2);
+                                double nx = q[3] * cx2 + q[0] * cw + q[1] * cz2 - q[2] * cy2;
+                                double ny = q[3] * cy2 + q[1] * cw + q[2] * cx2 - q[0] * cz2;
+                                double nz = q[3] * cz2 + q[2] * cw + q[0] * cy2 - q[1] * cx2;
+                                double nw = q[3] * cw - q[0] * cx2 - q[1] * cy2 - q[2] * cz2;
+                                q[0] = nx; q[1] = ny; q[2] = nz; q[3] = nw;
+                            }
+                        }
+                    }
+                }
+                pt = t;
+                float quat[4] = { (float)q[0], (float)q[1], (float)q[2], (float)q[3] };
+                dm_motion_set(1, acc, gyro, quat, t);
+            };
+        } else { static int nm; if (!nm++) LOG("front end: connected controller reports no motion; gyro aiming falls back to the device sensor"); }
     }
     if (!any) { dm_haptics_apple_controller(0, nil); pthread_mutex_lock(&g_mu); g_pad_btn = 0; g_pad_lx = g_pad_ly = g_pad_rx = g_pad_ry = 0; pthread_mutex_unlock(&g_mu); publish(); }
     dispatch_async(dispatch_get_main_queue(), ^{ self->_padOff = any; self->_controls.hidden = any; [self reset]; });
