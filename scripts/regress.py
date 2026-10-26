@@ -90,10 +90,10 @@ def sha256_file(p, h=None):
     return h
 
 
-def digest(paths, extra=b''):   # one SHA-256 over files' names and bytes (missing files count as missing)
+def digest(paths, extra=b''):   # one SHA-256 over files' names (not their folders: the same file in two trees is the same) and bytes; missing files count as missing
     h = hashlib.sha256(extra)
     for p in paths:
-        h.update(str(p).encode() + b'\0')
+        h.update(Path(p).name.encode() + b'\0')
         if Path(p).is_file(): sha256_file(p, h)
         else: h.update(b'missing')
     return h.hexdigest()
@@ -894,7 +894,7 @@ def cmd_check(a, smoke=True):
     games = select(a, smoke=smoke and not a.no_smoke)
     rep = new_report(a, 'check' if smoke else 'chain', baseline=base, candidate=cand)
     rewrite = a.rewrite or rewriter_key(base) != rewriter_key(cand)
-    if rewrite: say('the rewriter differs between the revisions: both rewrite the modules')
+    if rewrite and smoke and not a.no_smoke: say('the rewriter differs between the revisions: both rewrite the modules')
     for g in games:
         t0 = time.time(); gr = rep['games'][g.id] = {'name': g.name, 'status': 'PASS', 'reasons': [], 'known': [], 'secs': {}}
         levels = collections.defaultdict(list)
@@ -1055,6 +1055,7 @@ def main():
     sub.add_parser('list', help='the games, routes and baselines')
     a = ap.parse_args()
     ROOT, GAMES = Path(a.root), Path(a.games_dir)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # a stop runs the finally blocks: a game or a shader build in its own process group is stopped too
     try:
         if a.cmd == 'list': return cmd_list(a)
         ROOT.mkdir(parents=True, exist_ok=True); (ROOT / 'tmp').mkdir(exist_ok=True)

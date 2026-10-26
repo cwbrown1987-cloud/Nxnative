@@ -4,7 +4,7 @@ save	new
 keys	f800:A,f1000:A,f1200:A,f1500:A,f1900:A
 secs	95
 quick	60
-reach	2000@45
+reach	1600@45
 window	46	44
 shots	50,57,90
 hang	20
