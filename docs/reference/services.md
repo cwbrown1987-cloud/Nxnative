@@ -237,10 +237,10 @@ Most service calls can be found before they crash, before the first boot or the 
 
 ### Vibration handles before a controller is reported
 
-- **Symptom:** no rumble for the whole session with a controller that has haptics (a DualSense on the Mac); `DM_RUMBLE_LOG=1` shows the game's handle request answered with none, then every value sent to handle 0 and reaching no output.
+- **Symptom:** `DM_RUMBLE_LOG=1` shows the game's startup handle request answered with none, then every vibration value sent to handle 0 and reaching no output for the whole session, although a controller with haptics (a DualSense on the Mac) is connected. A game that rumbles would stay silent.
 - **Cause:** `hid::GetVibrationDeviceHandles` answered 0 handles until a controller's haptics were routed. Games ask once at startup, before GameController reports the pad, and keep the answer. On Horizon the handles are computed from the npad id and style alone (libnx `_hidGetVibrationDeviceHandles`).
 - **Fix:** the handles no longer wait for a routed output: with rumble on and an output sink installed (`dm_haptics_enabled`), a connected npad style gets its two handles; `vib_send` already checks for an output at each send (`hle_hid.c`). No sink, rumble off or a disconnected npad still get none, and `IsVibrationPermitted` still follows the routed outputs. `DM_RUMBLE_LOG=1` logs the handle requests and, once a second, the values sent, those that reached no output and the peak amplitude.
-- **Found on:** [Unicorn Overlord](../../dm/games/010069401ADB8000/README.md) (the Asian release, `010054B01AD92000`).
+- **Found on:** [Unicorn Overlord](../../dm/games/010069401ADB8000/README.md) (the Asian release, `010054B01AD92000`), in the log only: the game has no rumble of its own (it sends amplitude 0 throughout), so nothing could be felt before or after. Not yet checked on a game that rumbles.
 
 ### Touch gestures recognized from the touch points
 
