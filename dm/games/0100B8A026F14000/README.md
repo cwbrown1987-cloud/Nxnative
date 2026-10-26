@@ -2,6 +2,8 @@
 
 Update 1.0.1 (v65536) over the base game, SDK 20.5.17, NVN, CRIWARE sound and movies. Square Enix's Unreal Engine 5.6.1 (the desktop renderer, `SF_GLSL_SWITCH` shaders). Modules `main`, `subsdk0` (the movie module, which `main` imports from) and `sdk`; `sdk` and `subsdk0` are the builds the Japanese release runs ([0100606026F12000](../0100606026F12000/README.md)).
 
+**Status:** brought up on the Mac: the title, a new game (Normal difficulty), the opening cutscene, the first field, and Continue from a save, at 60 fps with no red line apart from one `texture type mismatch` (the Japanese release's note has the same one). Not yet tested on an iPhone.
+
 **This is the Korean release of the same game: the same code as the Japanese one, with the Korean resources.** The build ID differs (`main` `b7f965b9d7227db8e29f04e84ea7331b` against `84e182f72ee1da4f477804bd05b54c15`) but **every address is the same** — the FMallocBinned3 constructor call (`main+0x137f0`), its object (`main+0x77c6210`), its vtable (`main+0x67df800`) and `rhi.SyncInterval`'s object (`main+0x8adca10`) all match. Everything the Japanese release's profile says holds here; only the build ID and the language (`ko`) differ. The two releases share one `subsdk0` and one `sdk` build.
 
 What the profile needs, and what was found on it, is the Japanese release's note (the mechanisms are the same ones, and this release confirms them on a second build): the Unreal allocator in the host, the IoStore shader libraries, the node area cut, 60 fps. This note lists what is specific to this release.
