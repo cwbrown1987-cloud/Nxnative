@@ -30,6 +30,14 @@ ht -t nca --exefsdir=$W/data/v0/ExeFS --romfsdir=$W/data/v0/RomFS $W/build/nsp/<
 
 **A damaged NSP** (an incomplete copy, a broken download) shows as a hash error while the RomFS is read. `nx_extract` lists every file whose data fails the NCA's hash check and exits with code 3; `--allow-damaged` (the NSP script's `ALLOW_DAMAGED` / `--allow-damaged`) writes them as read and only lists them. To check a whole NCA, its file name is the first 16 bytes of its SHA-256: Super Mario Galaxy's base program NCA hashed differently, with 12 MB runs of zeros near its end (147 MB of damaged RomFS: the two WebM prologue movies), while its update and the small NCAs matched their names.
 
+## A cartridge XCI instead of an NSP
+
+A cartridge image (`.xci`) holds the same NCAs as an NSP, in its own container, and it carries **no ticket**: the NCAs have a zero rights ID, so their key area is encrypted with the key area key from `prod.keys` instead of a title key. No title key is needed at all.
+
+- The layout (a repack from a cart service; the header magic `HEAD` is at 0x100): an HFS0 partition at 0xF000 with the entries `update`, `normal`, `secure`; the `secure` one is another HFS0 that holds the NCAs (the base game's program, control, manual and meta NCAs first, then the update's); a PFS0 at 0x34A00 holds the logo and the startup movie. The NCAs keep their retail file names, which are the first 16 bytes of their SHA-256.
+- The NCA header is AES-128-XTS (data key = `header_key[0:16]`, tweak key = `header_key[16:32]`, one 0x200 sector per tweak value, the sector number as a 128-bit big-endian number). The key area (four 16-byte keys) is AES-ECB encrypted with `key_area_key_application_<master key revision>` from `prod.keys`; on a cartridge the four keys are the same value, and the **third** one is the section key. The sections are AES-128-CTR: the counter is the absolute offset in the NCA divided by 16, and the first half of the IV is the section counter from the FS header (at 0x140 of it), reversed. A section's data starts at `media offset × 0x200`; a PFS0 section's header sits at `pfs0_offset` inside the section (from the FS header at 0x40).
+- To use it with the NSP script, pack the NCAs into PFS0 containers and name the files `<game> [<title id>] [v<version>].nsp` (the script reads the title ID and the version from the name; the DLC gets its own NSP with its own title ID). A retail NSP's PFS0 has **no hash table** and the last word of every file entry is 0 — writing a hash table makes LibHac fail the partition with `ResultFsPartitionSignatureVerificationFailed (2002-4644)`.
+
 ## Workspace layout used so far
 
 The work folder `$W` sits in the game's NSP folder, beside the NSP script's `<title>_build/`, never in the home folder:

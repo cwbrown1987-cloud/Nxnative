@@ -2,6 +2,8 @@
 #include "dm.h"
 #include "front.h"
 #include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
@@ -27,16 +29,23 @@ static void guest_main(void) {
     // (Octopath Traveler 0, main+0x12afc) reads -SwitchVirtualAddressSpaceSize= and its other memory options there
     ((fnp)req("_ZN2nn2os11SetHostArgcEi"))((void *)(uint64_t)g_argc);
     ((fnp)req("_ZN2nn2os11SetHostArgvEPPc"))(g_argv);
+    // DM_OODLE_JOB runs the decoder on the job file before nninitStartup: the job is the game's own Oodle
+    // decoding the game's own files, and a title that does not get past nninitStartup (a new game being
+    // brought up) still needs its shaders decoded (FINAL FANTASY RESONANCE's UE5 IoStore shader cache).
+    { void dm_oodle_job_maybe(void); dm_oodle_job_maybe(); }   // DM_OODLE_JOB: decode a job file with the game's own Oodle and exit (hle_oodle.c, for the offline shader tools)
+    // The order of nn::init::Start (sdk+0x2b0470), as on hardware: nninitStartup, then _init_libc2, then each
+    // module's DT_INIT (the global constructors), then nnMain. Unreal Engine's nninitStartup reads the game
+    // arguments (-SwitchVirtualAddressSpaceSize=) and reserves the engine's address region there; its global
+    // constructors use the region it reserved, so they must not run before it (FINAL FANTASY RESONANCE, where a
+    // global constructor ran first, reserved Unreal's default 62 GB region instead and the game exited).
     LOG(">>> nninitStartup"); ((fn0)req("nninitStartup"))();
     ((fn0)req("_init_libc2"))();
     run_module_inits();   // rtld callback B: each module's DT_INIT (global constructors)
     { void dm_guest_spawn_selftest(void); dm_guest_spawn_selftest(); }   // DM_GUEST_SPAWN_TEST self-test of host-created guest threads (hle_guestthread.c)
     { void dm_oodle_serve_maybe(int); dm_oodle_serve_maybe(1); }   // DM_OODLE_SERVE with a decoder that needs the game's malloc (LZ5, hle_oodle.c)
-    { void dm_oodle_job_maybe(void); dm_oodle_job_maybe(); }   // DM_OODLE_JOB: decode a job file with the game's own Oodle and exit (hle_oodle.c, for the offline shader tools)
     LOG(">>> nnMain"); ((fn0)req("nnMain"))();
     LOG("nnMain returned");
 }
-
 struct dm_flags g_flag;
 uint64_t g_t0_ns;
 static void flags_init(void) {
@@ -95,6 +104,9 @@ static void host_preload(int argc, char **argv) {
     if (!n) { static const char *def[] = DM_GAME_MODULES; for (int k = 0; k < DM_GAME_NMOD && n < MAX_MOD; k++) names[n++] = def[k]; }   // default module list from the game profile's modules (Mario: main sdk)
     load_modules(argv[1], names, n);
     dm_sdk_major();   // logs the SDK version, which SDK-dependent behaviour follows (loader.c)
+    // DM_NVN_SHOT is read by the graphics layer (nvn_mtl.m): <frames comma separated>:<path>, the frame
+    // number replacing a %d in the path.  A second parser here would take the same variable for a
+    // different syntax, and the two would fight over it (one path per frame vs. one path for many).
     uint64_t ta = now_ns();
     probe_install();   // DM_PROBE probes (for diagnostics)
     hid_keys_init();   // DM_KEYS scripted input
@@ -121,7 +133,14 @@ void dm_host_preload_start(int argc, char **argv) {
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);
     if (pthread_create(&g_pre.th, &a, preload_thread, NULL)) die("dm_host_preload_start: cannot start the thread");
 }
+// The .app form (macOS, double-click): dm/host/app_mac.m prepares the window, the save directory, the log and the
+// game files.  That file is Mac only (kept out of the iOS app by the _mac naming convention), so the iOS build
+// leaves the call out (DM_NO_APP_MAC in dm/ios/project.yml: ld64 on iOS refuses an undefined weak symbol).
+
 int main(int argc, char **argv) {
+#ifndef DM_NO_APP_MAC
+    { int dm_app_bootstrap(int *, char ***); dm_app_bootstrap(&argc, &argv); }   // .app 形态（双击起）：把窗口、存档目录、游戏文件、着色器库和日志准备好 | the .app form (double-click): the window, the save directory, the game files, the shader libraries and the log are prepared
+#endif
     if (getenv("DM_PRELOAD")) dm_host_preload_start(argc, argv);   // Exercise the early-start path on Mac (on iOS it is called from the App's main())
     if (atomic_load(&g_pre.started)) {
         pthread_join(g_pre.th, NULL);

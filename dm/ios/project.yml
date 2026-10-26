@@ -50,6 +50,14 @@ targets:
             UIWindowSceneSessionRoleApplication:
               - UISceneConfigurationName: Default
                 UISceneDelegateClassName: SceneDelegate
+    dependencies:
+      # The iOS sources import these frameworks but the host Makefile's compile line (the source of DM_FRAMEWORKS, see tools/gen_build.py) is the macOS one and has no iOS-only framework.
+      # They used to be pulled in by clang's module autolinking; Xcode 27 no longer defaults CLANG_ENABLE_MODULES to YES for the application product type, so they are listed here instead.
+      - sdk: UIKit.framework           # front_ios.m: the window, the view controller, the screen brightness
+      - sdk: AVFAudio.framework        # front_ios.m: AVAudioSession (the macOS host links AudioToolbox instead)
+      - sdk: GameController.framework  # DmGamepad.m: the physical gamepads
+      - sdk: CoreGraphics.framework    # nvn_mtl.m: the frame grabs (CGContext, CGPath, CGRect)
+      - sdk: CoreText.framework        # front_ios.m: CTFont for the shared fonts
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: ${DM_BUNDLE_ID}
       PRODUCT_NAME: DmIOS
@@ -61,7 +69,9 @@ targets:
       TARGETED_DEVICE_FAMILY: "1,2"
       ENABLE_BITCODE: NO
       GCC_C_LANGUAGE_STANDARD: gnu11
-      OTHER_CFLAGS: $(inherited) -mcpu=apple-a18   # The host assembly contains LSE atomic instructions, which the default baseline does not accept
+      OTHER_CFLAGS: $(inherited) -mcpu=apple-a18 -DDM_NO_APP_MAC   # The host assembly contains LSE atomic instructions, which the default baseline does not accept;
+      #   DM_NO_APP_MAC: the .app bootstrap (dm/host/app_mac.m) is macOS only, and ld64 on iOS refuses an undefined weak symbol
       CLANG_ENABLE_OBJC_ARC: YES
+      CLANG_ENABLE_MODULES: YES   # Xcode 27 dropped it from the product type defaults: without it the module autolinking that used to bring in the system frameworks is off
       DEBUG_INFORMATION_FORMAT: dwarf
       GCC_WARN_INHIBIT_ALL_WARNINGS: YES

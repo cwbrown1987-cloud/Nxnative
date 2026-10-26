@@ -81,12 +81,19 @@ def same_shader(a, b):
     n = n if 0x760 <= n <= min(len(ca), len(cb)) else max(len(ca), len(cb))
     return ka == kb and ca[:n] == cb[:n]
 
-def check(where, st, ctl, code):
-    """control section and code area consistent; returns the reason if not"""
+def check(where, st, ctl, code, code_len=None):
+    """control section and code area consistent; returns the reason if not.
+
+    The Switch's control sections hold the code area's length at +0x704.  Some titles (UE5's IoStore
+    shader cache, FINAL FANTASY RESONANCE) put it elsewhere, so the caller can pass the length it
+    found itself; then the +0x704 field is not read."""
     if ctl[:4] != CTL_MAGIC or len(ctl) < ctl_len(ctl): return 'bad control section'
     # a compute code area may have no header (SDK 10's Super Mario 3D World + Bowser's Fury and D2R: instructions start at +0; dmsh_build strips only a 0x12345679 header)
     if st == 'cs' and code[:4] in (CS_MAGIC, GFX_MAGIC) and code[:4] != CS_MAGIC or st != 'cs' and code[:4] != GFX_MAGIC: return 'code area header magic does not match the stage'
-    if struct.unpack_from('<I', ctl, 0x704)[0] != len(code): return 'control +0x704 does not match the code area length'
+    if code_len is None:
+        if struct.unpack_from('<I', ctl, 0x704)[0] != len(code): return 'control +0x704 does not match the code area length'
+    elif code_len != len(code):
+        return f'the code area is {len(code)} bytes, the caller says {code_len}'
     return None
 
 def bnsh_shaders(d, base, label):
@@ -820,10 +827,14 @@ def group(label):
     return 'other'
 
 def ps_inputs(code):
-    """Generic attributes a pixel shader reads: SPH words 6–13 are the input map, 8 bits for each of the 32 attributes (Ryujinx ShaderHeader.ImapTypes), non-zero = read; the translated MSL inputs are exactly user(locn<attribute>)"""
+    """Generic attributes a pixel shader reads: SPH words 6–13 are the input map, 8 bits for each of the 32 attributes (Ryujinx ShaderHeader.ImapTypes), non-zero = read; the translated MSL inputs are exactly user(locn<attribute>)
+
+    The input map is at +0x48 of the code area, so a code area shorter than that has no map to read
+    (some of UE5's shader cache records hold only a few instructions)."""
+    if len(code) < 0x30 + 4 * 14: return set()
     return {i for i in range(32) if struct.unpack_from('<I', code, 0x30 + 4 * (6 + (i >> 2)))[0] >> ((i & 3) * 8) & 0xff}
 
-SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
+SINGLE_STAGE = ('#GLSLC@', '#UE', '#IO', '#MTSPK@', '#MGFX@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records (the .ushaderbytecode archives and the IoStore shader cache), MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
 # and MonoGame's effects, whose passes may name no vertex shader and keep the one bound (Celeste: 10 of its 13 effects draw through SpriteBatch's vertex shader, which is in main)
 def separable_pairs(keys):
     """Single-stage programs (13 Sentinels: each GLSLC output becomes a program with one stage, and BindProgram's stage bits combine vertex and pixel programs per draw; Unreal combines its shaders per draw
@@ -865,6 +876,40 @@ def ue_shaders(d, label):
         if why: red(f'{label}: shader {i} ({st}): {why}')
         out.append((f'{label}#UE{i}', st, ctl, code))
     return out
+
+def io_sph(code):
+    """A graphics code area's stage from its SPH word 0: in UE5's IoStore records the SPH is four bytes into the
+    code area (not 0x30, as in the other games' code areas), and its bits 10..13 are the stage (uepak.py io)"""
+    w = struct.unpack_from('<I', code, 4)[0]
+    return SPH_STAGE.get((w >> 10) & 0xf)
+
+def io_shaders(d, label):
+    """One shader record of UE5's IoStore shader cache (FINAL FANTASY RESONANCE: the .ucas of the game's
+    FFRS/Content/Paks, whose records hold one stage each).  The file is the code area followed by the control
+    section (the magic 0x98761234), as uepak.py io takes them out; the control section is the last 0x880 bytes
+    (the code area itself holds 0x98761234 sequences in its instruction stream, so it cannot be found by
+    searching for the magic).
+
+    The stage is the code area's SPH word 0 (four bytes in, io_sph), with the record's tag in the file name as
+    a fallback: a graphics code area (the magic 0x78563412) holds a pixel shader as well as a vertex one, so
+    the magic only tells graphics from compute."""
+    if len(d) < 0x884 or d[-0x880:-0x87c] != CTL_MAGIC:
+        red(f'{label}: no control section')
+        return []
+    ctl, code = d[-0x880:], d[:-0x880]
+    # the file name carries the stage (uepak.py io names the records <index>_<stage>_<name>.lsg; the Mac host's
+    # shader dump names them the same way), so it is the reliable source: the code area's SPH sits at +4 in the
+    # IoStore records and at +0x30 in the host's dump (the Switch's shader blob, with its 0x30-byte header)
+    m = re.search(r'\d+_(vs|ps|cs|gs|hs|ds)_', os.path.basename(label))
+    st = m.group(1) if m else None
+    if not st:
+        st = 'cs' if code[:4] == CS_MAGIC else io_sph(code) if code[:4] == GFX_MAGIC and len(code) >= 8 else None
+    if not st:
+        red(f'{label}: the stage is not known and the code area has no graphics or compute header')
+        return []
+    why = check(label, st, ctl, code, code_len=len(code))
+    if why: red(f'{label} ({st}): {why}')
+    return [(f'{label}#IO', st, ctl, code)]
 
 def var_pairs(found):
     """(vertex key, pixel key) within the same BNSH variation"""
@@ -965,8 +1010,14 @@ def main():
         # Unreal Engine shader code archives decoded on the Mac (uepak.py): <version dir>/ue_shaders, or DM_UE_SHADERS; needed when the RomFS has Unreal paks
         ued = os.environ.get('DM_UE_SHADERS') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'ue_shaders')
         names = sorted(f for f in os.listdir(ued) if f.endswith('.ushaderbytecode')) if os.path.isdir(ued) else []
-        if not names and uepak.unreal_paks(romfs, legacy=False): red(f'the RomFS has Unreal paks, but there are no decoded shader code archives in {ued} (the NSP script writes them)')
+        # UE5's IoStore shader cache (FINAL FANTASY RESONANCE): the .ucas beside the .utoc holds the shader records, one per shader, each with a code area and a control section.
+        ued2 = os.environ.get('DM_UE_SHADERS_IO') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'ue_shaders_io')
+        names2 = sorted(f for f in os.listdir(ued2) if f.endswith('.lsg')) if os.path.isdir(ued2) else []
+        if not names and not names2 and uepak.unreal_paks(romfs, legacy=False): red(f'the RomFS has Unreal paks, but there are no decoded shader code archives in {ued} (the NSP script writes them)')
         for nm in names: found += ue_shaders(open(os.path.join(ued, nm), 'rb').read(), f'/ue_shaders/{nm}')
+        # UE5's IoStore shader cache (FINAL FANTASY RESONANCE): the .ucas beside the .utoc holds the shader records, one per shader, each with a code area and a control section.
+        # uepak.py io takes them out of the .ucas into <version dir>/ue_shaders_io, one file per shader
+        for nm in names2: found += io_shaders(open(os.path.join(ued2, nm), 'rb').read(), f'/ue_shaders_io/{nm}')
         results.append(('main', {skey(c, k): (w, s, c, k) for w, s, c, k in found}, var_pairs(found), {}))
     zdicts = {k: v for r in romfs_v for k, v in zs_dicts(r).items()}   # Tears of the Kingdom's zstd dictionaries (zs_dicts)
     keys = {}
@@ -1017,8 +1068,13 @@ def main():
         rows.append((name, len(recs[name]), STAGE_NAME[st], key, where)); recs[name].append(bytes(rec)); stat[st] += 1
         if st == 'cs':
             x, y, z = struct.unpack_from('<3I', ctl, 0x748); sh = struct.unpack_from('<I', ctl, 0x754)[0]
-            if not x * y * z: red(f'compute shader {key}: control +0x748 thread group is 0 ({where})')
-            facts[key] = {'local': [x, y, z], 'shared': (sh + 15) // 16 * 16}
+            if not x * y * z:
+                # UE5's shader cache leaves the thread group empty (the engine dispatches the compute
+                # shaders indirectly, with the group size in the dispatch itself): the answer is unknown
+                # rather than wrong, so the translator keeps its default
+                facts[key] = {'local': None, 'shared': 0}
+            else:
+                facts[key] = {'local': [x, y, z], 'shared': (sh + 15) // 16 * 16}
     for name, rr in recs.items():
         with open(os.path.join(pkg, name), 'wb') as f: f.write(b''.join(rr))
     with open(mapout, 'w') as f:

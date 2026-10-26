@@ -64,6 +64,7 @@ typedef int32_t (*lz5_fn)(const void *, void *, int32_t, int32_t);
 
 // The decoder main has: LZ5 when main exports LZ5_decompress_safe, else Oodle (the one function that references its name)
 static struct { const char *name; oodle_fn oodle; lz5_fn lz5; uint64_t off; } g_dec;
+static int g_fuzz_safe = 1;   // the decoder's fuzz-safe flag: a job can ask for 0 (UE5's IoStore blocks)
 static void dec_find(const char *mode) {
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) {
         void *p = module_sym(&g_mod[i], "LZ5_decompress_safe");
@@ -74,7 +75,9 @@ static void dec_find(const char *mode) {
 }
 static int64_t dec_run(const void *c, int64_t cl, void *r, int64_t rl, void *scratch, int64_t scratch_n) {
     if (g_dec.lz5) return cl > INT32_MAX || rl > INT32_MAX ? -1 : g_dec.lz5(c, r, (int32_t)cl, (int32_t)rl);
-    return g_dec.oodle(c, cl, r, rl, 1, 0, 0, NULL, 0, NULL, NULL, scratch, scratch_n, 3);   // fuzz safe, no CRC check, silent, unthreaded
+    // fuzz safe (1) unless the job says otherwise: UE5's IoStore shader cache (FINAL FANTASY RESONANCE) holds
+    // blocks a fuzz-safe decoder refuses ("a compressor that can't decode Safe"), so its job asks for fuzzSafe 0
+    return g_dec.oodle(c, cl, r, rl, g_fuzz_safe, 0, 0, NULL, 0, NULL, NULL, scratch, scratch_n, 3);   // no CRC check, silent, unthreaded
 }
 
 static uint32_t rd32(FILE *f) { uint32_t v = 0; if (fread(&v, 4, 1, f) != 1) die("DM_OODLE_JOB: the job file ends early"); return v; }
@@ -87,6 +90,12 @@ void dm_oodle_job_maybe(void) {
     FILE *in = fopen(job, "rb"); if (!in) die("DM_OODLE_JOB: cannot open %s", job);
     if (rd32(in) != 0x4a4f4d44) die("DM_OODLE_JOB: %s is not a job file", job);
     uint32_t n = rd32(in);
+    // The decoder's fuzz-safe flag: the data is not fuzz-safe when the job says so (UE5's IoStore shader
+    // cache blocks, FINAL FANTASY RESONANCE: "a compressor that can't decode Safe"). The job file's count
+    // word carries it in bit 31; a job without it (every other title) keeps the default. DM_OODLE_UNSAFE=1
+    // sets it from the environment instead.
+    if (n & 0x80000000u) { g_fuzz_safe = 0; n &= 0x7FFFFFFFu; }
+    if (getenv("DM_OODLE_UNSAFE")) g_fuzz_safe = 0;
     char outp[1024]; snprintf(outp, sizeof outp, "%s.out", job);
     FILE *out = fopen(outp, "wb"); if (!out) die("DM_OODLE_JOB: cannot write %s", outp);
     uint32_t hdr[2] = {0x524f4d44, n}; fwrite(hdr, 4, 2, out);

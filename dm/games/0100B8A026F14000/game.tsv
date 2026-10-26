@@ -1,0 +1,50 @@
+# FINAL FANTASY RESONANCE: Square Enix / Lancarse, Unreal Engine 4 (the HD-2D engine: 2D sprites on a 3D scene), SDK 20.5.17, NVN, CRIWARE sound and movies; update 1.0.1 (v65536).
+# The card is a Switch 1 cartridge (the game also ships for Switch 2): its secure partition holds the base game, the update and one DLC (a licence only).
+
+# ---- Identity ----
+title_id	0100B8A026F14000
+program_id	0100B8A026F14000
+
+# ---- App ----
+# the on-screen gamepad of the iPhone app: the full layout (D-pad, right stick, L3 / R3) as the other Switch titles
+pad_layout	full
+name	FINAL FANTASY RESONANCE
+ipa	FinalFantasyResonance.ipa
+app_category	public.app-category.role-playing-games
+# the card is the Korean release: the game has ko, zh-Hant and zh-Hans
+language	ko
+
+# ---- Versions ----
+build	v65536	1.0.1	main=b7f965b9d7227db8e29f04e84ea7331b	subsdk0=ab62fe8edd07a6a293f885d54359e559	sdk=0023a1b06130cd795f7bc4613772af0a
+package	v65536
+shader_versions	v65536
+
+# ---- Files ----
+# subsdk0 is NintendoSDK_movie (main imports from it)
+modules	main subsdk0 sdk
+romfs_marker	FFRS/Content/Paks/FFRS-Switch.ucas
+zip_store	.pak:.ucas:.utoc:.ttf:.txt:.usm:.metallib
+
+# ---- Memory ----
+# Unreal Engine: nninitStartup reserves one address region for the whole engine (62 GB by default, the engine's own value) and the engine's FMallocBinned3 takes 38 GB of it
+# (main+0xae82c: the size 0x980000000 is hardcoded in the game and does not follow -SwitchVirtualAddressSpaceSize=, so that switch cannot help).
+# The engine's own address region is capped to 40 GB (-SwitchVirtualAddressSpaceSize= in MB: the 38 GB pool has to fit in it, the SDK's
+# 1 GB node area is taken from the alias region before it, and regions of 1 GB and more are 1 GB aligned), and the alias region is 44 GB (the 62 GB region, 1 GB aligned) with a 48 GB reservation.
+# The sizes are cut down from 64/68 GB so that the one mmap the host makes for the whole guest address space fits in an iPhone's address space: with the
+# com.apple.developer.kernel.extended-virtual-addressing entitlement (the kernel's jumbo mode) an app gets 64 GB of address space, without it about 2-7 GB (the
+# engine's 38 GB does not fit and the host dies with "reserve guest AS").
+mem_reserve	0x10A0000000
+mem_alias	0x1000000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 20 MB of system resource
+sys_resource	0x1400000
+# the shaders' texture handles: some of them are dynamic (the translator cannot trace them to one slot), the
+# game picks them from the c2 tables at run time
+tex_dyn_slots	on
+
+# ---- Shader split ----
+# The shaders are UE5's shader cache records in the .ucas of the IoStore (FFRS/Content/Paks/FFRS-Switch.ucas), not in a .ushaderbytecode archive: each record holds
+# one stage's code area and control section (uepak.py io, the same LSLG records as Octopath Traveler 0's archives)
+shader_groups	FFRS-Switch.ucas=ffrs
+shader_note	FINAL FANTASY RESONANCE shaders

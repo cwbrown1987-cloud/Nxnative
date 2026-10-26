@@ -138,6 +138,15 @@ CUTS = {
     (0x145bfc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
     (0x145c68, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
+  # FINAL FANTASY RESONANCE 1.0.1 (v65536) sdk (SDK 20.5.17, the same build as STEINS;GATE RE:BOOT's, which has no virtual address memory and never makes an address region, so the cut is inert there):
+  # the same node area cut. Unreal's nninitStartup (main+0x13370) reads -SwitchVirtualAddressSpaceSize= from the game arguments and reserves that region with
+  # nn::os::AllocateAddressRegion (main+0x137d0); without the cut the 1 GB node area that the AddressRegionManager constructor (sdk+0x145cac) carves out of the start of the alias
+  # region leaves less room than the 4064 MB the engine asks for, and the call fails with 0x1803 (the region list walk in VammManager::AllocateAddressRegion, sdk+0x145da0).
+  # The constructor is at sdk+0x145cac (limit = alias start + 0x3fe00000 at +0x28, a unit heap of 0x30-byte nodes, the area then registered as occupied at +0x145d28)
+  '0023a1b06130cd795f7bc4613772af0a': [
+    (0x145cbc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0x145d28, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+  ],
   # Super Mario Galaxy 1.3.1 / Super Mario Galaxy 2 1.4.0 sdk (SDK 18.3.5, the same build in both): the same node area cut. Galaxy 2's movie player initializes its StandardAllocator with
   # virtual address memory (main+0x62c280: Initialize(nullptr, 384 MB)), which aborted at its CentralHeap::Init: a 256 MB alias region holds no region after a 1 GB node area.
   # The constructor is at sdk+0x13be3c (limit = alias start + 0x3fe00000 at +0x28, a unit heap of 0x30-byte nodes, the area then registered as occupied at +0x13bee0)
@@ -878,6 +887,15 @@ def disasm_fn(fa, fb):
         l = list(md.disasm(bytes(IMG[a:fb]), a))
         out += l; a = (l[-1].address + 4 if l else a) + 4
     return out
+def disasm_back(a, n=64):
+    """The n instructions before a, decoded backwards from a. A jump table's setup can sit before the
+    function that the eh_frame table names: the compiler puts the table and the br at the end of the
+    previous function's code, and the FDE starts at the br (FINAL FANTASY RESONANCE main+0x219234:
+    adr x18,#0x219238; ldrb w0,[x17,x16]; add x18,x18,x0,lsl #2; br x18, with the adr and the ldrb
+    before the FDE's start, so the function's own instructions do not hold the table)."""
+    lo = max(0, a - n * 4)
+    out = list(md.disasm(bytes(IMG[lo:a]), lo))
+    return out
 funcs = sorted({func_of(a) for a, (k, _) in kinds.items() if k == 'x18'})
 for fa, fb in funcs:
     insl = disasm_fn(fa, fb)
@@ -905,6 +923,16 @@ for fa, fb in funcs:
                 if not tgt and tail_call(insl, j): tailcalls.add(ins.address); continue
                 if not tgt and (far := jump_bytes_far(insl, j)): jumps[ins.address] = far; continue
                 if not tgt: tgt = jump_offsets(insl, j, copy_first=True)   # the index copied before the check (check_before_copy), only where every other form failed
+                if not tgt:
+                    # the table's setup can sit before the function the eh_frame table names: the compiler
+                    # ends the previous function with the table and the br, and the FDE starts at the br
+                    # (FINAL FANTASY RESONANCE main+0x219234). The br is then the function's first
+                    # instruction, so the function's own instructions do not hold the table.
+                    back = disasm_back(ins.address)
+                    ext = back + insl[:j + 1]
+                    if (far := jump_bytes_far(ext, len(ext) - 1)): jumps[ins.address] = far; continue
+                    if (far := jump_offsets(ext, len(ext) - 1)): tabjumps[ins.address] = far; continue
+                    if (far := jump_adr_offsets(ext, len(ext) - 1)): tabjumps[ins.address] = far; continue
                 assert tgt, f'jump table {ins.address:x}'
                 tabjumps[ins.address] = tgt; continue
             jumps[ins.address] = (base, width)
