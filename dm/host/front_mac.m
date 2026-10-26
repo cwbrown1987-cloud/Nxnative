@@ -3,7 +3,8 @@
 // The window is fullscreen-capable (the green button and ⌃⌘F); DM_FULLSCREEN starts it that way. ⌘Q quits; the left mouse button is the touchscreen.
 // Keyboard and mouse controls (a game whose stubs turn the camera by the mouse, hle.h dm_mouse_camera) are on from the start, ` switches to the classic keys and back. A click in the
 // window captures the mouse (cursor hidden and held still); leaving the window (⌘Tab) or ` lets it go. The keyboard takes a PC layout (kbm_bit) and the captured mouse turns the camera by angle (raw counts from GCMouse to dm_mouse_move): WASD left stick, left click Y,
-// right click ZL, middle click R3, F ZR, Space X, Shift B, E or Return A, Q L, G R, Ctrl or C L3, 1-4 D-pad up / right / down / left, Tab or M −, Esc +, arrows D-pad.
+// right click ZL, middle click R3, F ZR, Space X, Shift B, E or Return A, Q L, G R, Ctrl or C L3, 1-4 D-pad up / right / down / left (while one is held WASD is the right
+// stick, which picks in the quick menus), Tab or M −, Esc + (in the pause menu and the Purah Pad E is R, left click A, right click B; while aiming right click is B), arrows D-pad.
 // Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
 // Controllers: buttons by position as on the iPhone (right A, bottom B, top X, left Y), shoulders L R, triggers ZL ZR, Menu + Options −, both sticks and their presses.
 // Each controller is a player of its own (local co-op): the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (pad_slots.h);
@@ -86,14 +87,16 @@ void front_screen_match(int fps) {
     g_match_want = fps; dispatch_async(dispatch_get_main_queue(), ^{ screen_match_apply(); });
 }
 static uint64_t g_mbtn;   // buttons held on the captured mouse
+static int g_kbm;   // keyboard and mouse controls (below)
 static void push(void) {
     int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
-    dm_input_set(g_btn | g_mbtn, lx, ly, 0, 0);
+    if (g_kbm && (g_btn & (DM_BTN_UP | DM_BTN_RIGHT | DM_BTN_DOWN | DM_BTN_LEFT))) dm_input_set(g_btn | g_mbtn, 0, 0, lx, ly);   // a held D-pad opens a quick menu, picked with the right stick
+    else dm_input_set(g_btn | g_mbtn, lx, ly, 0, 0);
 }
 // Keyboard and mouse controls (main thread), on from the start when the game's patch reads mouse counts (dm_mouse_camera); ` switches between them and the classic keys.
 // A click in the window captures the mouse: the cursor is hidden and detached from it, and it reaches the game only as camera movement and its buttons; leaving the window
 // (input_release) or ` gives the cursor back
-static int g_kbm, g_mouse_cap;
+static int g_mouse_cap;
 static float g_mrx, g_mry;   // fractions of a count carried to the next movement
 static void mouse_capture(int on) {
     if (on == g_mouse_cap || (on && !dm_mouse_camera())) return;
@@ -116,9 +119,14 @@ static void mouse_moved(float dx, float dy) {
     g_mrx -= ix; g_mry -= iy;
     if (ix || iy) dm_mouse_move(ix, iy);
 }
-static void mouse_button(uint64_t bit, int down) {
+static int menu_open(void);
+// Mouse button n (0 left, 1 right, 2 middle): Y, ZL, R3; in the menus left is A and right B, and while aiming (the game's camera 2, Tears of the Kingdom's bow and throw)
+// right is B, which puts the weapon away. Its release lets go of what its press pressed
+static void mouse_button(int n, int down) {
+    static uint64_t held[3];
     if (!g_mouse_cap || !g_input_on) return;
-    g_mbtn = down ? (g_mbtn | bit) : (g_mbtn & ~bit); push();
+    if (down) { int m = menu_open(); held[n] = n == 0 ? (m ? DM_BTN_A : DM_BTN_Y) : n == 1 ? (m || dm_mouse_camera_kind() == 2 ? DM_BTN_B : DM_BTN_ZL) : DM_BTN_RS; }
+    g_mbtn = down ? (g_mbtn | held[n]) : (g_mbtn & ~held[n]); push();
 }
 static int key_bit(unsigned short code) {
     switch (code) {
@@ -141,6 +149,15 @@ static int kbm_bit(unsigned short code) {
     }
     return -1;
 }
+// The menus (Esc → + the pause menu, Tab or M → − the Purah Pad): while one is open E is R, so Q and E switch its tabs (L / R). The host does not see the game's menus: the key
+// that opened one closes it, the other key switches to the other menu (it stays open), and it counts as closed once the camera runs again (dm_mouse_camera_idle: the
+// game's cameras stand still in the menus), which also catches a menu closed with B
+static int g_menu; static double g_menu_t;   // g_menu: the button of the open menu (DM_BTN_PLUS or DM_BTN_MINUS), 0 when none
+static int menu_open(void) {
+    if (g_menu && CACurrentMediaTime() - g_menu_t > 0.5 && dm_mouse_camera_idle() < 0.1) g_menu = 0;
+    return g_menu;
+}
+static uint64_t g_kmask[128];   // the button each key pressed, released by its key-up even if the layout changed in between
 static void on_flags(NSEvent *e) {
     if (!g_input_on || !g_kbm) return;
     NSEventModifierFlags f = e.modifierFlags;
@@ -153,8 +170,14 @@ static void on_key(NSEvent *e, int down) {
     if (c == 50 || c == 10) { if (down && dm_mouse_camera()) kbm_set(!g_kbm); return; }   // ` (§ beside it on ISO keyboards) switches between the two layouts
     switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }
     if (g_kbm) {
-        int kb = kbm_bit(c); uint64_t km = kb >= 0 ? 1ull << kb : 0;
-        g_btn = down ? (g_btn | km) : (g_btn & ~km); push(); return;
+        if (down && (c == 53 || c == 48 || c == 46)) {
+            int m = c == 53 ? DM_BTN_PLUS : DM_BTN_MINUS;
+            if (menu_open() == m) g_menu = 0; else { g_menu = m; g_menu_t = CACurrentMediaTime(); }
+        }
+        int kb = c == 14 && down && menu_open() ? 7 : kbm_bit(c);   // E: R in the pause menu
+        if (c >= 128) return;
+        if (down) g_kmask[c] = kb >= 0 ? 1ull << kb : 0;
+        g_btn = down ? (g_btn | g_kmask[c]) : (g_btn & ~g_kmask[c]); push(); return;
     }
     int b = key_bit(c);
     uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : 0;   // Space: shaken while held
@@ -247,14 +270,14 @@ static void pads_start(void) {
 @interface DmGameView : NSView @end
 @implementation DmGameView
 - (void)mouseDown:(NSEvent *)e {
-    if (g_mouse_cap) mouse_button(DM_BTN_Y, 1);
+    if (g_mouse_cap) mouse_button(0, 1);
     else if (g_kbm) { if (g_input_on) mouse_capture(1); }   // the click that captures the mouse is not an attack
     else [self mouseDragged:e];
 }
-- (void)rightMouseDown:(NSEvent *)e { (void)e; mouse_button(DM_BTN_ZL, 1); }
-- (void)rightMouseUp:(NSEvent *)e { (void)e; mouse_button(DM_BTN_ZL, 0); }
-- (void)otherMouseDown:(NSEvent *)e { if (e.buttonNumber == 2) mouse_button(DM_BTN_RS, 1); }
-- (void)otherMouseUp:(NSEvent *)e { if (e.buttonNumber == 2) mouse_button(DM_BTN_RS, 0); }
+- (void)rightMouseDown:(NSEvent *)e { (void)e; mouse_button(1, 1); }
+- (void)rightMouseUp:(NSEvent *)e { (void)e; mouse_button(1, 0); }
+- (void)otherMouseDown:(NSEvent *)e { if (e.buttonNumber == 2) mouse_button(2, 1); }
+- (void)otherMouseUp:(NSEvent *)e { if (e.buttonNumber == 2) mouse_button(2, 0); }
 - (void)mouseDragged:(NSEvent *)e {
     if (!g_input_on || g_kbm) return;
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil]; NSSize b = self.bounds.size;
@@ -265,7 +288,7 @@ static void pads_start(void) {
     dm_touch t = {0, (float)fmin(fmax((p.x - x0) / w, 0), 0.999), (float)fmin(fmax(1 - (p.y - y0) / h, 0), 0.999)};   // The AppKit view origin is at bottom left, the touchscreen origin is at top left
     dm_touch_set(&t, 1); g_mouse_down = 1;
 }
-- (void)mouseUp:(NSEvent *)e { (void)e; mouse_button(DM_BTN_Y, 0); if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); } }
+- (void)mouseUp:(NSEvent *)e { (void)e; mouse_button(0, 0); if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); } }
 // The drawable follows the view in pixels: a layer assigned to a layer-backed view kept the drawable at the first window's 1280x720 in fullscreen too, so the game picture was
 // scaled down to it and up again by the compositor
 - (void)fitDrawable {
