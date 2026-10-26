@@ -93,6 +93,12 @@ check_t_perf_order: t_perf_order
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_perf_order
 	DM_NVN_FAST_WAKE=0 DM_NVN_SLICE_MERGE=0 DM_NVN_CS_HOIST=0 MTL_DEBUG_LAYER=1 ./t_perf_order
 run: check_t_perf_order
+t_link_ticks: t_link_ticks.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_link_ticks.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_link_ticks
+check_t_link_ticks: t_link_ticks
+	./t_link_ticks
+run: check_t_link_ticks
 t_cube_placeholder: t_cube_placeholder.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_cube_placeholder.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_cube_placeholder
