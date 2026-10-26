@@ -1,6 +1,9 @@
 // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard and controllers → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // The window is fullscreen-capable (the green button and ⌃⌘F); DM_FULLSCREEN starts it that way. ⌘Q quits; the left mouse button is the touchscreen.
+// Overlay panel at the window's top right (DmHudPanel), off until the player turns it on: the frame rate, the shaders and render pipelines new to this device, the CPU / GPU load
+// and a shortcut reminder. Key 1 (the top-row key, never a game input) or F8 cycles it off → all → FPS only → off, remembered across runs; the Window menu item does the same and
+// names the mode. DM_MENUBAR_FPS=1 also shows the frame rate in the menu bar.
 // Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
 // Controllers: buttons by position as on the iPhone (right A, bottom B, top X, left Y), shoulders L R, triggers ZL ZR, Menu + Options −, both sticks and their presses.
 // Each controller is a player of its own (local co-op): the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (pad_slots.h);
@@ -15,6 +18,8 @@
 #include "hle.h"
 #include "pad_slots.h"
 #include "haptics_apple.h"
+#include "hud_text.h"
+#include "sysload.h"   // the load sampler (sysload_mac.c)
 #include <signal.h>
 #include <math.h>
 
@@ -22,6 +27,104 @@ static CAMetalLayer *g_layer;
 static uint64_t g_btn;
 static int g_w, g_a, g_s, g_d;
 static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
+// Overlay panel (DM_WINDOW runs, hidden until key 1 / F8): a box at the window's top right with the HUD lines (hud_text_mac.c formats them from nvn_mtl.m's
+// mtl_hud_snapshot and sysload_mac.c's load sampler) above a shortcut reminder. A subview of the game's own Metal view, composited by WindowServer: no extra window,
+// and nothing of it enters the drawable, so the host's own screenshots (shot(), DM_NVN_SHOT) never show it; a macOS window capture does. A 0.5 s main-thread timer polls and formats; AppKit stays on the main thread.
+@interface DmHudPanel : NSView
+@property(strong) NSTextField *label; @property(strong) NSTimer *timer; @property(copy) NSAttributedString *text; @property NSSize textSize;
+- (void)refresh; - (void)position;
+@end
+static DmHudPanel *g_hud;
+static NSMenuItem *g_hud_item, *g_fps_bar;   // the Window menu's "Overlays: <mode>"; the menu bar's frame rate (only with DM_MENUBAR_FPS=1)
+static int g_hud_mode = HUD_OFF;             // hud_text.h HUD_*; main thread only (the renderer is not gated by it, the panel just leaves lines out)
+static NSString *const g_hud_key = @"DmOverlayMode";   // NSUserDefaults: the mode as hud_text.h numbers it (0 off, 1 all, 2 FPS only)
+static void hud_line(NSMutableAttributedString *a, const char *t, int hl) {   // one HUD line and its newline: green, yellow while hl (something new in the last 3 s)
+    static NSDictionary *green, *yellow;
+    if (!green) {
+        NSFont *mono = [NSFont monospacedSystemFontOfSize:10.5 weight:NSFontWeightMedium];
+        green = @{NSFontAttributeName: mono, NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:80/255.0 green:1 blue:120/255.0 alpha:1]};
+        yellow = @{NSFontAttributeName: mono, NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:1 green:230/255.0 blue:40/255.0 alpha:1]};
+    }
+    [a appendAttributedString:[[NSAttributedString alloc] initWithString:[(@(t) ?: @"") stringByAppendingString:@"\n"] attributes:hl ? yellow : green]];
+}
+
+@implementation DmHudPanel
+- (instancetype)initWithFrame:(NSRect)frame {
+    if (!(self = [super initWithFrame:frame])) return nil;
+    self.wantsLayer = YES; self.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;   // frame-based: keeps the top-right corner while the window resizes
+    CALayer *l = self.layer; l.zPosition = 10; l.cornerRadius = 7; l.borderWidth = 1;
+    l.backgroundColor = [NSColor colorWithCalibratedWhite:0.04 alpha:0.72].CGColor; l.borderColor = [NSColor colorWithCalibratedWhite:1 alpha:0.14].CGColor;
+    NSTextField *t = self.label = [NSTextField labelWithString:@""];
+    t.alignment = NSTextAlignmentLeft; t.lineBreakMode = NSLineBreakByClipping; t.maximumNumberOfLines = 0; t.selectable = NO;
+    t.accessibilityLabel = @"Performance overlay";
+    [self addSubview:t];
+    __weak DmHudPanel *weak = self;   // the run loop keeps the timer; the timer must not keep the panel
+    self.timer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *tm) { DmHudPanel *s = weak; if (s) [s refresh]; else [tm invalidate]; }];
+    [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];   // common modes: it keeps going while a menu is open or the window is resized
+    return self;
+}
+- (NSView *)hitTest:(NSPoint)p { (void)p; return nil; }   // clicks reach the game (the touchscreen) beneath the panel
+- (BOOL)acceptsFirstResponder { return NO; }
+- (void)viewDidMoveToSuperview { [super viewDidMoveToSuperview]; [self position]; }
+- (void)layout { [super layout]; [self position]; }
+- (void)position {   // the text's size plus the padding, 10 pt from the top-right corner of the safe area (the camera housing in fullscreen)
+    NSView *v = self.superview; if (!v) return;
+    NSEdgeInsets safe = v.safeAreaInsets; NSSize b = v.bounds.size, z = self.textSize;
+    CGFloat w = z.width + 16, h = z.height + 10;
+    NSRect f = NSMakeRect(floor(b.width - w - 10 - safe.right), floor(b.height - h - 10 - safe.top), w, h), in = NSMakeRect(8, 5, z.width, z.height);
+    if (!NSEqualRects(self.frame, f)) self.frame = f;
+    if (!NSEqualRects(self.label.frame, in)) self.label.frame = in;
+}
+- (void)refresh {   // main thread: every 0.5 s, and at once on a mode change
+    mtl_hud_info h; mtl_hud_snapshot(&h);
+    if (g_fps_bar) { char rates[48]; hud_rate_text(rates, sizeof rates, h.fps, h.presented_fps); NSString *fps = @(rates);
+        if (![g_fps_bar.title isEqualToString:fps]) { g_fps_bar.title = fps; g_fps_bar.submenu.title = fps; } }   // the menu bar follows every mode
+    int mode = g_hud_mode;
+    // Off is really hidden, not just empty, so fullscreen can go back to the compositor's direct path; before the first present the panel waits too (key 1 still sets the mode)
+    if (mode == HUD_OFF || mtl_present_count() == 0) { self.hidden = YES; return; }
+    NSMutableAttributedString *a = [NSMutableAttributedString new]; char t[256];
+    hud_frame_text(t, sizeof t, h.fps, h.presented_fps, h.out_w, h.out_h, h.scene_w, h.scene_h); hud_line(a, t, 0);   // never highlighted
+    if (mode == HUD_ALL) {
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), newest = MAX(h.shader_new_ns, h.pipeline_new_ns);   // now after the snapshot: never before newest
+        int hl = newest && now - newest < 3000000000ull;   // yellow for 3 s after the last new shader or pipeline
+        hud_shader_text(t, sizeof t, h.shader_new, h.shader_total); hud_line(a, t, hl);
+        hud_pipeline_text(t, sizeof t, h.pipeline_new, h.pipeline_total); hud_line(a, t, hl && h.pipeline_new_ns >= h.shader_new_ns);   // only when a pipeline was the newest
+        dm_sysload_start();   // once (pthread_once), the first time the load line is due: a run that never shows "all" never starts the sampler thread
+        dm_sysload l; if (dm_sysload_get(&l)) { hud_load_text(t, sizeof t, &l); hud_line(a, t, 0); }   // left out until the first sample
+        NSMutableDictionary *at = [@{NSFontAttributeName: [NSFont systemFontOfSize:10], NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.75 alpha:1]} mutableCopy];
+        if (a.length) { NSMutableParagraphStyle *gap = [NSMutableParagraphStyle new]; gap.paragraphSpacingBefore = 4; at[NSParagraphStyleAttributeName] = gap; }   // a gap under the HUD lines
+        NSString *keys = @"Shortcuts\n1  Overlays: all → FPS only → off (F8 too)\n⌃⌘F  Full screen";
+        [a appendAttributedString:[[NSAttributedString alloc] initWithString:keys attributes:at]];
+    } else [a deleteCharactersInRange:NSMakeRange(a.length - 1, 1)];   // FPS only: that one line without the newline under it
+    if (![a isEqual:self.text]) {   // compared with what was set, not label.attributedStringValue, which may come back with the cell's own attributes added
+        self.text = a; self.label.attributedStringValue = a;
+        NSSize z = [self.label sizeThatFits:NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX)]; self.textSize = NSMakeSize(ceil(z.width), ceil(z.height));
+        [self position];
+    }
+    self.hidden = NO;   // shown only with the new text in place
+}
+@end
+
+static void hud_apply(int mode, int persist) {   // main thread: show a mode (persist: remember it for the next run)
+    g_hud_mode = mode;
+    g_hud_item.title = mode == HUD_ALL ? @"Overlays: All" : mode == HUD_MINIMAL ? @"Overlays: FPS Only" : @"Overlays: Off";
+    if (persist) [NSUserDefaults.standardUserDefaults setInteger:mode forKey:g_hud_key];
+    [g_hud refresh];
+    LOG("front end: overlays %s (1 or F8 cycles)", hud_mode_name(mode));
+}
+static void hud_cycle(void) { hud_apply(hud_mode_next(g_hud_mode), 1); }   // key 1, F8 and the Window menu: all → FPS only → off → all
+static void hud_setup(NSView *view) {   // front_run: the remembered mode (off on a first run) and the panel (hidden until the first present)
+    NSInteger m = [NSUserDefaults.standardUserDefaults integerForKey:g_hud_key];   // 0 when never set
+    g_hud_mode = m == HUD_ALL || m == HUD_MINIMAL ? (int)m : HUD_OFF;   // any other value (edited by hand) is off
+    g_hud = [[DmHudPanel alloc] initWithFrame:NSZeroRect]; g_hud.hidden = YES;
+    [view addSubview:g_hud positioned:NSWindowAbove relativeTo:nil];
+}
+static void hud_menubar_fps(NSMenu *bar) {   // the live frame rate as a menu of its own between the app menu and Window (hidden with the menu bar in fullscreen)
+    NSMenu *m = [[NSMenu alloc] initWithTitle:@"FPS --"]; m.autoenablesItems = NO;
+    [m addItemWithTitle:@"Live frame rate (DM_MENUBAR_FPS=1)" action:nil keyEquivalent:@""].enabled = NO;
+    g_fps_bar = [[NSMenuItem alloc] initWithTitle:@"FPS --" action:nil keyEquivalent:@""]; g_fps_bar.submenu = m;
+    [bar insertItem:g_fps_bar atIndex:1];
+}
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 static _Atomic int g_screen_fps;   // the window's screen's maximumFramesPerSecond, kept up to date when the window moves to another screen
@@ -189,6 +292,7 @@ static void pads_start(void) {
 // not a window-wide event monitor, so clicks on the title bar, the window buttons and the resize edges still reach AppKit.
 @interface DmGameView : NSView @end
 @implementation DmGameView
+- (void)cycleOverlays:(id)sender { (void)sender; hud_cycle(); }
 - (void)mouseDown:(NSEvent *)e { [self mouseDragged:e]; }
 - (void)mouseDragged:(NSEvent *)e {
     if (!g_input_on) return;
@@ -209,8 +313,8 @@ static void pads_start(void) {
     NSSize px = [self convertSizeToBacking:self.bounds.size]; if (px.width < 1 || px.height < 1 || CGSizeEqualToSize(l.drawableSize, px)) return;
     l.drawableSize = px; LOG("front end: drawable %.0fx%.0f", px.width, px.height);
 }
-- (void)setFrameSize:(NSSize)s { [super setFrameSize:s]; [self fitDrawable]; }
-- (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self fitDrawable]; }
+- (void)setFrameSize:(NSSize)s { [super setFrameSize:s]; [self fitDrawable]; [g_hud position]; }   // the panel follows the corner and the safe area
+- (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self fitDrawable]; [g_hud position]; }
 @end
 
 typedef struct { void (*fn)(void); } guest_arg;
@@ -245,6 +349,7 @@ void front_run(void (*guest)(void)) {
         g_layer.contentsScale = win.backingScaleFactor;
         if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
         v.layer = g_layer; [(DmGameView *)v fitDrawable];
+        hud_setup(v);   // the overlay panel
         [win center];
         [win makeKeyAndOrderFront:nil];
         g_screen_fps = (int)(win.screen ?: NSScreen.mainScreen).maximumFramesPerSecond;
@@ -256,6 +361,13 @@ void front_run(void (*guest)(void)) {
         [app addItemWithTitle:@"Quit " DM_GAME_NAME action:@selector(terminate:) keyEquivalent:@"q"];
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+        [wm addItem:NSMenuItem.separatorItem];
+        // The overlays: the title names the current mode (hud_apply). F8 only: a bare "1" equivalent would take every 1 typed into the software keyboard's box (another window, whose keys the monitor lets through)
+        g_hud_item = [wm addItemWithTitle:@"Overlays: Off" action:@selector(cycleOverlays:) keyEquivalent:[NSString stringWithFormat:@"%C", (unichar)NSF8FunctionKey]];
+        g_hud_item.target = v;
+        g_hud_item.keyEquivalentModifierMask = 0;
+        { const char *e = getenv("DM_MENUBAR_FPS"); if (e && atoi(e)) hud_menubar_fps(bar); }
+        hud_apply(g_hud_mode, 0);
         NSApp.mainMenu = bar;
         if (getenv("DM_FULLSCREEN")) dispatch_async(dispatch_get_main_queue(), ^{ [win toggleFullScreen:nil]; });   // start in fullscreen
         for (NSNotificationName nm in @[GCControllerDidConnectNotification, GCControllerDidDisconnectNotification])
@@ -267,6 +379,15 @@ void front_run(void (*guest)(void)) {
         pads_start();
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
+            // The top-row 1 (key code 18 on every layout; the keypad's 1 is not bound) cycles the overlays and never becomes a game input; ⌘ / ⌃ / ⌥ combinations go on as before
+            if (e.keyCode == 18 && !(e.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption))) {
+                if (e.type == NSEventTypeKeyDown && !e.isARepeat) hud_cycle();   // a held key acts once
+                return nil;
+            }
+            if (e.charactersIgnoringModifiers.length && [e.charactersIgnoringModifiers characterAtIndex:0] == NSF8FunctionKey) {
+                if (e.type == NSEventTypeKeyDown && !e.isARepeat) hud_cycle();
+                return nil;   // F8 never becomes a game input (on a keyboard whose top row is media keys it is Fn-F8)
+            }
             if (e.type == NSEventTypeKeyDown && (e.modifierFlags & NSEventModifierFlagCommand)) return e;   // ⌘ shortcuts go to the menu; a key released while ⌘ is held still reaches the game, or it would stay pressed
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
             return nil;   // Swallow it to avoid the system beep
@@ -279,8 +400,8 @@ void front_run(void (*guest)(void)) {
         [nc addObserverForName:NSWindowDidChangeScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; if (win.screen) { g_screen_fps = (int)win.screen.maximumFramesPerSecond; g_layer.contentsScale = win.backingScaleFactor; } screen_match_apply(); }];
         // Entering and leaving fullscreen: the layer is layer-backed, so its frame (and with it the drawable) follows the
         // content view by itself; only the scale factor has to be carried over to the screen the window ended up on. The screen's rate is matched in fullscreen only (screen_match_apply)
-        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
-        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
+        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); [g_hud position]; }];
+        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); [g_hud position]; }];
         [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_release(); if (!win.miniaturized) dm_focus_set(2); }];
         [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_resume(); dm_focus_set(1); }];
         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_release(); dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];

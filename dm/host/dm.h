@@ -111,6 +111,18 @@ void dm_guest_write_prepare(void *addr, size_t len);
 // Graphics lifecycle (hle_nvn.c): on=1 suspends (afterwards submit / present block, and in-flight GPU work is drained before returning), on=0 resumes; called by the iOS front end when entering and leaving the background
 void dm_gfx_suspend(int on);
 void dm_gfx_enter(void); void dm_gfx_leave(void);   // hle_nvn.c: the gate dm_gfx_suspend closes, for graphics layers other than NVN (dm/gfx/vk)
+// What the Mac overlay panel shows from the renderer (nvn_mtl.m; any thread, relaxed reads, polled twice a second by front_mac.m)
+typedef struct {
+    int fps;                                   // the game's presents a second, -1 before the first half-second window
+    int presented_fps;                         // frames actually put on screen a second (the drawables' presented handlers), -1 before the first window
+    int out_w, out_h;                          // the game picture as presented (the present crop), before scaling to the window; 0 before the first present
+    int scene_w, scene_h;                      // the internal 3D scene (profile key scene_shader: the texture its fragment slot 0 samples); 0 = not known
+    uint64_t shader_new, pipeline_new;         // shader libraries and render pipelines this device had not seen before (pso_user.tsv), this run
+    int64_t shader_total, pipeline_total;      // shaders in the game's cache (shader_map.tsv, -1 before it is read); render pipelines built this run
+    uint64_t shader_new_ns, pipeline_new_ns;   // CLOCK_UPTIME_RAW of the last new shader / pipeline, 0 = none yet
+} mtl_hud_info;
+void mtl_hud_snapshot(mtl_hud_info *o);
+uint64_t mtl_present_count(void);
 void dm_gfx_shot_at(long k, const char *path);
 void dm_shot_written(const char *path, int ok);   // The graphics side finished writing a screenshot to disk (diag.c: DM_TICK_HOLD=E:SHOT unfreezes on this)
 void dm_host_shutdown(const char *why);   // Graceful exit (crash.c): stop background threads and audio, drain graphics, then _exit(0); used by SIGTERM and the iOS App termination callback   // graphics side: screenshot of the k-th frame after the current presented frame (nvn_mtl.m)

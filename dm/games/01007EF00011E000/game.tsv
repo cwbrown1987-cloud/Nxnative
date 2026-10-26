@@ -27,6 +27,10 @@ fps_target	60
 # pipeline archive, the prepare step and the hybrid pipelines on the iPhone too (5,100 prewarm lines prepared in 0.28 s at start instead of compiling on first use)
 present_snap	on
 pso_mtl4	on
+# The Mac overlay's scene size (nvn_mtl.m scene_want): the fragment shader of 1.9.0's compose draw (tone mapping; a pixel shader of uking_pass_shader.sharcb in shader_map.tsv), whose t0 is
+# the R11G11B10F scene and t1 the 320x180 bloom (MacNativeGames 5281186, docs/botw-v1.9.0-port.md). Docked the scene is the 1600x900 G-buffer's size (docs/reference/rendering.md), which the
+# game's next draw scales to 1080p (README.md, Upscaling). Checked in windowed 1.9.0 on an M2 Mac: 1920x1080 output and a 1600x900 scene in Great Plateau gameplay (README.md, Upscaling)
+scene_shader	f7ee6fe10b925543
 
 # ---- Versions ----
 # only the merged 1.9.0 copy is extracted; the base game's own build IDs are added when needed

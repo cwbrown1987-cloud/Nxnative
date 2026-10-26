@@ -84,6 +84,8 @@ Used at `DM_FPS_TARGET=0` and for the interval the framework keeps while the VFR
 
 Handheld, the game draws 1280x720 into its 1920x1080 window textures and crops the window to it. Docked it scales its 900p scene to 1080p with one draw and draws the HUD on the 1080p target. The optional [MetalFX present](../../../docs/reference/rendering.md#the-present-upscales-through-metalfx) scales that presented picture in either mode; it cannot recover detail lost in the game's own upscale.
 
+The Mac overlay (key 1 or F8) shows the scene's size beside the picture's: the profile's `scene_shader` is the compose draw (`f7ee6fe10b925543`, tone mapping) that reads the scene at fragment slot 0 before that upscale. Checked in windowed 1.9.0 on an M2 Mac: the overlay showed 1920x1080 output and a 1600x900 scene in Great Plateau gameplay, with intermediate scene sizes during loading. Both keys cycled off, all and FPS only, and the selected mode survived a restart. This did not measure overlay overhead or input latency; fullscreen and iOS runtime remain unchecked.
+
 Measurements reported in [PR #215](https://github.com/seedds/nxnative/pull/215), the present command buffer's GPU time:
 
 | Device and content → output | MetalFX | Standard |

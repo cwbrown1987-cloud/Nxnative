@@ -3242,6 +3242,7 @@ static int clear_rect_zero(int i) {
 static os_unfair_lock g_rmu = OS_UNFAIR_LOCK_INIT;
 // ---------- Shader mapping table: Switch control section hash → PC metallib (produced by dm/gfx/tools/shader_map.py) ----------
 static NSMutableDictionary<NSString *, NSString *> *g_shmap;
+static _Atomic int64_t g_hud_shader_total = -1;   // g_shmap.count for the overlay's shader line (mtl_hud_snapshot, main thread), which must not touch the dictionary; -1 before shmap_load
 static NSString *g_shmap_path, *g_msl_dir;
 static NSString *exe_rel(const char *rel) {
     char buf[4096]; uint32_t n = sizeof buf;
@@ -3298,6 +3299,7 @@ static void shmap_load(void) {
             g_cb_ext = d; MLOG("uniform read extents: %lu shaders (cb_extent.tsv)", (unsigned long)d.count); }
     }
     MLOG("shader route B (translated Switch originals): shader map %lu entries (%s), metallib directory %s", (unsigned long)g_shmap.count, path.UTF8String, g_msl_dir.UTF8String);
+    atomic_store(&g_hud_shader_total, (int64_t)g_shmap.count);
     warm_start();
 }
 
@@ -3310,6 +3312,7 @@ static void shmap_load(void) {
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass; uint32_t ab_binst;   // ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn;   // bflib: readable-tile version <key>_bf (merge B step 2)
     uint64_t mis[4];   // mis: texture slots 0-255 already reported for a type mismatch (tex_mis_note)
+    uint8_t scene_src;   // the profile's scene_shader (scene_want): its fragment slot 0 is the internal 3D scene, whose size the overlay shows (scene_note); a byte so a draw tests no key
     NSString *ventry; id<MTLFunction> vfn; int vfn_state;
     id<MTLFunction> pfn; int pfn_state, has_pull; } @end   // pfn: the same entry of the pulling library <key>_bp (pull_fn; has_pull: the reflection names one, dmsh_pull.py)   // vertex: the entry point loaded (by the depth mode); vfn: the same entry of the shadow-input library <key>_bv (vin_fn; state 0 untried, 1 loaded, 2 failed)
 @implementation NvShader
@@ -3392,6 +3395,7 @@ static NSString *pso_user_path(void) {
 }
 static FILE *g_pso_user; static int g_pso_user_checked;
 static NSMutableSet<NSString *> *g_pso_user_seen;
+static _Atomic uint64_t g_hud_new_s, g_hud_new_r, g_hud_new_s_ns, g_hud_new_p_ns;   // 'S' / 'R' lines new to this device this run, and CLOCK_UPTIME_RAW of the last new 'S' / 'R' or 'C' (0 = none)
 static FILE *pso_user_file(void) {
     if (g_pso_user_checked) return g_pso_user;
     g_pso_user_checked = 1;
@@ -3413,6 +3417,10 @@ static void pso_user_record(const char *fmt, ...) {
     size_t ll = strlen(line); NSString *s = [[NSString alloc] initWithBytes:line length:ll && line[ll - 1] == '\n' ? ll - 1 : ll encoding:NSUTF8StringEncoding];   // Compared with the manifest file line by line (without the newline)
     if (!s || [g_pso_user_seen containsObject:s]) return;
     [g_pso_user_seen addObject:s]; fputs(line, f); fflush(f);
+    // The overlay's "new" counts (mtl_hud_snapshot): lines neither the seed list nor this device's list had. A compute pipeline ('C') adds to no count but lights the pipeline line
+    uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (line[0] == 'S') { atomic_fetch_add(&g_hud_new_s, 1); atomic_store(&g_hud_new_s_ns, t); }
+    else { if (line[0] == 'R') atomic_fetch_add(&g_hud_new_r, 1); atomic_store(&g_hud_new_p_ns, t); }   // 'R' or 'C'
 }
 // Build the library from a .metallib file without permanently occupying a file descriptor: newLibraryWithURL keeps that file open for as long as the library object lives (one per game shader - of the 258 descriptors the iOS app permanently holds in a run, 213 are these,
 // while the default soft limit of an iOS process is 256; new shaders created in other acts raise it further). Here the file is mapped into memory and closed immediately, and the library is built from the in-memory data; the mapping is released when the library's data object is freed
@@ -3456,6 +3464,15 @@ static MTL4FunctionDescriptor *fn4_of(id<MTLFunction> f) {
     os_unfair_lock_lock(&g_fn4_lock); MTL4FunctionDescriptor *d = [g_fn4 objectForKey:f]; os_unfair_lock_unlock(&g_fn4_lock);
     return d;
 }
+// The overlay's scene size: the game profile's scene_shader (one key prefix), the compose shader whose fragment slot 0 is the internal 3D scene; DM_NVN_SCENE_SHADER=<key> another, 0 none.
+// Matched once per shader as it loads (NvShader scene_src), on the warm-up thread as well as the submit thread, hence the once
+static int scene_want(const char *key) {
+    static char want[17]; static dispatch_once_t once;
+    dispatch_once(&once, ^{ const char *e = getenv("DM_NVN_SCENE_SHADER"), *src = e && *e ? e : DM_GAME_SCENE_SHADER; size_t n = strcmp(src, "0") ? strcspn(src, ", ") : 0;
+        if (n > 16) n = 16; memcpy(want, src, n); want[n] = 0;
+        if (n) MLOG("overlay scene size: fragment slot 0 of shader %s%s", want, e && *e ? " (DM_NVN_SCENE_SHADER)" : " (profile key scene_shader)"); });
+    return want[0] && !strncmp(key, want, strlen(want));
+}
 // layer: a vertex shader's layer entry points (entry_layer / entry_layer_z, which also write the layer) instead of main0 / main0_z, for a program whose geometry shader is a slice writer (prog_fold_gs)
 static NvShader *shader_load(NSString *pc, int stage, int layer) {
     NSError *e = nil;
@@ -3496,6 +3513,7 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     if (geo) { o->geo_vertices = [geo[@"vertices"] unsignedIntValue]; o->geo_invocations = [geo[@"invocations"] unsignedIntValue];
         o->geo_output = [geo[@"output"] unsignedIntValue]; o->geo_stride = [geo[@"stride"] unsignedIntValue]; o->geo_index_stride = [geo[@"index_stride"] unsignedIntValue]; }
     o->fn = fn4_note([lib newFunctionWithName:entry], lib, entry, nil); o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key); o->ventry = entry;
+    o->scene_src = stage == 1 && scene_want(o->key);
     // writes the layer (render_target_array_index, named in the library's metadata): its passes are layered and its pipelines get an input class (pso_desc). A library with layer entry points
     // names it for those alone: its main0 / main0_z write no layer
     if (stage == 0) o->layer_out = layer || (t_lib_layer && !j[@"entry_layer"]);
@@ -4622,6 +4640,7 @@ static os_unfair_lock g_fz_fn_lock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary<NSString *, id<MTLFunction>> *g_bf_fn_cache;
 static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_bf_lib_cache;
 static nvn_hmap g_pso = {.klen = sizeof(pso_key)}, g_dss;
+static _Atomic int64_t g_hud_pipeline_total;   // published after completed insertions; no hash-table race on the UI thread
 static nvn_hmap g_pso_fail = {.klen = sizeof(pso_key)};   // pipelines that failed to build: remembered and never retried (previously every draw recompiled it, over 10,000 times in one iPhone session)
 static const char g_tf_mark, g_amp_mark;
 static char g_geo_mark;
@@ -5529,7 +5548,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
     if (!ms_fn) { pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
         pso_record("R\t%s\n", shex);
         pso_user_record("R\t%s\n", shex); }
-    hm_put_id(&g_pso, &k, ps);
+    hm_put_id(&g_pso, &k, ps); atomic_store_explicit(&g_hud_pipeline_total, g_pso.n, memory_order_relaxed);
     // Metal may serialize requests internally. Submit the pipeline needed now before speculative work, and preserve record-on-use above.
     static int predict = -1; if (predict < 0) { const char *e = getenv("DM_NVN_PREDICT"); predict = !(e && !strcmp(e, "0")); if (!predict) MLOG("DM_NVN_PREDICT=0: no parallel precompile prediction"); }
     if (predict && g_pp_submit_mark != g_sub_serial) {
@@ -8183,7 +8202,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> tf_pso(NvShader *vs) {
     if (hm_get_id(&g_pso_fail, &k)) return nil;
     NSError *e = nil; id<MTLRenderPipelineState> ps = pso_build(pso_desc(&k, vs, nil, nil, 0), &e);
     if (!ps) { MLOG("[RED] failed to create the transform feedback pipeline (vertex %s): %s", vs->key, e.localizedDescription.UTF8String); hm_put_id(&g_pso_fail, &k, NSNull.null); return nil; }
-    hm_put_id(&g_pso, &k, ps);
+    hm_put_id(&g_pso, &k, ps); atomic_store_explicit(&g_hud_pipeline_total, g_pso.n, memory_order_relaxed);
     return ps;
 }
 static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
@@ -8309,6 +8328,17 @@ static int lc_keeps(uint32_t op) {
         case OP_UPDATE_UB: case OP_COPY_B2B: case OP_CLEAR_BUF: return 1;
         default: return 0;
     }
+}
+// The overlay's internal 3D resolution (mtl_hud_snapshot): the size of the view at fragment slot 0 of the profile's compose shader (scene_want), noted by its draw, about once a frame.
+// It follows dynamic resolution only if the game renders the scene into a texture of that size (not a sub-viewport of a fixed one)
+static _Atomic uint64_t g_hud_scene_wh;   // width | height << 32 (one word: the overlay never reads one side of a change), 0 = not seen
+static void scene_note(void) {
+    int tid = (int)(tex_slot_h(S.tex[1], S.img[1], 0) & 0xfffff); uint64_t w = 0, h = 0;
+    os_unfair_lock_lock(&g_rmu);   // the registry may be growing on the game thread
+    if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) { const treg_t *r = &g_treg[tid]; int lv = r->has_v && r->v.set_levels ? r->v.base_level : 0;   // the level the view samples, as its MTLTexture reports
+        w = MAX(r->t.d.width >> lv, 1u); h = MAX(r->t.d.height >> lv, 1u); }
+    os_unfair_lock_unlock(&g_rmu);
+    if (w && atomic_exchange(&g_hud_scene_wh, w | h << 32) != (w | h << 32)) MLOG("scene size (compose shader slot 0): %llux%llu", (unsigned long long)w, (unsigned long long)h);
 }
 
 static void dispatch(const p_dispatch *dp);
@@ -8444,6 +8474,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (zskip_can_draw(pr)) {   // Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("zero-source skip: first case pass %llu", g_stat_pass + 1); }
         PD("N %llu zero-source draw skipped", g_stat_pass + 1); return; }
+    if (pr->sh[1] && pr->sh[1]->scene_src) scene_note();
     if (g_nlc && !g_enc) lc_take(pr);   // waiting clears: this pass's load actions, or landed before it (see lc_take)
     if (ixc_wanted(dw, di) && !ixc_find(dw, di)) ixc_run(dw, di);   // indirect quads / fans / 8-bit indices: converted on the GPU before the render pass, at their own place in the replay (see ixc_run)
     uint64_t mdx = 0;   // the masked copy of the record (mdx_run); a draw it could not copy waits for the count instead
@@ -8734,7 +8765,7 @@ static void warm_claim(void) {
             if (!vs) { vs = item->vs; g_shcache[item->vs_key] = vs; }
             if (item->fs_key.length && !fs) { fs = item->fs; g_shcache[item->fs_key] = fs; }
             item->pso.vs = (__bridge void *)vs; item->pso.fs = (__bridge void *)fs;
-            if (!hm_get_id(&g_pso, &item->pso)) { hm_put_id(&g_pso, &item->pso, item->object); g_warm_claim_rps++; }
+            if (!hm_get_id(&g_pso, &item->pso)) { hm_put_id(&g_pso, &item->pso, item->object); atomic_store_explicit(&g_hud_pipeline_total, g_pso.n, memory_order_relaxed); g_warm_claim_rps++; }
         } else {
             NvShader *cs = g_shcache[item->key];
             if (!cs) { cs = item->shader; if (!g_shcache) g_shcache = [NSMutableDictionary dictionary]; g_shcache[item->key] = cs; }
@@ -9499,7 +9530,7 @@ void mtl_exec(const uint8_t *p) {
 static id<MTLRenderPipelineState> g_blit_pso; static MTLPixelFormat g_blit_fmt;
 static id<MTLSamplerState> g_blit_samp;
 static uint64_t g_present_n;
-uint64_t mtl_present_count(void) { return g_present_n; }   // Actual present count (heat attribution DM_HEAT computes the present frame rate)
+uint64_t mtl_present_count(void) { return __atomic_load_n(&g_present_n, __ATOMIC_RELAXED); }   // Actual present count (heat attribution DM_HEAT computes the present frame rate; the Mac overlay stays hidden while it is 0); other threads read it
 void mtl_res_snapshot(mtl_res_count *out) {
     memset(out, 0, sizeof *out);
     out->pso = g_pso.n;
@@ -10051,9 +10082,44 @@ static void present_gpu_note(double s, int fx) {
     n[fx] = 0;
 }
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
+// ---------- Mac overlay panel (front_mac.m): the numbers mtl_hud_snapshot hands it ----------
+// A rate over windows of at least half a second: k is a running count (the game's present ticket, or the frames put on screen), the value lround(dk / dt) with no smoothing,
+// -1 before the first window, 0 once nothing was noted for 1.5 s. stale_s > 0: a longer gap restarts the window instead of averaging over it. Noted on the present thread
+// (and the presented handlers), read on the main thread
+typedef struct { pthread_mutex_t mu; double t0, stale_s; uint64_t k0; _Atomic int value; _Atomic uint64_t last_ns; } hud_rate;
+static hud_rate g_hud_game = {PTHREAD_MUTEX_INITIALIZER, -1, 0, 0, -1};   // game frames presented (the FPS line's first number)
+static void hud_rate_note(hud_rate *m, uint64_t k, double now) {
+    atomic_store_explicit(&m->last_ns, (uint64_t)(now * 1e9), memory_order_relaxed);
+    pthread_mutex_lock(&m->mu);
+    if (m->t0 < 0 || k < m->k0 || (m->stale_s > 0 && now - m->t0 > m->stale_s)) { m->t0 = now; m->k0 = k; }
+    else if (now - m->t0 >= 0.5) { atomic_store(&m->value, (int)lround((double)(k - m->k0) / (now - m->t0))); m->t0 = now; m->k0 = k; }
+    pthread_mutex_unlock(&m->mu);
+}
+static int hud_rate_value(hud_rate *m, double now) {
+    uint64_t last = atomic_load_explicit(&m->last_ns, memory_order_relaxed);
+    return last && now * 1e9 - last > 1500000000.0 ? 0 : atomic_load_explicit(&m->value, memory_order_relaxed);
+}
+static hud_rate g_hud_shown = {PTHREAD_MUTEX_INITIALIZER, -1, 1.0, 0, -1};   // frames put on screen (presentedTime > 0; a drawable that was dropped reports 0)
+static _Atomic uint64_t g_hud_shown_total;
+static void hud_presented_note(double time) { if (time > 0) hud_rate_note(&g_hud_shown, atomic_fetch_add(&g_hud_shown_total, 1) + 1, time); }
+static _Atomic uint64_t g_hud_out_wh;   // the game picture (present crop) of the last game frame: width | height << 32, 0 before the first present
+// Any thread (front_mac.m polls it on the main thread twice a second): relaxed loads only, no renderer lock is taken
+void mtl_hud_snapshot(mtl_hud_info *o) {
+    #define HUD_LD(v) atomic_load_explicit(&(v), memory_order_relaxed)
+    memset(o, 0, sizeof *o);
+    uint64_t out = HUD_LD(g_hud_out_wh), scene = HUD_LD(g_hud_scene_wh);
+    o->fps = hud_rate_value(&g_hud_game, CACurrentMediaTime());
+    o->out_w = (int)(uint32_t)out; o->out_h = (int)(out >> 32); o->scene_w = (int)(uint32_t)scene; o->scene_h = (int)(scene >> 32);
+    o->shader_new = HUD_LD(g_hud_new_s); o->pipeline_new = HUD_LD(g_hud_new_r);
+    o->shader_total = HUD_LD(g_hud_shader_total); o->pipeline_total = HUD_LD(g_hud_pipeline_total);   // g_pso.n: render pipelines built on the spot and claimed from warm-up
+    o->shader_new_ns = HUD_LD(g_hud_new_s_ns); o->pipeline_new_ns = HUD_LD(g_hud_new_p_ns);
+    o->presented_fps = hud_rate_value(&g_hud_shown, CACurrentMediaTime());
+    #undef HUD_LD
+}
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
+    hud_rate_note(&g_hud_game, ticket, CACurrentMediaTime());   // by ticket: frames the display link merged away still count as the game's
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
         if (g_present_n == 1) g_bp_first_present = bp_now() - g_bp_t0;
         MLOG("[bootprof] t=%.3f s present #%llu: metallibs loaded %llu / %.1f ms; pipelines created %llu / %.1f ms (all synchronous on the submit thread); prewarmed and used: shaders %llu / render pipelines %llu / compute pipelines %llu; "
@@ -10103,6 +10169,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     for (int i = 0; i < g_nshotq;) if (g_present_n >= g_shotq[i].frame) { mtl_finish_gpu(); shot(src, g_shotq[i].path, 1, crop); g_shotq[i] = g_shotq[--g_nshotq]; } else i++;
     pthread_mutex_unlock(&g_shotq_mu);
 
+    {   // the overlay's output size: this game frame's picture, before it is scaled to the drawable
+        int c = crop && (crop[2] || crop[3]); uint64_t cw = c ? (uint32_t)crop[2] : src.width, ch = c ? (uint32_t)crop[3] : src.height;   // as present_encode crops it
+        atomic_store_explicit(&g_hud_out_wh, cw | ch << 32, memory_order_relaxed); }
     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
     if (!layer) return 0;
     if (g_present_layer_resident != layer) { [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }
@@ -10162,6 +10231,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
         CFTimeInterval tt = d.presentedTime;
         g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
+        hud_presented_note(tt);
     }];
     // Each frame is displayed for at least one present period: when the GPU completion time jitters around a 120 Hz refresh boundary, the paired "25 ms + 8.33 ms" stutter no longer appears
     if (target_ts > 0) [dr present];
