@@ -49,6 +49,12 @@ The game builds Mii heads from the console's MiiModel system data, starting at b
 
 - The spin-wait search with the lock, test and store rules finds `main` 25 → 26 loops (a state setter like Breath of the Wild's, `main+0x715df8`) and one loop wider in `subsdk0` (the movie library's thread loop, `0x24118`) ([development.md, Power](../../../docs/development.md#power)).
 
+## Update 3.0.5 validation
+
+- **Resolved: black screen before the first frame** with the derived profile for v1376256 (3.0.5). Its main thread stopped at `main+0x8e657c`, returning from the notification thread's start, before setting focus handling mode. The priority-41 worker stopped at `main+0x8e6384`, immediately after its call to `oe::PopNotificationMessage`. See [Blocking notification hooks release same-core handoffs](../../../docs/reference/threads.md#blocking-notification-hooks-release-same-core-handoffs) for the general cause and fix.
+- **Current validation:** an isolated Mac boot with a fresh save, the same rewritten 3.0.5 modules and the same shader libraries reached frame 1500 in a bounded 30-second run after the host fix; frame-time p50 was about 16.67 ms. The unmodified host presented no frames. This was a headless boot test, with Metal 4 pipelines disabled, not a completed race or an iPhone gameplay validation. The regular profile still registers 4.0.0; 3.0.5 continues to use the packing script's derived profile.
+- **Current iPhone validation:** the corrected build, signed with a free Personal Team, renders the title's demo race on an iPhone 18 Pro (A20 Pro). It reached frame 2400 at about 60 fps (frame-time p50 16.72 ms, GPU 5.69 ms), with no audio underruns logged. Language `es-419` and the Booster Course Pass were recognized. This run used Metal 4 pipelines off and standard upscaling; a complete manual race has not been validated.
+
 ## Mac routes
 
 - The work folder's `run/ctl.sh` drives a run started with `DM_CTL`.
@@ -62,6 +68,7 @@ General host changes first needed here; each applies to every game:
 - **The Mii database and the MiiModel stand-in** (`hle_mii.c`, `dm_mii_standin`, `MountSystemData`), **the add-on content cache sized as Horizon's RomFS working memory** (`romfs_work_size`), **device save data as a save of its own** for a game that mounts account save data too (`<DM_SAVE>_device`) and **SDK 4's DeviceSink** (`g_sink4`): [Mii database answered by the host](../../../docs/reference/services.md#mii-database-answered-by-the-host), [System data stand-in for the MiiModel archive](../../../docs/reference/services.md#system-data-stand-in-for-the-miimodel-archive), [Add-on content mount cache sized as RomFS working memory](../../../docs/reference/services.md#add-on-content-mount-cache-sized-as-romfs-working-memory), [Device and account save data as two saves](../../../docs/reference/services.md#device-and-account-save-data-as-two-saves), [SDK 4: DeviceSink is command 0xf of 0x130 bytes](../../../docs/reference/audio.md#sdk-4-devicesink-is-command-0xf-of-0x130-bytes).
 - **The audio renderer's update lock read off each SDK's `Update`** (`update_lock`): [The renderer's update lock (`update_lock`)](../../../docs/reference/audio.md#the-renderers-update-lock-update_lock).
 - **The zero cube for a 2D array of fewer than six layers in a cube slot** (`tex_fit`): [A 2D texture in a cube slot binds the zero cube](../../../docs/reference/rendering.md#a-2d-texture-in-a-cube-slot-binds-the-zero-cube).
+- **Blocking notification hooks release same-core handoffs** (`dm_guest_host_wait_begin` / `dm_guest_host_wait_end`, `hle_oe.c`): [Blocking notification hooks release same-core handoffs](../../../docs/reference/threads.md#blocking-notification-hooks-release-same-core-handoffs).
 
 ## Open
 

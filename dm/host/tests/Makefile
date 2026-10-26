@@ -10,6 +10,7 @@ run: $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_fs_
 	$(B)/t_touch
 	$(B)/t_gesture
 	$(B)/t_oe 2>/dev/null
+	$(B)/t_oe_handoff
 	$(B)/t_fs 2>/dev/null
 	TMPDIR="$(abspath $(B))" $(B)/t_fs_commit_list
 	$(B)/t_thread_leak
@@ -119,6 +120,12 @@ preempt: $(B)/t_preempt
 	$(B)/t_preempt
 	$(B)/t_preempt --all-peers
 run: $(B)/t_preempt
+$(B)/t_oe_handoff: t_oe_handoff.c t_condvar_stub.c ../hle_thread.c ../hle_oe.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	clang -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_oe_handoff.c t_condvar_stub.c
+.PHONY: oe-handoff
+oe-handoff: $(B)/t_oe_handoff
+	$(B)/t_oe_handoff
+run: $(B)/t_oe_handoff
 # the Vorbis tests build their own packets and need no game profile (they build without GAME)
 $(B)/t_vorbis: t_vorbis.c ../../third_party/stb_vorbis/stb_vorbis.c | $(B)
 	clang -O1 -g -Wno-unused-function -Wno-tautological-compare -o $@ t_vorbis.c

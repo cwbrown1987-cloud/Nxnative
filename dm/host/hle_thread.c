@@ -10,6 +10,7 @@
 // Semantics follow the public Horizon kernel behavior (KConditionVariable / KAddressArbiter / KSynchronization of Atmosphère mesosphère).
 // All waits hang on one global lock G, with one condition variable per thread; correctness first, performance to be measured later.
 #include "dm.h"
+#include <assert.h>
 #include <errno.h>
 #include <sched.h>
 #include <signal.h>
@@ -56,6 +57,7 @@ typedef struct thr {
     // Current wait: kind 0=none 1=lock 2=condition 3=address 4=synchronization object
     int wkind, woke; uint64_t waddr, wkey; uint32_t wtag; int64_t wres;
     _Atomic int sleeping;      // inside SleepThread's timed sleep (not runnable; used by dm_yield_to_core_peers)
+    unsigned host_wait;        // nested blocking host-hook waits, protected by G (not runnable)
     int yield_pending;         // this caller woke a higher-priority thread pinned to its core: hand off before returning to guest code
     _Atomic uint64_t hand_epoch;   // this thread's current handoff: threads it makes runnable belong to it until its next thread SVC returns (svc_thread)
     struct { struct thr *by; uint64_t epoch; } hand[4]; int nhand;   // the handoffs this thread was made runnable for (its waker's, then those the waker belonged to), until it blocks (note_runnable / hand_leave)
@@ -126,7 +128,7 @@ void dm_thread_mark_host(void) { thr_t *t = pthread_getspecific(g_keythr); if (t
 // Holding G. wake() clears wkind before the pthread resumes; it must already count as runnable in that window, even if Mach still reports WAITING / STOPPED.
 // Explicit host GPU work does not occupy a guest core. Ordinary host dispatch delays and HLE calls do, until a guest wait / sleep / exit says otherwise.
 static int thr_runnable(const thr_t *t) {
-    return !t->wkind && !t->sleeping && !t->pause_req && !(t->host_work && *t->host_work);
+    return !t->wkind && !t->sleeping && !t->pause_req && !t->host_wait && !(t->host_work && *t->host_work);
 }
 // Holding G. Whether t was made runnable for self's current handoff (by self, or by a thread that was) and has not blocked since
 static int thr_in_handoff(const thr_t *t, const thr_t *self) {
@@ -135,6 +137,20 @@ static int thr_in_handoff(const thr_t *t, const thr_t *self) {
 }
 // Holding G. t blocked (a guest wait, a timed sleep, YieldToAnyThread): it gave its core back, so it no longer holds the threads whose handoff made it runnable
 static void hand_leave(thr_t *t) { t->nhand = 0; }
+void dm_guest_host_wait_begin(void) {
+    thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
+    pthread_mutex_lock(&G);
+    t->host_wait++;
+    hand_leave(t);   // Like a kernel wait, this ends the handoff even if the host wakes immediately.
+    pthread_mutex_unlock(&G);
+}
+void dm_guest_host_wait_end(void) {
+    thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
+    pthread_mutex_lock(&G);
+    assert(t->host_wait);
+    t->host_wait--;
+    pthread_mutex_unlock(&G);
+}
 // The peers a handoff waits for are the ones it made runnable, not every runnable higher-priority thread of the core. The host runs a
 // lower-priority thread beside busy higher-priority threads of its core all the time (it has no per-core scheduler; core_preempt aside),
 // and waiting for those threads at a wake had no bound: Tears of the Kingdom's BootupBackgroundWorkThread (priority 58) waited at each
