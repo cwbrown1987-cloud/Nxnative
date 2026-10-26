@@ -4,7 +4,7 @@
 # Source of query answers: the answer table in the game profile, dm/games/<id>/shader_facts.tsv (dmsh_facts.py) - texture types, vertex attribute / fragment output component types, compute thread group size and shared memory.
 # Usage: dmsh_build.py <Switch package dir> <output cache dir> [key...] (no keys = all); build output is actually written to <output cache dir>/b-<chain version>/ (same for IOSOUT), for the chain version see dmsh_chain.py.
 # A full build (no keys) also stamps both directories with the game and the digest of its profile inputs (inputs.tsv) and writes the profile's c1_full.tsv and cb_extent.tsv (c1_guard.py, cb_extent.py)
-# from its Mac outputs. One output directory per game: the chain version is the same for every game   Environment: DM_GAME=game profile (required, dm/games/<id>), XLATE=path to the translation tool (default the in-repo dmsh_xlate_bin), DMSH_CAS=content-addressed cache dir (default <output cache dir>/cas), DMSH_PREFILL=Mac library root[=iOS library root] (separated by :, their b-*/ go into the MSL-keyed compile cache first; sibling b-*/ always do), J=concurrency
+# from its Mac outputs. One output directory per game: the chain version is the same for every game   Environment: DM_GAME=game profile (required, dm/games/<id>), XLATE=path to the translation tool (default the in-repo dmsh_xlate_bin), DMSH_CAS=content-addressed cache dir (default <output cache dir>/cas), DMSH_PREFILL=Mac library root[=iOS library root] (separated by :, their b-*/ go into the MSL-keyed compile cache first; sibling b-*/ always do), DM_PSO_PAIRS=the pso pairs (the prebuild's own list) when the profile has no pso_pairs.tsv, J=concurrency
 # Build output: <key>_b.metallib, <key>_b.json (replay reflection, including drv_reads, the runtime read offsets into driver segments c0 / c2), <key>_b.metal (MSL)
 # Environment IOSOUT=dir: the same MSL also goes through dm/ios/tools/ios_metal.compile to produce an iphoneos metallib + reflection (chain_metal records the iOS compile convention)
 # Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately)
@@ -587,10 +587,12 @@ def int_inputs(src):
         if not bad and nint: out[str(loc_)] = 'uint'
     return out
 
-# vertex / pixel pairs (taken from BNSH variations by shader_split.py): vertex key → paired pixel keys
+# vertex / pixel pairs (taken from BNSH variations by shader_split.py): vertex key → paired pixel keys. The pso_pairs.tsv pairs (the agl program variations, BAHS) count as well: the pipeline
+# prebuild builds their bases too, and a pair whose vertex shader lacks an output its pixel shader reads does not link (the base fails, the draw is skipped)
 PAIRS = collections.defaultdict(set)
-for _ln in open(GAME.table('shader_pairs.tsv')):
-    if _ln.strip() and not _ln.startswith('#'): _v, _p = _ln.split(); PAIRS[_v].add(_p)
+for _tbl in ('shader_pairs.tsv', 'pso_pairs.tsv'):
+    for _v, _p in dmsh_chain.read_pairs(GAME.table(_tbl)): PAIRS[_v].add(_p)
+for _v, _p in dmsh_chain.read_pairs(os.environ.get('DM_PSO_PAIRS')): PAIRS[_v].add(_p)   # the split's copy of the pso pairs, for a profile with no table of its own
 
 def vs_pad(key, src):
     """Give a vertex shader the outputs its paired pixel shaders read but it does not write, with the value (0,0,0,1).

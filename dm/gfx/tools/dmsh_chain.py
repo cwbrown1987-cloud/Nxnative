@@ -55,6 +55,15 @@ def inputs(g):
     h.update(profile_rows(g))
     return h.hexdigest()[:12]
 
+def read_pairs(path):   # the pairs of a table file (one vertex key and one pixel key per line, '#' starts a comment): a set of (vertex key, pixel key); a missing file is no pairs
+    out = set()
+    if not path or not os.path.exists(path): return out
+    for ln in open(path):
+        if ln.strip() and not ln.startswith('#'):
+            v, p = ln.split()
+            out.add((v, p))
+    return out
+
 def read_stamp(lib):   # {'game': title ID, 'inputs': digest} of a library directory; {} when it has none
     try: return dict(l.rstrip('\n').split('\t', 1) for l in open(os.path.join(lib, STAMP)) if '\t' in l and not l.startswith('#'))
     except OSError: return {}
