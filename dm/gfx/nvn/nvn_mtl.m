@@ -7143,6 +7143,11 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             if ((dw && dw->mdi_cnt && !mdi_live(dw->mdi_cnt, dw->mdi_i)) || (di && di->mdi_cnt && !mdi_live(di->mdi_cnt, di->mdi_i))) return;
             geo_draw(geometry_program, dw, di); return;
         }
+        // A geometry shader with a function (a slice writer is a stub and prog_fold_gs replaced it) but no geometry metadata: the host cannot run it
+        // (Metal has no geometry stage; the compute path needs the metadata), so the draw goes on without it and reaches only the vertices the vertex shader made.
+        if (geometry_program && geometry_program->sh[2] && geometry_program->sh[2]->fn) {
+            static int n; if (n++ < 8) MLOG("[RED] draw with geometry shader %s, which the host cannot run (no geometry metadata): the draw reaches only the vertices the vertex shader made", geometry_program->sh[2]->key);
+        }
     }
     int mdx_on = (dw && dw->mdi_cnt) || (di && di->mdi_cnt) ? mdx_wanted(dw, di) : 0;   // an indirect-count multi-draw's record masked on the GPU (mdx_run), else read after a wait
     if (!mdx_on && ((di && di->mdi_cnt && !mdi_live(di->mdi_cnt, di->mdi_i)) || (dw && dw->mdi_cnt && !mdi_live(dw->mdi_cnt, dw->mdi_i)))) return;   // past the multi-draw's count
