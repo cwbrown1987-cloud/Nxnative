@@ -152,6 +152,8 @@ On this Mac the background prewarm also ends before the save loads, so the step 
 
 ## Found on this game
 
+- **Optional touch-camera preferences (device validation pending after launcher integration):** [Relative swipe camera input on iOS](../../../docs/reference/services.md#relative-swipe-camera-input-on-ios). User feedback on the 1.9.0 prototypes motivated a game-independent swipe option and configurable touch sensitivity/dead zone; this is separate from physical-controller input.
+
 General host changes first needed here; each applies to every game:
 
 - **Resolved: the IPA omitted pulling libraries with `pso_mtl4 on`, and explicitly including them failed under macOS Bash 3.2.** See [Pulling vertex inputs](../../../docs/reference/rendering.md#pulling-vertex-inputs).

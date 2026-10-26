@@ -14,12 +14,15 @@ import Foundation
         d.set("0", forKey: "launcher.DM_PSO_MTL4")       // a changed performance setting
         d.set("1", forKey: "launcher.DM_FPS_HOLD")       // a value the toggle does not take (on / off): the default
         setenv("DM_ENV_FILE_KEYS", "DM_METAL_HUD", 1); setenv("DM_METAL_HUD", "1", 1)   // set by Documents/env.txt
+        let touchValues = [("DM_TOUCH_SWIPE", "1"), ("DM_TOUCH_SWIPE_GAIN", "2.50"), ("DM_TOUCH_LEFT_DEADZONE", "0.25")]
+        for (key, value) in touchValues { d.set(value, forKey: "launcher." + key) }
         let m = LauncherModel(file.settings, defaults: d)
         let scale = file.settings.first { $0.env == "DM_RENDER_SCALE" }!
         expect(["nan", "inf", "-inf", "0.49", "1.01", "invalid"].allSatisfy { !scale.accepts($0) } && scale.accepts("0.5") && scale.accepts("1.00"), "saved ranges reject nonfinite and out-of-range values")
         d.set("nan", forKey: "launcher.DM_RENDER_SCALE")
         expect(LauncherModel(file.settings, defaults: d).values["DM_RENDER_SCALE"] == scale.def, "an invalid saved range loads the default")
         expect(m.values["DM_FPS_TARGET"] == "30" && m.values["DM_PSO_MTL4"] == "0" && m.values["DM_FPS_HOLD"] == "on" && m.values["DM_METAL_HUD"] == "1", "stored choices and the env file are read")
+        expect(touchValues.allSatisfy { m.values[$0.0] == $0.1 }, "all three touch choices load from storage")
         expect(m.changed, "Reset is offered with changed settings")
         m.values["DM_RENDER_SCALE"] = "1.00"   // the slider's format of the default
         m.apply()
@@ -28,10 +31,22 @@ import Foundation
         expect(d.string(forKey: "launcher.DM_FPS_TARGET") == "30" && d.string(forKey: "launcher.DM_PSO_MTL4") == "0", "changed choices are stored")
         expect(d.string(forKey: "launcher.DM_METAL_HUD") == nil && String(cString: getenv("DM_METAL_HUD")) == "1", "the env file's value is kept and not stored")
         expect(String(cString: getenv("DM_PSO_MTL4")) == "0" && String(cString: getenv("DM_PRESENT_SNAP")) == "1" && String(cString: getenv("DM_FPS_HOLD")) == "on", "the environment gets every value")
+        expect(touchValues.allSatisfy { d.string(forKey: "launcher." + $0.0) == $0.1 && String(cString: getenv($0.0)) == $0.1 }, "touch choices persist and reach the runtime")
+        expect(touchValues.allSatisfy { LauncherModel(file.settings, defaults: d).values[$0.0] == $0.1 }, "touch choices survive relaunch")
         m.reset()
         expect(d.string(forKey: "launcher.DM_PSO_MTL4") == nil && m.values["DM_PSO_MTL4"] == "1", "Reset clears performance choices and shows the defaults")
         expect(d.string(forKey: "launcher.DM_FPS_TARGET") == nil && m.values["DM_FPS_TARGET"] == file.settings.first { $0.env == "DM_FPS_TARGET" }!.def, "Reset also clears game choices")
         expect(m.values["DM_METAL_HUD"] == "1" && !m.changed, "Reset leaves the env file's value; nothing left to reset")
+        expect(touchValues.allSatisfy { key, _ in
+            d.string(forKey: "launcher." + key) == nil && m.values[key] == file.settings.first { $0.env == key }!.def
+        }, "Reset restores all touch defaults")
+        for (key, value) in touchValues {
+            setenv("DM_ENV_FILE_KEYS", key, 1); setenv(key, value, 1)
+            let locked = LauncherModel(file.settings, defaults: d)
+            locked.reset(); locked.apply()
+            expect(locked.fromFile.contains(key) && locked.values[key] == value && String(cString: getenv(key)) == value,
+                   "env file keeps " + key + " through Reset and Play")
+        }
         print("launcher storage: \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }
