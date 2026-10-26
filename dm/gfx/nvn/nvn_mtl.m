@@ -10485,9 +10485,13 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     // dropped the one before whenever two frames landed in the same refresh, as frames of a 60 fps game that take 16-17.5 ms do, and the next frame then stayed up 33 ms
     // (Dark Souls Remastered, from PR #31: presents within 14.7-18.7 ms 98.2 -> 99.98 %, about 2 ms more from enqueue to display). DM_PRESENT_FIFO=0 takes the newest, as before
     static int fifo = -1; if (fifo < 0) { const char *e = getenv("DM_PRESENT_FIFO"); fifo = !(e && !strcmp(e, "0")); MLOG("display link: %s", fifo ? "frames in order, at most one behind" : "the newest frame each tick (DM_PRESENT_FIFO=0)"); }
-    if (fifo && ticket > first) ticket = ticket - first >= 2 ? g_pq_in - 1 : first;
-    // Frame interpolation: a frame with an interpolated one goes up in two ticks, the interpolated frame first; the frame stays the next to take until its own goes up
-    pq_item *ip = &g_pq[(ticket - 1) % PQ]; int interp = ip->interp >= 0 && !ip->interp_shown ? ip->interp : -1;
+    // Frame interpolation: a frame with an interpolated one goes up in two ticks, the interpolated frame first; the frame stays the next to take until its own goes up.
+    // A frame whose interpolated picture is up is never dropped (its own picture next, whatever is queued behind it), and while the queue catches up (three or more
+    // waiting) no interpolated picture is shown: taking the newer frames' interpolated pictures instead dropped nearly every game frame once the queue stayed that deep
+    pq_item *fp = &g_pq[(first - 1) % PQ]; int behind = 0;
+    if (fp->interp >= 0 && fp->interp_shown) ticket = first;
+    else if (fifo && ticket > first) { behind = ticket - first >= 2; ticket = behind ? g_pq_in - 1 : first; }
+    pq_item *ip = &g_pq[(ticket - 1) % PQ]; int interp = !behind && ip->interp >= 0 && !ip->interp_shown ? ip->interp : -1;
     if (interp >= 0) { ip->interp_shown = 1; ip->interp_ts = update.targetPresentationTimestamp; }
     pq_item it = *ip; g_link_it_tin = it.t_in;
     g_pq_read = interp >= 0 ? ticket - 1 : ticket;
@@ -10498,8 +10502,8 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     int submitted;
     ext_wait(it.ev_val); snap_commit_wait(it.snap_v);
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp, interp); }
-    double shown = it.interp >= 0 ? it.period / 2 : it.period;   // frame interpolation: each of the two pictures for half the frame's period (30+30: one 60 Hz tick each)
-    g_link_hold_until = submitted && shown > (it.interp >= 0 ? 0.0125 : 0.025) ? update.targetPresentationTimestamp + shown : 0;   // without interpolation as before: only intervals of 2 or more
+    double shown = it.interp >= 0 && it.interp_shown ? it.period / 2 : it.period;   // frame interpolation: each of the two pictures for half the frame's period (30+30: one 60 Hz tick each); a frame shown without its interpolated one keeps its whole period
+    g_link_hold_until = submitted && shown > (it.interp >= 0 && it.interp_shown ? 0.0125 : 0.025) ? update.targetPresentationTimestamp + shown : 0;   // without interpolation as before: only intervals of 2 or more
     if (!submitted && interp < 0) {
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;
