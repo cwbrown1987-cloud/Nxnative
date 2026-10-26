@@ -47,15 +47,33 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
     if (pitch < row_bytes) return -1;
     bl += base; uint32_t lb = nvn_tex_level_gobs(d, level) * 64;   // the row as laid out (padded in a sparse texture's tiled levels)
     if (lb < row_bytes) lb = row_bytes;
-    for (uint32_t z = 0; z < slices; z++)
+    // Incremental addressing: nvn_bl_offset (kept above for one-off addresses and the tests) recomputes six divisions by runtime values
+    // (gobs_x, blocks_y, y/(8*bh), y%(8*bh), z/bd, z%bd) per 16-byte segment, and the divisor being a runtime value stops the compiler
+    // from turning them into shifts. All of them are constant per row or per slice: 8*bh and bd are powers of two (bh = 1<<th, bd = 1<<td),
+    // so their division / remainder are shifts and masks, and within a row the segment at x = 16*j sits at block column (j >> 2) plus one
+    // of four fixed positions inside the GOB (x%64 = 0/16/32/48 -> 0/32/256/288), while gob_off's y part depends only on y%8
+    static const uint16_t kox[4] = {0, 32, 256, 288};                         // x%16 is always 0 here: segments start at multiples of 16
+    static const uint16_t koy[8] = {0, 16, 64, 80, 128, 144, 192, 208};       // (y%8/2)*64 + (y%2)*16
+    uint32_t bh = 1u << th, bd = 1u << td;
+    uint64_t block = 512ull * bh * bd, gobs_x = (uint64_t)(lb + 63) >> 6, blocks_y = ((uint64_t)rows + 8 * bh - 1) >> (3 + th);
+    for (uint32_t z = 0; z < slices; z++) {
+        uint64_t zb = (uint64_t)(z >> td) * gobs_x * blocks_y * block + (uint64_t)(z & (bd - 1)) * bh * 512;
         for (uint32_t y = 0; y < rows; y++) {
+            uint64_t p = (uint64_t)(y >> (3 + th)) * gobs_x * block + (uint64_t)((y & (8 * bh - 1)) >> 3) * 512 + koy[y & 7];
             uint8_t *row = lin + ((size_t)z * rows + y) * pitch;
-            for (uint32_t x = 0; x < row_bytes; x += 16) {             // 16-byte segments: 16 bytes are contiguous within a GOB, and 16 divides all block widths
-                uint32_t n = row_bytes - x < 16 ? row_bytes - x : 16;
-                uint8_t *p = bl + nvn_bl_offset(x, y, z, lb, rows, th, td);
-                if (to_linear) memcpy(row + x, p, n); else memcpy(p, row + x, n);
+            uint64_t yb = zb + p;   // the row's segments: block column (j >> 2) at yb + j>>2 times block + kox[j & 3]
+            uint32_t nfull = row_bytes >> 4, tail = row_bytes & 15;
+            // The full 16-byte segments take a constant-size copy (a memcpy of a runtime length is a call per segment);
+            // only a row whose block width does not divide 16 has a tail (a partial block, e.g. ASTC 10×6 or 12×10)
+            if (to_linear) {
+                for (uint32_t j = 0; j < nfull; j++) memcpy(row + (j << 4), bl + yb + ((uint64_t)(j >> 2) * block) + kox[j & 3], 16);
+                if (tail) memcpy(row + (nfull << 4), bl + yb + ((uint64_t)(nfull >> 2) * block) + kox[nfull & 3], tail);
+            } else {
+                for (uint32_t j = 0; j < nfull; j++) memcpy(bl + yb + ((uint64_t)(j >> 2) * block) + kox[j & 3], row + (j << 4), 16);
+                if (tail) memcpy(bl + yb + ((uint64_t)(nfull >> 2) * block) + kox[nfull & 3], row + (nfull << 4), tail);
             }
         }
+    }
     return 0;
 }
 
