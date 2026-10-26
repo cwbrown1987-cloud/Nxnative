@@ -23,6 +23,10 @@ Update 1.0.1 (v65536), SDK 15.3.2. Intelligent Systems' engine on NintendoWare (
 - **`fps_hold off`:** the frame waits for its three render worker threads (`gfx::ParallelManager`), idle during a hold, so the cost of a frame grew with the hold (1.4 vsyncs at hold 1, 3.3 at hold 2 on a loaded Mac) and the hold stuck at 3 vsyncs, 20 fps; without holds the same load gave 32–58 fps at 0.994 of real time. `DM_FPS_HOLD=on` brings the holds back.
 - `DM_FPS_TARGET=30` (`Documents/env.txt` on the iPhone) keeps the game's 30 fps.
 
+## Startup
+
+- **Resolved in the host; reporter confirmed iPhone startup:** black screen before the first frame, with the main thread at `main+0x32796c` and `SYS_Notification` waiting in the native notification HLE. See [Native HLE waits release the guest core](../../../docs/reference/threads.md#native-hle-waits-release-the-guest-core). Full gameplay was not revalidated.
+
 ## CPU
 
 - **Resolved: Rogueport at 24 fps on the first iPhone build:** frame p50 42 ms against 8 ms of GPU time, with the three `gfx::ParallelManager` workers (pinned to cores 0–2, priority 45) at 94% of a core each and the main thread waiting for them. `main+0xa8e680` is their loop. While a batch is pending, an idle worker polls the job cursor (`main+0xa8e784`) through a serial job, which only worker 1 runs, and through the end of a parallel-for, registering with it and backing out. The first worker to finish a parallel-for polls until the others are done (`main+0xa8e9a8`). None of these polls makes an SVC; the general spin wait rule now handles them.
