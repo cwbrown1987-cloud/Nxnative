@@ -1,5 +1,8 @@
-# FINAL FANTASY RESONANCE: Square Enix / Lancarse, Unreal Engine 4 (the HD-2D engine: 2D sprites on a 3D scene), SDK 20.5.17, NVN, CRIWARE sound and movies; update 1.0.1 (v65536).
-# The card is a Switch 1 cartridge (the game also ships for Switch 2): its secure partition holds the base game, the update and one DLC (a licence only).
+# FINAL FANTASY RESONANCE: Square Enix, Unreal Engine 5.6.1 (SDK MW+EpicGames+UnrealEngine-5_6_1 in main; the desktop renderer, SF_GLSL_SWITCH shaders), SDK 20.5.17, NVN, CRIWARE sound and movies;
+# update 1.0.1 (v65536). The card is a Switch 1 cartridge (the game also ships for Switch 2): its secure partition holds the base game, the update and one DLC (a licence only).
+# This is the Korean release (title ID 0100B8A026F14000; the Japanese one is 0100606026F12000): the same code as the Japanese one at the same addresses, with the Korean resources, so the
+# build ID differs but the addresses below are the Japanese release's. The game's shaders are two IoStore shader library chunks of FFRS-Switch.utoc (type 8) with their 5,919 shader
+# groups (type 9), read through the game's own Oodle in the Mac host's tool mode (uepak.py Toc / io_archive / OodleHost, dm/host/hle_oodle.c DM_OODLE_SERVE).
 
 # ---- Identity ----
 title_id	0100B8A026F14000
@@ -25,16 +28,22 @@ modules	main subsdk0 sdk
 romfs_marker	FFRS/Content/Paks/FFRS-Switch.ucas
 zip_store	.pak:.ucas:.utoc:.ttf:.txt:.usm:.metallib
 
+# ---- Graphics ----
+# 60 fps (30 on the Switch): the engine's Switch device profile sets rhi.syncinterval=2, so the game asks for present interval 2; the host writes rhi.SyncInterval 1 into its
+# console variable (hle_fpslock.c) whenever the game sets it back (at level loads), so the game asks for present interval 1 itself. Unreal steps the game by the time that really
+# passed. DM_FPS_TARGET=30 (Documents/env.txt on the iPhone) keeps the game's 30 and saves power.
+fps_target	60
+
 # ---- Memory ----
-# Unreal Engine: nninitStartup reserves one address region for the whole engine (62 GB by default, the engine's own value) and the engine's FMallocBinned3 takes 38 GB of it
-# (main+0xae82c: the size 0x980000000 is hardcoded in the game and does not follow -SwitchVirtualAddressSpaceSize=, so that switch cannot help).
-# The engine's own address region is capped to 40 GB (-SwitchVirtualAddressSpaceSize= in MB: the 38 GB pool has to fit in it, the SDK's
-# 1 GB node area is taken from the alias region before it, and regions of 1 GB and more are 1 GB aligned), and the alias region is 44 GB (the 62 GB region, 1 GB aligned) with a 48 GB reservation.
-# The sizes are cut down from 64/68 GB so that the one mmap the host makes for the whole guest address space fits in an iPhone's address space: with the
-# com.apple.developer.kernel.extended-virtual-addressing entitlement (the kernel's jumbo mode) an app gets 64 GB of address space, without it about 2-7 GB (the
-# engine's 38 GB does not fit and the host dies with "reserve guest AS").
-mem_reserve	0x10A0000000
-mem_alias	0x1000000000
+# Unreal Engine 5.6.1: nninitStartup (main+0x13370) reserves one 62 GB region for the engine (-SwitchVirtualAddressSpaceSize= in MB up to 4095, game_args below), and its FMallocBinned3
+# (38 GB of address space, main+0xae82c: the size 0x980000000 is hardcoded in the game and does not follow -SwitchVirtualAddressSpaceSize=, so that switch cannot help) is
+# constructed in place in the bss; the constructor call is cut and the host runs Unreal's heap on a malloc zone (patches.py, hle_uemalloc.c layout UE5_6), and the SDK's node area is
+# cut to 62 MB (dm/tools/sdk_patches.py, the SDK build of STEINS;GATE RE:BOOT). The engine hands its region out with a page allocator of its own (main+0x13ef0): a bump pointer, and
+# freed blocks kept in free lists by size class, so its address use only grows, and past the region's end OnOutOfMemory (main+0x13c74) aborts. This SDK build aligns regions of
+# 2 MB and more to 2 MB only (VammManager::AllocateAddressRegion, sdk+0x145e00), so the region starts right after the node area, in the 5 GB block below, as DRAGON QUEST XI S's.
+game_args	-SwitchVirtualAddressSpaceSize=4064
+mem_reserve	0x140000000
+mem_alias	0x118000000
 mem_stack	0x10000000
 app_pool	0xCD500000
 # the NPDM declares 20 MB of system resource
@@ -44,7 +53,9 @@ sys_resource	0x1400000
 tex_dyn_slots	on
 
 # ---- Shader split ----
-# The shaders are UE5's shader cache records in the .ucas of the IoStore (FFRS/Content/Paks/FFRS-Switch.ucas), not in a .ushaderbytecode archive: each record holds
-# one stage's code area and control section (uepak.py io, the same LSLG records as Octopath Traveler 0's archives)
-shader_groups	FFRS-Switch.ucas=ffrs
+# The shaders are Unreal Engine 5's shader libraries in the IoStore container FFRS-Switch.utoc / .ucas: two library chunks (type 8: the engine's global shaders and the game's
+# material shaders) with their 5,919 shader groups (type 9). Their tables and groups are Oodle-compressed in two layers, so uepak.py reads them through the game's own decoder in the
+# Mac host's tool mode (Toc / io_archive / OodleHost, DM_OODLE_SERVE, served before the SDK starts, no boot) and writes them as version 2 archives; the split reads them as any other.
+# Unreal combines a vertex and a pixel shader per draw from its pipeline state, so every vertex shader is made to link with any pixel shader (shader_split.py separable_pairs).
+shader_groups	ShaderArchive-Global-=global ShaderArchive-FFRS-=game
 shader_note	FINAL FANTASY RESONANCE shaders

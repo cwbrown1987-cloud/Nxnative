@@ -42,6 +42,8 @@ static const struct { const char *build, *what; int layout; uint64_t obj, vtable
     { "0d9649011312f62e93f6a5673a09d7e9", "OCTOPATH TRAVELER II 1.1.1", UE4_27, 0, 0x64710b0, 0xbecc08 },
     // FINAL FANTASY RESONANCE 1.0.1: the FMallocBinned3 object (main+0x77c6210, bss), its vtable (main+0x67df800, 32 slots), the cut constructor call (main+0x137f0)
     { "84e182f72ee1da4f477804bd05b54c15", "FINAL FANTASY RESONANCE 1.0.1", UE5_6, 0x77c6210, 0x67df800, 0x137f0 },
+    // FINAL FANTASY RESONANCE 1.0.1 (the Korean release, 0100B8A026F14000): the same code at the same addresses (only the resources differ, so the build ID does)
+    { "b7f965b9d7227db8e29f04e84ea7331b", "FINAL FANTASY RESONANCE 1.0.1 (Korean)", UE5_6, 0x77c6210, 0x67df800, 0x137f0 },
 };
 enum { NSLOT = 32 };
 
