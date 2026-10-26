@@ -14,8 +14,8 @@ SDK calls and system services the host answers (`dm/host/hle_*.c`). Each entry: 
 
 ### SDK 3.6.0 answered as SDK 4
 
-- The oldest SDK so far booted to its frame loop with the provisional profile as generated and no host change: the services, the NVN API version (53, as for every SDK up to 10), the audio output and the heap all answered as for SDK 4.
-- **Found on:** [Bayonetta 2](../../dm/games/01007960049A0000/README.md) (PlatinumGames' engine in its Wii U form): what it needed was graphics ([Clears of attachments larger than the render pass](rendering.md#clears-of-attachments-larger-than-the-render-pass), [`Downsample` of a single-sample texture](rendering.md#downsample-of-a-single-sample-texture)) and a reader for its CRI CPK archives ([BNSH files in PlatinumGames DAT archives inside CRI CPK archives](shaders.md#bnsh-files-in-platinumgames-dat-archives-inside-cri-cpk-archives)); [Bayonetta](../../dm/games/010076F0049A2000/README.md), on the same `sdk` and `subsdk0` builds, then needed no change at all (its profile is Bayonetta 2's with its own build row and tables, and the route from the boot to the first fight logged no red line).
+- SDK 3.6.0 booted to its frame loop with the provisional profile as generated and no host change: the services, the NVN API version (53, as for every SDK up to 10), the audio output and the heap all answered as for SDK 4.
+- **Found on:** [Bayonetta 2](../../dm/games/01007960049A0000/README.md) (PlatinumGames' engine in its Wii U form): what it needed was graphics ([Clears of attachments larger than the render pass](rendering.md#clears-of-attachments-larger-than-the-render-pass), [`Downsample` of a single-sample texture](rendering.md#downsample-of-a-single-sample-texture)) and a reader for its CRI CPK archives ([BNSH files in PlatinumGames DAT archives inside CRI CPK archives](shaders.md#bnsh-files-in-platinumgames-dat-archives-inside-cri-cpk-archives)); [Bayonetta](../../dm/games/010076F0049A2000/README.md), on the same `sdk` and `subsdk0` builds, then needed no change at all (its profile is Bayonetta 2's with its own build row and tables, and the route from the boot to the first fight logged no red line). [OCTOPATH TRAVELER](../../dm/games/010057D006492000/README.md)'s SDK 3.5.1 answered as SDK 4 as well (NVN 53.313); its audio renderer needed the update lock found without `SdkMutexType` ([No `SdkMutexType` in SDK 3](audio.md#no-sdkmutextype-in-sdk-3)).
 
 ### Listing a game's unhooked imports before they are met
 
@@ -234,6 +234,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Cause:** the SDK's vibration graph flushes queued values with `hid::detail::SendVibrationValues`, which opens the hid service. The game sets handles on its `VibrationTarget`s even when the host reports no vibration device.
 - **Fix:** the flush calls it through the PLT, so an `HLE_FORCE` on that symbol catches it and returns success (`hle_hid.c`).
 - **Found on:** [Metroid Dread](../../dm/games/010093801237C000/README.md).
+
+### Vibration handles before a controller is reported
+
+- **Symptom:** `DM_RUMBLE_LOG=1` shows the game's startup handle request answered with none, then every vibration value sent to handle 0 and reaching no output for the whole session, although a controller with haptics (a DualSense on the Mac) is connected. A game that rumbles would stay silent.
+- **Cause:** `hid::GetVibrationDeviceHandles` answered 0 handles until a controller's haptics were routed. Games ask once at startup, before GameController reports the pad, and keep the answer. On Horizon the handles are computed from the npad id and style alone (libnx `_hidGetVibrationDeviceHandles`).
+- **Fix (resolved):** the handles no longer wait for a routed output: with rumble on and an output sink installed (`dm_haptics_enabled`), a connected npad style gets its two handles; `vib_send` checks for an output at each send (`hle_hid.c`). No sink, rumble off or a disconnected npad still get none, and `IsVibrationPermitted` still follows the routed outputs. `DM_RUMBLE_LOG=1` logs the handle requests and, once a second, the values sent, those with no routed output and the peak amplitude. Each input value is counted separately, including mixed batches; a mutex protects the diagnostic totals across game threads. `t_hid` covers cached startup handles delivering a nonzero value after routing, mixed-batch diagnostics and concurrent sends; `t_hid_tsan` checks those sends for data races.
+- **Found on:** [Unicorn Overlord](../../dm/games/010069401ADB8000/README.md) (the Asian release, `010054B01AD92000`), in the log only: the game has no rumble of its own (it sends amplitude 0 throughout), so nothing could be felt before or after. Not yet checked on a game that rumbles.
 
 ### Touch gestures recognized from the touch points
 
@@ -542,6 +549,14 @@ Most service calls can be found before they crash, before the first boot or the 
 
 ## Modules and symbols
 
+### Host symbol indexes avoid repeated name scans
+
+- **Symptom:** relocation repeatedly scans all HLE and forced-takeover entries, and named-stub reuse becomes quadratic as more imports are missing.
+- **Cause:** module exports already had a name index, but `resolve_import`, `hle_implements`, `force_lookup` and stub reuse still searched their tables linearly.
+- **Fix:** open-addressed name indexes store entry numbers. HLE duplicates retain the first entry; forced-takeover duplicates still abort. Stub insertion grows its index above half capacity and retains existing stub numbers. Resolution is serialized at startup and by the module write lock during runtime NRO loading; module string tables stay mapped across unload.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md#found-on-this-game), reported in [PR #261](https://github.com/seedds/nxnative/pull/261).
+- **Check:** `make -C dm/host/tests GAME=010015100B514000 symbols nro` covers collisions that wrap around the table, duplicate precedence/rejection, absent sections and names, counting-wrapper selection, all 4,096 stubs through growth and reuse at capacity, and NRO relocation/lifecycle. The symbol test also passes AddressSanitizer and UBSan. A local arm64 Mac synthetic 270-entry HLE table with 25% misses, Apple clang 21 at `-O1`, took 375–442 ns per linear lookup versus 15 ns indexed (25–29x; three runs of 360,000 lookups). This measures lookup cost, not overall game loading time; no new gameplay run here.
+
 ### Global symbol resolution in load order
 
 - **Symptom:** a library's `free` rejects a pointer (`CentralHeap::Free` → `NotNMallocPtrError`).
@@ -587,6 +602,20 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Cause:** NVIDIA's OpenGL and Vulkan drivers (`subsdk1`, `subsdk0`) program the GPU through NvRm, which the host does not have.
 - **Fix:** they are never loaded (`profile_guess.py` `GPU_DRIVERS`); the EGL imports stay unbound stubs that nothing calls.
 - **Found on:** [Absolum](../../dm/games/0100A83022A22000/README.md) (FNA3D).
+
+### Modules only the NROs import from
+
+- **Symptom:** `UNIMPL _ZN5movie12SetAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_`, `UNIMPL glslcInitialize`, then `UNIMPL _ZN5movie9ExtractorC1ENS_13ContainerTypeE` and a crash reading address 0x18 in an NRO (`pc=nro18+0x97f4`) as the first movie starts.
+- **Cause:** the provisional profile loads a subsdk only when `main` imports something from it that the host does not supply. The survey extracts only the code modules, so the NROs in the RomFS were not looked at. Portal's `main` is a launcher with SDL; its Source engine NROs play the movies through NintendoSDK_movie (`subsdk2`, imported by `video_nx.nro`) and initialize and call GLSLC (`subsdk0`, imported by `materialsystem.nro` and `video_nx.nro`). Left out, their imports were bound to stubs, and the stub constructor of `movie::Extractor` left the object empty.
+- **Fix:** once the rewrite stage has collected the NROs, the NSP script adds to a provisional profile every subsdk whose exports an NRO imports and that no loaded module, other NRO or host hook supplies (`profile_guess.py` `nro_modules`, written under a section `After the NRO collection`). NVIDIA's GPU drivers stay out, as above.
+- **Found on:** [Portal](../../dm/games/01007BB017812000/README.md) (`modules main subsdk0 subsdk2 sdk`; `subsdk1`, NVIDIA's OpenGL driver, stays out).
+
+### `ro::LookupModuleSymbol` for a name the module does not define
+
+- **Symptom:** `[RED] ro::LookupModuleSymbol BuiltDebug: not defined in that module` once at boot; nothing goes wrong after it.
+- **Cause:** the Source engine asks each module it loads for `BuiltDebug`, which only its debug builds define. `ldr:ro` fails such a lookup on Horizon too, and the game takes the failure as "release build".
+- **Fix:** the host's answer was already Horizon's (a failure result). The line is no longer red when the module is a loaded one; a lookup in a module the host does not know stays red (`hle_ro.c`).
+- **Found on:** [Portal](../../dm/games/01007BB017812000/README.md).
 
 ### IL2CPP common string table intact
 

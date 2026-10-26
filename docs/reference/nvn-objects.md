@@ -65,6 +65,21 @@ The game may also write into an NVN object directly, without an NVN call, throug
 - **Fix:** such a pool gets an address range of its own at `MemoryPoolInitialize` (reserved, inaccessible: 64 GB on the Mac, at most 1 GB on iOS), and each mapping request `vm_remap`s the physical pages over its part of the range, so virtual addresses read and write the same memory, as the GPU's page table does. Each run of mapped pages is registered with the replay like a pool of its own and rebuilt when a request joins or splits runs (`vpool_*` in `hle_nvn.c`). Mario's 128 MB pool, mapped whole onto one physical pool, keeps the alias. The log reports the mapped high-water mark per 128 MB.
 - **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md).
 
+### Virtual pools of one texture each, mapped before and after the texture
+
+- **Symptom:** `[RED] MapVirtual: non-contiguous mapping (true sparse) not implemented`, on small virtual pools; streamed textures black or missing (OCTOPATH TRAVELER's village ground and plants).
+- **Cause:** Unreal Engine 4.18's NVN RHI gives each streamed texture a virtual pool of its own (0x20000 to 0x560000 bytes, flags 0x2a1), creates the texture in it before mapping anything, maps the mip tail from a 4 MB physical pool after writing its texels there on the CPU, and later maps the higher mips from other pages of that pool. Only pools larger than the application pool had [an address range of their own](#sparse-virtual-pools-built-from-separate-physical-pools); the others were aliased onto `physical − offset` at their first mapping, so the texture had no storage (its pool had none when it was created) and every later mapping at another base was refused.
+- **Fix:** every virtual pool gets its reserved range at `MemoryPoolInitialize` (`vpool_reserve`; the sparse records are now one per pool, reached through `pool_t.vp`, without the old limit of 4). Its first mapping request decides: one that maps the whole pool from offset 0 keeps the alias (the range is given back; Mario's 128 MB pool), anything else makes the pool sparse, with the page table and the uploads through it ([next entry](#textures-read-through-a-4-kb-page-table-of-a-sparse-pool)).
+- **Found on:** [OCTOPATH TRAVELER](../../dm/games/010057D006492000/README.md): 221 pools by the first village; the same route with the old alias left the ground, plants and props black.
+- **Not checked:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) (no game files on hand), whose pool should take the alias branch as before.
+
+### The sparse tile layout of a texture
+
+- **Symptom:** `[RED] NVN unimplemented function called: nvnTextureBuilderGetSparseTileLayout`, then an out-of-memory abort in Unreal's allocator (`Failed to allocate 1879113728 bytes from Standard Allocator`, on `DM_DBG=1`).
+- **Cause:** the call fills `NVNtextureSparseTileLayout` {numTiledLevels, tile width, height and depth in texels, 16 reserved bytes}; Unreal Engine 4.18 sizes a sparse texture's mip tail as storage(all levels) − storage(numTiledLevels levels) and allocates it from its heap. Unimplemented, the count was stack garbage and the whole 1.75 GB texture counted as tail.
+- **Fix:** `nvnTextureBuilderGetSparseTileLayout` and `nvnTextureGetSparseTileLayout` answer from the host's [sparse layout](rendering.md#sparse-textures-laid-out-in-64-kb-tiles) (`nvn_tex_sparse_tiles`: the levels at least one tile wide, high and deep).
+- **Found on:** [OCTOPATH TRAVELER](../../dm/games/010057D006492000/README.md), at boot (`main+0x1f1a688`).
+
 ### Textures read through a 4 KB page table of a sparse pool
 
 - **Symptom:** `CRASH sig=10` in `memmove` from `pkg_upload` → `nvn_deswizzle`, at an address 32 GB into a sparse virtual pool; textures with unaliased tails came out magenta.
@@ -162,6 +177,16 @@ Games read this count as a position in their own command memory and size their h
 - **Check:** GPU load from outside: `ioreg -r -d 1 -c IOAccelerator | grep 'Device Utilization'` at 100 % means a shader is looping forever. Find the shaders first used in the last frames (`DM_NVN_PASSDUMP`, compare the `K` keys) and look at their `.metal` for an empty `do {} while (true);` with no `return` (one such case: [Exact program start for the decoder](shaders.md#exact-program-start-for-the-decoder)).
 - **Found on:** no game named in the source (general).
 
+### The game's SyncWait wakes on the GPU's own signal of its fence
+
+- **Symptom:** the frame's blocking SyncWait on its newest fence wakes about 0.26–0.29 ms after the GPU end (M2 Max; the wait ledger, `DM_NVN_WAITS=1`), on the critical path of every frame.
+- **Cause:** the waiter slept until the commit feedback handler of the fence's submission had run, which comes that long after the GPU end.
+- **Fix:** the game's waits (newest fence, older fence, acquire sync) wait on `g_ev`, which the queue signals after each submission, and then make the CPU-side writes of every submission up to the fence that no handler has made yet (`post_early`: events, samples-passed and counter reports; a ring of `POST_RING` records, each run once by whichever comes first). A counter report of the fence's last segment takes the wake as that segment's end. `DM_NVN_FAST_WAKE=0` turns it off.
+- **Note:** the commit feedback handler's other blocks (diagnostics such as `DM_NVN_FUSE_CHECK`) still run when the handler does, after a fast-woken wait has returned.
+- **Resolved in review of #158:** claiming a record is not completion. The original early path skipped records a handler or another waiter owned and advanced `g_done` before their writes finished; a delayed callback also retained a recyclable slot pointer. `post_claim` now holds `g_post_mu` through `post_run`, and both contenders call `post_complete` with their fence to apply earlier records in order. A slot is reused under that lock only after its writes finish; an old fence cannot claim its new generation. `g_done` and `g_fence` are atomic.
+- **Check:** `make -C dm/gfx/tests GAME=010015100B514000 check_t_perf_order` covers a paused completion owner, a competing waiter, recycled-slot generations, event order and exactly-once writes, with direct/deferred encoding and fast wake disabled. `t_perf_order --cpu` and `perf-order-tsan` run the completion cases without a GPU in CI. The original harness reproduced premature completion; the corrected CPU cases pass ThreadSanitizer. Current gameplay coverage and timing limits are recorded in [BotW](../../dm/games/01007EF00011E000/README.md#final-synchronization-and-pass-validation-2026-10-26-current) and [Metroid Dread](../../dm/games/010093801237C000/README.md#final-gameplay-validation-2026-10-26-current); [13 Sentinels](../../dm/games/01003FC01670C000/README.md#rendering) has additional menu/report traffic coverage.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md): it reads 5 timestamp reports a frame right after the wait (its interval controller and dynamic resolution), which is why the waiter makes them itself. Wake after the GPU end 0.29 → 0.08 ms on an M2 Max, 0.147 ms on an iPhone 17 Pro Max.
+
 ### `nvnQueueFinish` waits for the GPU, not the display
 
 - **Symptom:** loading screens many times slower on the iPhone than on the Mac (Three Houses' first loading screen 78 s on the iPhone, 5 s on the Mac).
@@ -172,6 +197,22 @@ Games read this count as a position in their own command memory and size their h
 
 ## CPU-written textures
 
+### CPU deswizzle copies use slice and row offsets
+
+- **Symptom:** CPU texture uploads spend time recalculating block-linear addresses and calling variable-length `memcpy` for every 16-byte segment.
+- **Cause:** `move` called `nvn_bl_offset` inside its innermost loop, repeating slice/row calculations and division by runtime block dimensions.
+- **Fix:** hoist slice and row offsets, express power-of-two block dimensions as shifts/masks, and use the four fixed x offsets and eight fixed y offsets within a GOB. Full segments use constant-size 16-byte copies; byte counts not divisible by 16 retain a tail copy. ASTC blocks are always 16 bytes irrespective of their texel dimensions. Both copy directions preserve the layout, sparse row padding and mip/layer offsets.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md#found-on-this-game), reported in [PR #261](https://github.com/seedds/nxnative/pull/261).
+- **Check:** `t_tex` compares both directions against the byte-address formula for 1,029 deterministic layouts, including 1D/2D/3D, arrays/cubes, packaged block dimensions, sparse mip tails, 1/2/3/4/6/8/12/16-byte formats, padded pitches and partial segments. All 5,334 checks pass, including under AddressSanitizer and UBSan. A local arm64 Mac comparison against the old implementation, Apple clang 21 at the host's `-O1`, measured 7.4–7.7 GB/s before and 35.1–37.6 GB/s after (4.6–5.1x) across 1024x1024 sparse ASTC 6x6, 2048x2048 BC7, 1920x1080 RGBA8 and 1280x720 RGBA16F. Each result is the median of seven runs copying about 128 MiB, with implementation order alternated. This is a CPU microbenchmark; no new gameplay run here.
+
+### Packaged texture block dimensions and linear storage rows
+
+- **Symptom:** driver comparisons report the wrong block dimensions for packaged 2D / 3D textures, or too little storage for linear block-compressed textures (64x64 BC1 with stride 128: 2048 bytes instead of 8192).
+- **Cause:** `SetPackagedTextureLayout` byte 0 holds log2 block height in its low nibble and log2 block depth in its high nibble. The host treated the whole byte as a 2D block height and ignored it for 3D. Linear storage was sized by compressed block rows, while NVN counts pixel rows.
+- **Fix:** `nvn_tex_layout` decodes both nibbles for 3D and only the height nibble for 2D; a present byte of zero overrides automatic dimensions too (`pkg_block_h` stores byte 0 + 1). Level offsets and CPU / GPU deswizzling use those shared dimensions, reduced for smaller mips. Both linear flags use stride times pixel height, preserving row alignment and explicit strides.
+- **Check:** `t_tex_layout` covers nine driver-derived shapes; four fail before the fix. `t_tex` also decodes packaged 3D markers at independently calculated addresses and checks mip dimensions and offsets; `t_deswz_gpu` checks both packaged 3D layouts across six mips on Metal. `MINIMAL_LAYOUT` (0x200) remains unimplemented; linear compressed-texture uploads are outside these storage checks.
+- **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md): digitalhivehub's driver probes in [PR #11](https://github.com/seedds/nxnative/pull/11), ported through MacNativeGames `3c482a7` and [PR #201](https://github.com/seedds/nxnative/pull/201). Validated here with CPU and synthetic Mac GPU tests; packaged 3D / linear BC gameplay and the iPhone have not been rechecked.
+
 ### Linear textures in CPU-visible pools
 
 - **Symptom:** menus and dialogue boxes draw but contain no text, while images and pictogram digits are fine; the sky is black (CPU-written linear colour ramps).
@@ -180,6 +221,13 @@ Games read this count as a position in their own command memory and size their h
 - **Note:** block-linear CPU-written textures still need the packaged-texture re-upload path (next entry).
 - **Check:** `DM_NVN_TEXCPU=1` lists non-packaged textures in CPU-visible pools.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md): its glyph cache (the text texture) and its four 64×1 RGBA16F sky colour ramps.
+
+### Linear render-target storage without the LINEAR flag
+
+- **Symptom:** a trap during graphics initialization in `SetupSurfaceInfoMemoryInside`, asserting `ctx.memorySize <= localmemsetupinfo.memorySize`.
+- **Cause:** `LINEAR_RENDER_TARGET` specifies linear storage independently of `LINEAR`. The Metal backing path recognized either flag, but the storage-size and deswizzle helpers tested only `LINEAR`, underallocating some render targets and treating their rows as block-linear.
+- **Fix:** `nvn_tex.c` recognizes either flag for linear sizing and excludes both from block-linear level offsets, GOB columns and sparse layout. `nvn_deswizzle_geom` rejects both. `tex_linear` uses the same calculated row pitch, including implicit alignment, as `GetStorageSize`. Render-target rows align to 128 bytes; ordinary linear rows align to 32. Explicit strides are preserved. `t_tex` covers the layout and `t_linear_readback` checks a GPU clear against padded CPU-visible rows.
+- **Found on:** [Persona 5 Royal](../../dm/games/01005CA01580E000/README.md#rendering): a 16x16 RGBA8 target with flags `0x44` and stride 128 needs 2 KB; block-linear sizing returned 1 KB.
 
 ### Textures written with `nvnTextureWriteTexels`
 
@@ -225,6 +273,7 @@ Games read this count as a position in their own command memory and size their h
 - **Cause:** the decoder's NV12 output is copied by the game into textures in a CPU-visible pool and published with `nvnMemoryPoolFlushMappedRange`, which the host did not take as an upload.
 - **Fix:** the profile key `tex_flush_upload`. Buffer textures stay out of that path: they are views onto the pool buffer, and an upload would have sent them past Metal's 2D size limit.
 - **Found on:** [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md): a 1280×720 R8 and a 640×360 RG8 texture; the buffer texture kept out is a 1,048,576-texel R32F one.
+- **Also found on:** [NieR:Automata The End of YoRHa Edition](../../dm/games/010056B015FE8000/README.md): the title background; the game note records the controlled comparison.
 
 ### CPU writes with no flush, caught by page protection (`tex_dirty_upload`)
 
@@ -275,6 +324,14 @@ Games read this count as a position in their own command memory and size their h
 - **Fix:** the thread pause for the GC, and the tracker race fixed; `tests/t_dirty_race.c` reproduces the race.
 - **Found on:** [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md): probably fixed; since the pause, 12 runs (eight of them 200 s runs through the movie and title, four of 330 to 850 s) have not stalled once, where one in four used to.
 - **Note:** if a stall comes back, sample the process when its log stops growing (`sample <pid> 3`) to see where every thread waits. The crash handler writes one line with `write()` and exits if the stderr lock stays taken for 1 s, so a stall that holds that lock shows up as such.
+
+### Dirty-page writes missed during upload
+
+- **Symptom:** a CPU-written texture stays stale after later writes; letters can be missing from a glyph cache.
+- **Cause:** a protect skipped a page another thread was unprotecting, leaving it writable with a generation already covered by the upload stamp. Taking the stamp after protecting, or setting the cached last-check generation after the upload, could also cover a fault whose bytes arrived after the read. Separately, an unprotect advanced the global clock before publishing the page generation: a checker could cache a clean result in between and never scan again once the page became writable. Both the page-fault path and batched host pre-write path had that publication window.
+- **Fix:** take the stamp before protecting and reading, and start the last-check generation at that stamp. Finish any pending protection run before waiting for a BUSY page, then retry that page. Both unprotect paths use `stamp_page` to publish the page generation and advance the global clock once more afterward, invalidating checks that ran before publication. These are general tracker and cache rules, with no game-specific gate.
+- **Found on:** [Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), reported in MacNativeGames commit `a166602` and ported through [PR #197](https://github.com/seedds/nxnative/pull/197). The missing-letter symptom has not been reproduced in nxnative; the tracker failures are reproduced locally by the regression tests.
+- **Check:** `t_dirty_race` covers the BUSY-page retry, stamp ordering, and a check between clock allocation and generation publication in both unprotect paths. The publication cases fail on main; the batched case also fails with the original PR applied.
 
 ## NVN entry points
 

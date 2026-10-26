@@ -8,11 +8,12 @@ The audio renderer (`dm/host/hle_audren.c`), AudioOut, audio devices and codecs.
 
 Check whether the SDK carries the renderer: list the `sdk` module's exports for `nn::audio::server::` and `nn::audio::dsp::CommandListProcessor`. If they are there ([Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md), SDK 16), do not write a mixer:
 
-- switch `AudioRendererParameter` to rendering device = CPU (+0x2c = 1) and execution mode = manual (+0x30 = 1) in `GetAudioRendererWorkBufferSize` and both `OpenAudioRenderer` overloads;
+- switch a copy of `AudioRendererParameter` to rendering device = CPU (+0x2c = 1) and execution mode = manual (+0x30 = 1) in `GetAudioRendererWorkBufferSize` and both `OpenAudioRenderer` overloads;
 - call the SDK originals (`guest_sym` returns the module's own code even for a forced symbol);
 - drive `ExecuteAudioRendererRendering` from a guest thread (`dm_guest_thread_spawn`).
 
 The open then goes through `CreateAudioRendererManagerByDfc`; no IPC.
+For a replaced DSP renderer the size query keeps the service's work-buffer contract; a larger local CPU representation is a backend cost. See [A sound engine's heap too small for its renderer and players](#a-sound-engines-heap-too-small-for-its-renderer-and-players).
 
 ### SDK 8's longer `AudioRendererParameter`
 
@@ -43,6 +44,13 @@ The open then goes through `CreateAudioRendererManagerByDfc`; no IPC.
 - **Found on:** [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md) (4.4), the first game it was plainly wrong for.
 - **Check:** checked with sound on [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (11.4, +0x1d8), [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) (7.3, `MutexType` +0x1d8) and [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (7.3, which is silent for its first minute with either lock).
 
+### No `SdkMutexType` in SDK 3
+
+- **Symptom:** `FATAL audren: missing SDK symbol _ZN2nn2os12SdkMutexType4LockEv` right after the renderer's render thread starts.
+- **Cause:** the render path looked up `SdkMutexType::Lock` / `Unlock` before reading which lock the SDK's `Update` takes ([The renderer's update lock](#the-renderers-update-lock-update_lock)); SDK 3.5.1's `sdk` has no `SdkMutexType` and takes `nn::os::LockMutex` at +0x1f8.
+- **Fix:** `render_once` looks up the `SdkMutexType` functions only when `update_lock` does not find `LockMutex` (`hle_audren.c`).
+- **Found on:** [OCTOPATH TRAVELER](../../dm/games/010057D006492000/README.md) (SDK 3.5.1), the first SDK 3 game through the audio renderer (Bayonetta 2's 3.6.0 plays through `AudioOut`).
+
 ### The render thread's route through the public `ExecuteAudioRendererRendering` (SDK 20)
 
 - **Symptom:** `CommandListProcessor::Process` crashes now and then (SIGSEGV under `render_main`, once at 60 s and once at 134 s in the shrine); every `RequestUpdate` renders a catch-up frame.
@@ -62,10 +70,10 @@ The open then goes through `CreateAudioRendererManagerByDfc`; no IPC.
 ### A sound engine's heap too small for its renderer and players
 
 - **Symptom:** the main thread spins at start-up in a resource wait (a `YieldThread` loop, no crash), right after `OpenAudioRenderer`.
-- **Cause:** Koei Tecmo's sound engine (KTSL) failed its setup quietly. The init hands it three heaps cut from one block (15 MB engine memory, 2 MB, 142 MB sound data; the sizes are constants at `main+0x8d9610`). In the 15 MB heap the setup allocates the renderer config and work buffer (0x760000: `AudioRenderSystem::GetWorkBufferSize`, 0x40a9c8 of it command buffer) and one block per player (up to 0x1b5860; three of the four mix 5.1). The fourth block came back null, the setup released its memory pools (`RequestAttachMemoryPool` then `Detach` with no update between) and returned −51, the first sound archive (ASRS) never loaded, and the resource the main thread waited for depended on it.
-- **Fix:** a per-build cut moves 4 MB from the sound data heap to the engine heap (its `patches.py`).
+- **Cause:** the DSP service and an application's local SDK server use different command/state representations. The host forwarded the local CPU server's work-buffer requirement as the guest's DSP-service requirement. Larger local command structures could then exhaust a fixed sound heap that fits the service's budget. Changing only the device / execution fields in the local sizing routine does not reveal this difference: it still sizes the same compiled structures. The game note records the comparison against Horizon's actual sizing code and the resulting allocation failure.
+- **Fix:** `ar_service_work_size` in `hle_audren.c` computes the Horizon service budget through renderer revision 15, with revision gates for graph/splitter storage, effect states, performance frames and command storage. A DSP caller receives that size. On open the host independently asks the SDK for its CPU/manual requirement and supplies a page-aligned, zeroed backend buffer if it exceeds the caller's capacity; a buffer below the declared service requirement is rejected. Both open forms share the allocation, including a nested no-event open. Failed opens free it; close joins the render thread, closes the SDK renderer, then frees it. Explicit CPU renderers keep their SDK contract. A sufficient caller buffer is reused; revisions beyond the verified service model retain the SDK size. No firmware is loaded or distributed at runtime, and no game's heap constants change.
 - **Found on:** [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md).
-- **Note:** how it was found: probe the pump the wait calls (`main+0x8e1c0`: first missing stage bit → the type's stage handler), the handler's dependency list (an incomplete entry of type `0xbbd39f2d`, ASRS), then the memory pool states (`MemoryPoolInfo` +0x10: 1 new, 3 detached, 4 request attach, 5 attached, 6 unused) and the engine allocator's arguments and results. Why hardware fits in 15 MB is not known.
+- **Check:** `make -C dm/host/tests GAME=<id> audren-work` checks independently obtained Horizon sizing fixtures, both public parameter layouts, uninitialized padding, unsupported revisions, nested opens, undersized buffers, failure cleanup, caller-owned storage and close lifetime. The sizing implementation also matched 360 seeded parameter sets executed through Horizon's original machine code across REV1–REV15. The game note records the original-heap reproduction and audio check.
 
 ## Command lists by SDK
 
@@ -112,6 +120,14 @@ The open then goes through `CreateAudioRendererManagerByDfc`; no IPC.
 - **Found on:** [Rhythm Heaven Groove](../../dm/games/0100D9F01D474000/README.md) (SDK 21.4.0, one boot).
 
 ## AudioOut and devices
+
+### Stopping an AudioOut releases its pending buffers
+
+- **Symptom:** FMOD waits for buffer release after stopping an AudioOut, hanging the game during a scene transition.
+- **Cause:** the host stopped its backend but left unplayed and partially played buffers in the pending queue, so no callback could release them.
+- **Fix:** after stopping a started backend, `au_release_pending` moves the pending buffers to the released queue in order, resets the partial-buffer position and signals the client's release event and the host waiter. Calling Stop on an already stopped output preserves buffers queued for its next Start.
+- **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md): reported on 1.0.0 in [PR #190](https://github.com/seedds/nxnative/pull/190); the 1.3.0 bring-up passed that transition before this fix.
+- **Check:** `t_audio_spsc` covers a partially consumed buffer, queue wraparound, release notification, repeated Stop and buffers queued before Start, then runs its 100,000-buffer producer/consumer stress test.
 
 ### RemoteIO's default I/O buffer duration
 

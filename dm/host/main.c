@@ -138,6 +138,7 @@ void dm_host_preload_start(int argc, char **argv) {
 // leaves the call out (DM_NO_APP_MAC in dm/ios/project.yml: ld64 on iOS refuses an undefined weak symbol).
 
 int main(int argc, char **argv) {
+    { int mtl_pso_prebuild_tool(void); if (mtl_pso_prebuild_tool()) return 0; }   // DM_PSO_PREBUILD=tool: the pipeline archive's prebuild alone, no game (nvn_mtl.m)
 #ifndef DM_NO_APP_MAC
     { int dm_app_bootstrap(int *, char ***); dm_app_bootstrap(&argc, &argv); }   // .app 形态（双击起）：把窗口、存档目录、游戏文件、着色器库和日志准备好 | the .app form (double-click): the window, the save directory, the game files, the shader libraries and the log are prepared
 #endif
