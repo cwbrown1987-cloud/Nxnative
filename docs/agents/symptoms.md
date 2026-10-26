@@ -324,6 +324,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 - no SPIR-V file in the RomFS; SPIRV-Cross refuses a module with "Struct member does not have ArrayStride set". → [Vulkan shaders generated at run time](../reference/rendering.md#vulkan-shaders-generated-at-run-time)
 - a crash in `bind_res` reading a freed view's texture (Super Mario Galaxy 2 on an iPhone, element 1 of the 8-texture array, when the ship took off after the first galaxy; GitHub issue 68). → [Descriptors hold the Metal objects they were written with](../reference/rendering.md#descriptors-hold-the-metal-objects-they-were-written-with)
 - Metal refuses the pipeline: "Fragment shader does not write to render target color(0), index(1)". → [Dual-source blending from output location 1](../reference/rendering.md#dual-source-blending-from-output-location-1)
+- the process ends on Apple's assertion `[AGX] Failed assertion "error == MTLCompilerErrorNoError"` in `findOrCreateComputeFastClearPipeline` / `getStatelessPSODynamicLibrary`; `MTLCompilerService` crash reports (`EXC_BAD_ACCESS` in `AGCLLVMStatelessFragmentObject::buildBlendFactor`) at the same moment; under lldb, `pso_build` waits in `newRenderPipelineStateBySpecializationWithDescriptor:` for that compile. → [Dual-source blending in NVN pixel shaders](../reference/rendering.md#dual-source-blending-in-nvn-pixel-shaders)
 - Metal's validation aborts on a buffer layout no mapped attribute uses. → [Scaled and three-component vertex formats](../reference/rendering.md#scaled-and-three-component-vertex-formats)
 - menus 1.5x too big in handheld mode (the file-creation dialog cut off at the right edge). → [Viewport and scissor persist across render passes](../reference/rendering.md#viewport-and-scissor-persist-across-render-passes)
 - `draw outside a render pass`; the rest of the pass was dropped. → [Copies inside a render pass](../reference/rendering.md#copies-inside-a-render-pass)
@@ -338,6 +339,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 
 - `shader_split.py` finds 0 shaders in a RomFS of zstd files named `.zst`. → [Zstd files recognised by their magic](../reference/shaders.md#zstd-files-recognised-by-their-magic)
 - a provisional split finds only a fraction of the shaders (3,126 of Pokémon Sword's 41,516). → [BNSH entries of GFPAK archives](../reference/shaders.md#bnsh-entries-of-gfpak-archives)
+- `[RED] /bin/archive/ai/ai.gfpak: entry 0 has compression 3 (Oodle), which this reader does not decode` stops the shader split. → [Oodle entries of GFPAK archives](../reference/shaders.md#oodle-entries-of-gfpak-archives)
 - the split found no shader in the game (0 shaders). → [GLSLC outputs holding several stages](../reference/shaders.md#glslc-outputs-holding-several-stages)
 - 24 shaders before the control-length fix, 1,355 after. → [SPKG packages in KTGL LINKDATA](../reference/shaders.md#spkg-packages-in-ktgl-linkdata)
 - `[RED] ... PKZ version 0x10000: only 0x20000 is known` stops the shader split. → [PKZ version 1 archives](../reference/shaders.md#pkz-version-1-archives)

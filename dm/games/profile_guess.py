@@ -170,12 +170,12 @@ GPU_DRIVERS = {'NintendoSDK_OpenGL', 'NintendoSDK_Vulkan'}
 
 
 # ---- Shader sources: decided from the game files at every build, not kept in the profile (scripts/build_ipa_from_nsp.py; shader_split.py reads what those steps write) ----
-def shader_sources(imports, glsl_src, glslc_mods, spirv, unreal_paks, trinity_packs=0, legacy_paks=0, gl_names=0, gl_src=0, gl_files=0, oodle_pkz=0):
+def shader_sources(imports, glsl_src, glslc_mods, spirv, unreal_paks, trinity_packs=0, legacy_paks=0, gl_names=0, gl_src=0, gl_files=0, oodle_pkz=0, oodle_gfpak=0):
     """{name: (value, reason)}: graphics (vulkan when main imports Vulkan functions and not nvnBootstrapLoader; gl when it imports eglCreateWindowSurface and names glShaderSource, so it compiles
     GLSL through OpenGL (gl_names: how often main has that name; Absolum imports the same EGL functions for SDL3 but renders with NVN and names no GL function); else nvn; vkGetInstanceProcAddr
     alone is SDL's Vulkan loader, which Balatro's LÖVE links and never uses), vk_capture (a Vulkan game without SPIR-V files generates its shaders at run time), gl_capture (an OpenGL game with no
     GLSL source where gl_shaders.py looks, gl_src strings in main and gl_files files in the RomFS: it puts its shaders together at run time, LÖVE from its Lua), glslc_capture (main holds GLSL sources and calls glslcCompile in a module the game loads: it compiles some shaders at run time), ue_decode (Unreal paks keep the shaders Oodle-compressed
-    in their shader code archives, which only the game's own Oodle decodes), oodle_packs (Trinity packs, or oodle_pkz PlatinumGames PKZ archives with Oodle Kraken entries:
+    in their shader code archives, which only the game's own Oodle decodes), oodle_packs (Trinity packs, oodle_pkz PlatinumGames PKZ archives with Oodle Kraken entries, or oodle_gfpak Game Freak GFPAK archives with Oodle entries:
     Oodle-compressed file by file, which the shader split decodes with the game's own decoder in the Mac host's tool mode), ue_legacy (Unreal paks whose shaders are inline in the cooked packages:
     legacy paks, version 4, which the shader split reads through the game's own decoder the same way, and version 11 paks without shader code archives, Zlib, read by uepak.py itself).
     unreal_paks counts the paks with shader code archives, legacy_paks those with inline shaders (uepak.inline_shaders). Checked against every profile: Hades and Super Mario Galaxy Vulkan, Galaxy alone with no SPIR-V file, Three Houses alone compiling
@@ -191,8 +191,8 @@ def shader_sources(imports, glsl_src, glslc_mods, spirv, unreal_paks, trinity_pa
             'glslc_capture': (not vulkan and not gl and bool(glsl_src) and 'glslcCompile' in imports and bool(glslc_mods),
                               f'main holds {glsl_src} GLSL sources and calls glslcCompile in {", ".join(glslc_mods) or "no module it loads"}: shaders compiled at run time (Fire Emblem: Three Houses), captured by booting it on the Mac'),
             'ue_decode': (not vulkan and not gl and bool(unreal_paks), f'{unreal_paks} Unreal pak(s): the shaders are Oodle-compressed in their shader code archives (Octopath Traveler 0), decoded by booting the game on the Mac'),
-            'oodle_packs': (not vulkan and not gl and bool(trinity_packs or oodle_pkz), (f'{trinity_packs} Trinity pack file(s) (ONEPACK, arc/data.trpfs: Pokémon Legends: Z-A)' if trinity_packs else
-                            f'{oodle_pkz} PlatinumGames PKZ archive(s) with Oodle Kraken entries (Bayonetta 3)') + ', Oodle-compressed: the shader split decodes them with the game\'s own decoder in the Mac host (dm/host/hle_oodle.c DM_OODLE_SERVE)'),
+            'oodle_packs': (not vulkan and not gl and bool(trinity_packs or oodle_pkz or oodle_gfpak), (f'{trinity_packs} Trinity pack file(s) (ONEPACK, arc/data.trpfs: Pokémon Legends: Z-A)' if trinity_packs else
+                            f'{oodle_pkz} PlatinumGames PKZ archive(s) with Oodle Kraken entries (Bayonetta 3)' if oodle_pkz else f'{oodle_gfpak} Game Freak GFPAK archive(s) with Oodle entries (Pokémon Legends: Arceus)') + ', Oodle-compressed: the shader split decodes them with the game\'s own decoder in the Mac host (dm/host/hle_oodle.c DM_OODLE_SERVE)'),
             'ue_legacy': (not vulkan and not gl and bool(legacy_paks), f'{legacy_paks} Unreal pak(s) with the shaders inline in the cooked packages (legacy, version 4, UE 4.18: DRAGON QUEST XI S, LZ5, decoded by the game\'s own decoder in the Mac host, dm/host/hle_oodle.c DM_OODLE_SERVE; '
                           'version 11 without shader code archives, UE 4.27: OCTOPATH TRAVELER II, Zlib): the shader split reads them file by file')}
 
@@ -221,7 +221,16 @@ def build_sources(exefs, romfs, modules):
                     h = f.read(0x20)
                     if h[:4] == b'pkzl':
                         cnt, eo, nl = struct.unpack_from('<III', h, 0x10); f.seek(eo + 0x20 * cnt); oodle_pkz += b'OodleKraken\0' in f.read(nl)
-    return shader_sources(imports, glsl_src, glslc_mods, spirv, len(uepak.unreal_paks(str(romfs), inline=False)), trinity, len(uepak.unreal_paks(str(romfs), inline=True)), gl_names, gl_src, gl_files, oodle_pkz)
+    oodle_gfpak = 0   # Game Freak GFPAK archives with an Oodle entry (compression 3 in the 0x18-byte file table entries, shader_split.py gfpak_members): decoded with the game's own decoder
+    for d, _, names in os.walk(romfs):
+        for n in names:
+            if n.endswith('.gfpak'):
+                with open(os.path.join(d, n), 'rb') as f:
+                    h = f.read(0x20)
+                    if h[:8] == b'GFLXPACK':
+                        cnt, _, files = struct.unpack_from('<IIQ', h, 0x10); f.seek(files); t = f.read(0x18 * cnt)
+                        oodle_gfpak += any(struct.unpack_from('<H', t, 0x18 * i + 2)[0] == 3 for i in range(len(t) // 0x18))
+    return shader_sources(imports, glsl_src, glslc_mods, spirv, len(uepak.unreal_paks(str(romfs), inline=False)), trinity, len(uepak.unreal_paks(str(romfs), inline=True)), gl_names, gl_src, gl_files, oodle_pkz, oodle_gfpak)
 
 
 def va_heap(sysres, imports):   # virtual address memory (an NPDM system resource) and a heap: the alias / heap split is a starting point the heap check corrects (Wonder, Tears of the Kingdom; Engage's pool is its own measurement)

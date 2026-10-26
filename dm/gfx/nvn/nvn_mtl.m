@@ -1340,7 +1340,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[113];
+static int g_red_once[114];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -2959,7 +2959,7 @@ static void shmap_load(void) {
     warm_start();
 }
 
-@interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, fn_u, fn_m, geo_fn; uint8_t mask_m;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose colour attachments are all unsigned integer (pso_desc); fn_m: the mixed one, its outputs in mask_m unsigned integer
+@interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, fn_u, fn_m, fn_d, geo_fn; uint8_t mask_m;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose colour attachments are all unsigned integer (pso_desc); fn_m: the mixed one, its outputs in mask_m unsigned integer
     uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
     id<MTLComputePipelineState> geo_pso;
@@ -3168,11 +3168,14 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     if (stage == 1 && j[@"entry_u"]) { o->fn_u = fn4_note([lib newFunctionWithName:j[@"entry_u"]], lib, j[@"entry_u"], nil); if (!o->fn_u) MLOG("[RED] shader %s: no integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_u"] UTF8String]); }
     if (stage == 1 && j[@"entry_m"]) { o->fn_m = fn4_note([lib newFunctionWithName:j[@"entry_m"]], lib, j[@"entry_m"], nil); o->mask_m = (uint8_t)[j[@"uint_mask_m"] unsignedIntValue];
         if (!o->fn_m) MLOG("[RED] shader %s: no mixed integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_m"] UTF8String]); }
+    // fn_d: the dual-source entry point (dmsh_build.py fs_dual: colour output 1 as the second source of attachment 0), for pipelines whose blend reads it (pso_desc)
+    if (stage == 1 && j[@"entry_d"]) { o->fn_d = fn4_note([lib newFunctionWithName:j[@"entry_d"]], lib, j[@"entry_d"], nil); if (!o->fn_d) MLOG("[RED] shader %s: no dual-source entry point %s in its library", pc.UTF8String, [j[@"entry_d"] UTF8String]); }
     if (o->fn.functionConstantsDictionary.count) {
         NSError *fe = nil; MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new]; id<MTLFunction> f = fn4_note([lib newFunctionWithName:entry constantValues:cv error:&fe], lib, entry, cv);
         if (f) o->fn = f; else MLOG("[RED] shader %s: specializing its function constants failed: %s", pc.UTF8String, fe.localizedDescription.UTF8String);
         if (o->fn_u) { f = fn4_note([lib newFunctionWithName:j[@"entry_u"] constantValues:cv error:&fe], lib, j[@"entry_u"], cv); o->fn_u = f; }
         if (o->fn_m) { f = fn4_note([lib newFunctionWithName:j[@"entry_m"] constantValues:cv error:&fe], lib, j[@"entry_m"], cv); o->fn_m = f; }
+        if (o->fn_d) { f = fn4_note([lib newFunctionWithName:j[@"entry_d"] constantValues:cv error:&fe], lib, j[@"entry_d"], cv); o->fn_d = f; }
     }
     if (o->rf.nb) {
         o->ae = [o->fn newArgumentEncoderWithBufferIndex:o->rf.abi];
@@ -4294,6 +4297,26 @@ static int pso_mixed_uint(const pso_key *k, NvShader *fs, int merged) {
     }
     return ints && floats;
 }
+// Dual-source blending (NVN's SRC1_* factors): the second source is the pixel shader's colour output 1, which Metal reads from [[color(0), index(1)]] (dmsh_build.py fs_dual's main0_d).
+// A pipeline whose fragment function has no such output must not name the factors: Apple's compiler crashed building its blend (MTLCompilerService in buildBlendFactor, then the
+// driver's assertion "error == MTLCompilerErrorNoError" ended the process: Pokémon Legends: Arceus, an RGBA16Float target with destination factor SRC1_ALPHA). Without the entry point
+// (a shader with no colour output 1, a merged or framebuffer-fetch function) the factors read the first source instead, with a red line
+static int src1_fac(MTLBlendFactor f) { return f == MTLBlendFactorSource1Color || f == MTLBlendFactorOneMinusSource1Color || f == MTLBlendFactorSource1Alpha || f == MTLBlendFactorOneMinusSource1Alpha; }
+static MTLBlendFactor src0_fac(MTLBlendFactor f) {
+    switch (f) { case MTLBlendFactorSource1Color: return MTLBlendFactorSourceColor; case MTLBlendFactorOneMinusSource1Color: return MTLBlendFactorOneMinusSourceColor;
+        case MTLBlendFactorSource1Alpha: return MTLBlendFactorSourceAlpha; case MTLBlendFactorOneMinusSource1Alpha: return MTLBlendFactorOneMinusSourceAlpha; default: return f; }
+}
+static int pso_dual_source(MTLRenderPipelineDescriptor *d) {
+    for (int i = 0; i < 8; i++) { MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[i];
+        if (c.blendingEnabled && (src1_fac(c.sourceRGBBlendFactor) || src1_fac(c.destinationRGBBlendFactor) || src1_fac(c.sourceAlphaBlendFactor) || src1_fac(c.destinationAlphaBlendFactor))) return 1; }
+    return 0;
+}
+static void pso_drop_src1(MTLRenderPipelineDescriptor *d, const char *key) {
+    RED_ONCE(113, "dual-source blending without a dual-source entry point (pixel shader %s): the second-source blend factors read the first source", key);
+    for (int i = 0; i < 8; i++) { MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[i];
+        c.sourceRGBBlendFactor = src0_fac(c.sourceRGBBlendFactor); c.destinationRGBBlendFactor = src0_fac(c.destinationRGBBlendFactor);
+        c.sourceAlphaBlendFactor = src0_fac(c.sourceAlphaBlendFactor); c.destinationAlphaBlendFactor = src0_fac(c.destinationAlphaBlendFactor); }
+}
 static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = vs->fn; d.fragmentFunction = fsfn ? fsfn : fs ? fs->fn : nil;
@@ -4336,6 +4359,10 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
             c.sourceAlphaBlendFactor = bfac(bl.src_a); c.destinationAlphaBlendFactor = bfac(bl.dst_a);
             c.rgbBlendOperation = bop(bl.eq_rgb); c.alphaBlendOperation = bop(bl.eq_a);
         }
+    }
+    if (d.fragmentFunction && pso_dual_source(d)) {   // a blend factor reads the second source: the dual-source entry point (dmsh_build.py fs_dual)
+        if (fs && fs->fn_d && !fsfn && d.fragmentFunction == fs->fn) d.fragmentFunction = fs->fn_d;
+        else pso_drop_src1(d, fs ? fs->key : "?");
     }
     d.depthAttachmentPixelFormat = (MTLPixelFormat)k->dfmt; d.stencilAttachmentPixelFormat = (MTLPixelFormat)k->sfmt;
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];

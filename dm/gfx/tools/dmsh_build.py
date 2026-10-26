@@ -695,6 +695,22 @@ def fs_uint(src):
         mask = sum(1 << int(re.search(r'color\((\d+)\)', at).group(1)) for _, nm, at in mem if nm in from_int)
     return out, mask
 
+def fs_dual(src):
+    """Dual-source blending. NVIDIA's hardware feeds a pixel shader's colour output 1 to blend factors that read the second source (NVN's SRC1_COLOR / SRC1_ALPHA and their
+    complements), and the translator declares that output [[color(1)]]; Metal reads the second source from [[color(0), index(1)]]. Pokémon Legends: Arceus blends an RGBA16Float
+    target with destination factor SRC1_ALPHA: with no such output Apple's compiler crashed building the pipeline's blend (MTLCompilerService, buildBlendFactor). A pixel shader with
+    an output at colour 1 gets another entry point, main0_d, the same body returning colour 0 and colour 1 as the two sources of attachment 0 (the others left out: dual-source
+    blending writes attachment 0 alone); the host takes it for a pipeline whose blend reads the second source (nvn_mtl.m pso_desc). → the entry point's source, or None"""
+    m = re.search(r'^.*\bfragment\s+main0_out\s+main0\s*\(', src, re.M); st = re.search(r'struct main0_out\s*\{(.*?)\};', src, re.S)
+    if not m or not st: return None
+    mem = re.findall(r'^\s*(\w+)\s+(\w+)\s*(\[\[[^\]]*\]\])?;', st.group(1), re.M)
+    col = lambda at: int(re.search(r'color\((\d+)\)', at).group(1)) if at and 'color(' in at else None
+    if not any(col(at) == 1 for _, _, at in mem): return None
+    keep = [(ty, nm, '[[color(0), index(1)]]' if col(at) == 1 else at) for ty, nm, at in mem if col(at) in (None, 0, 1)]
+    struct = 'struct main0_out_d\n{\n' + ''.join(f'    {ty} {nm} {at};\n' for ty, nm, at in keep) + '};\n\n'
+    ret = 'return main0_out_d{' + ', '.join(f'out.{nm}' for _, nm, _ in keep) + '};'
+    return '\n' + struct + re.sub(r'\bfragment\s+main0_out\s+main0\s*\(', 'fragment main0_out_d main0_d(', src[m.start():], count=1).replace('return out;', ret)
+
 SG_OPS = {333: 'true', 334: 'pred', 335: 'pred', 336: 'true', 337: 'value', 338: 'value', 339: 'ballot', 345: 'value', 346: 'value', 347: 'value', 348: 'value'}   # OpGroupNonUniform* → its one-lane value
 SG_BUILTINS = {36: 'one', 41: 'zero', 4416: 'one4', 4417: 'one4', 4418: 'zero4', 4419: 'one4', 4420: 'zero4'}   # SubgroupSize, SubgroupLocalInvocationId, Eq / Ge / Gt / Le / Lt masks
 def spv_single_lane(path):
@@ -842,12 +858,13 @@ def finish(key, w, j, c1):
         full, lay = vs_layer_entry(full)   # layer entry points for a slice-writing geometry shader (see vs_layer_entry)
         open(msl, 'w').write(full)
     fu, fmask = fs_uint(src) if j['stage'] == 'ps' else (None, 0)   # the integer-output entry points (see fs_uint); the analysis below uses the source with only main0
-    if fu: plain = src; open(msl, 'w').write(fu)
+    fd = fs_dual(src) if j['stage'] == 'ps' else None   # the dual-source entry point (see fs_dual)
+    if fu or fd: plain = src; open(msl, 'w').write((fu or src) + (fd or ''))
     res = json.load(open(os.path.join(w, key + '.res.json')))
     try: MTL.compile('mac', msl, lib)   # MSL identical to one compiled before takes that library (dmsh_mtlcache.py)
     except subprocess.CalledProcessError as e:
-        if not lay and not fu: return 'metal failed', str(e)[:160], None
-        open(msl, 'w').write(plain); lay = fu = None   # the layer and integer-output entry points are extras: a library that does not build with them is built without
+        if not lay and not fu and not fd: return 'metal failed', str(e)[:160], None
+        open(msl, 'w').write(plain); lay = fu = fd = None   # the layer, integer-output and dual-source entry points are extras: a library that does not build with them is built without
         try: MTL.compile('mac', msl, lib)
         except subprocess.CalledProcessError as e: return 'metal failed', str(e)[:160], None
     clone(msl, os.path.join(out, key + '_b.metal'))
@@ -859,7 +876,7 @@ def finish(key, w, j, c1):
     refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
             'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None, **({'entry_z': 'main0_z', 'entry_geometry_capture': 'main0_gs'} if j['stage'] == 'vs' else {}),
             **({'entry_tf': 'main0_tf', 'tf_strides': [e[2] if e else 0 for e in j['tf']]} if j.get('tf') else {}),
-            **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}),
+            **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}), **({'entry_d': 'main0_d'} if fd else {}),
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
             'bindings': reflect(key, j['stage'], src, res),
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],

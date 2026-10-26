@@ -155,4 +155,13 @@ CUTS = {
     (0x346190, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
     (0x34622c, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
+  # Pokémon Legends: Arceus 1.0.0 (v0) sdk (SDK 11.4.0): the node area cut, and regions of 1 GB and more aligned to 32 MB, as Advance Wars 1+2's SDK 10.4.1 build. The NPDM declares a 16 MB
+  # system resource, so malloc's StandardAllocator takes an address region (cut to 4 GB in the game's patches.py); with the 1 GB node area it aborted in nninitStartup (sdk+0x2f98e4 ← main+0x2b12ce8).
+  # The constructor (AddressRegionManagerC2Emm, sdk+0x34e038): +0x34e048 sets the node area limit, +0x34e0e4 registers it as an occupied region; VammManager::AllocateAddressRegion
+  # (sdk+0x34e148) aligns a region by its size, 1 GB from 1 GB up (+0x34e244)
+  'b39add63421be525d352e576dab438d3': [
+    (0x34e048, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0x34e0e4, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+    (0x34e244, '0a00a852', '0a40a052', 'AllocateAddressRegion: alignment of regions of 1 GB and more mov w10,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)'),
+  ],
 }

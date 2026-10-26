@@ -10,10 +10,11 @@ import re
 NFB = 8
 
 def variant(msl, bindings, om_only_ok=False):
-    # main0_u (dmsh_build.py int_outputs: integer colour targets) is appended to the source after main0; the host takes it from the shader's own library, never from this variant.
-    # Its body reads main0's output struct, whose members the variant renames, and its samples were rewritten to fb0–fb7, which only main0 declares: 483 of Breath of the
-    # Wild's variants failed to compile once their cached copies were gone (use of undeclared identifier 'fb0'). The variant is built from the source without it
-    cut = msl.find('\nstruct main0_out_u\n')
+    # main0_u (dmsh_build.py int_outputs: integer colour targets) and main0_d (fs_dual: dual-source blending) are appended to the source after main0; the host takes them from the
+    # shader's own library, never from this variant. Their bodies read main0's output struct, whose members the variant renames, and its samples were rewritten to fb0–fb7, which
+    # only main0 declares: 483 of Breath of the Wild's variants failed to compile once their cached copies were gone (use of undeclared identifier 'fb0'). The variant is built from
+    # the source without them
+    cut = min((c for c in (msl.find('\nstruct main0_out_u\n'), msl.find('\nstruct main0_out_d\n')) if c >= 0), default=-1)
     if cut >= 0: msl = msl[:cut + 1]
     tex = {m.group(1) for m in re.finditer(r'texture2d<float> (\w+) \[\[id\(\d+\)\]\];', msl)}
     locn = {m.group(1): int(m.group(2)) for m in re.finditer(r'float4 (m_\d+) \[\[user\(locn(\d+)\)\]\];', msl.split('struct main0_in', 1)[-1].split('};', 1)[0])}

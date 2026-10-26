@@ -579,6 +579,13 @@ The Vulkan layer (`dm/gfx/vk/hle_vk.m`) was written for Hades; Super Mario Galax
 - **Fix:** `vk_shaders.py` builds a variant `vk_<key>_d` with that output at `[[color(0), index(1)]]`, which the host takes for pipelines whose blend reads source 1.
 - **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md).
 
+### Dual-source blending in NVN pixel shaders
+
+- **Symptom:** the process ends on Apple's assertion `[AGX] Failed assertion "error == MTLCompilerErrorNoError"` in `findOrCreateComputeFastClearPipeline` / `getStatelessPSODynamicLibrary`; `MTLCompilerService` crash reports (`EXC_BAD_ACCESS` in `AGCLLVMStatelessFragmentObject::buildBlendFactor`) at the same moment; under lldb, `pso_build` waits in `newRenderPipelineStateBySpecializationWithDescriptor:` for that compile.
+- **Cause:** a pipeline blends with a factor that reads the second source (NVN's `SRC1_COLOR` / `SRC1_ALPHA` and their complements, `MTLBlendFactorSource1*`). NVIDIA's hardware takes the second source from the pixel shader's colour output 1, which the translator declares `[[color(1)]]`; Metal reads it from `[[color(0), index(1)]]`. Through the Metal 4 specialization path a fragment function with no such output is not refused: Apple's compiler segfaults building the blend.
+- **Fix:** `dmsh_build.py` `fs_dual` gives every pixel shader with a colour output 1 another entry point, `main0_d`, the same body returning colour 0 and colour 1 as the two sources of attachment 0 (`entry_d` in its reflection; `dmsh_fetch.py` cuts it off as it does `main0_u`). `pso_desc` (`nvn_mtl.m`) takes it for a pipeline whose blend reads the second source; without one (no colour output 1, a merged or framebuffer-fetch function) the second-source factors read the first source, with a red line. The Vulkan path has its own variant ([Dual-source blending from output location 1](#dual-source-blending-from-output-location-1)).
+- **Found on:** Pokémon Legends: Arceus (`01001F5010DFA000`, 1.0.0; provisional profile, no note yet): an RGBA16Float target with destination factor `SRC1_ALPHA` a few seconds after boot; 5,935 of its pixel shaders have a colour output 1.
+
 ### Scaled and three-component vertex formats
 
 - **Symptom:** Metal's validation aborts on a buffer layout no mapped attribute uses.

@@ -40,6 +40,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** `shader_split.py` `gfpak_members` reads the BNSH entries of GFPAK archives (LZ4 entries, [01](../agents/01-extract.md)).
 - **Found on:** [Pokémon Sword](../../dm/games/0100ABF008968000/README.md): 41,516 shaders, nearly all BNSH entries of the 7,699 GFPAK archives under `bin/archive` (the models' and effects' shader archives), beside loose BNSH files (`bin/battle/waza/model/**/*.bnsh_vsh` / `_fsh`, `bin/graphics`, `system_resource/shader`) and two in `main`. The YEBIS shaders it also draws are in `main` ([Shaders in a zlib stream in main](#shaders-in-a-zlib-stream-in-main-yebis-tfxo)).
 
+### Oodle entries of GFPAK archives
+
+- **Symptom:** `[RED] /bin/archive/ai/ai.gfpak: entry 0 has compression 3 (Oodle), which this reader does not decode` stops the shader split.
+- **Cause:** `gfpak_members` decoded only stored, zlib and LZ4 entries, all that Pokémon Sword uses. Compression 3 is Oodle; Oodle is linked into `main`, and there is no decoder for it with a licence fit for this repository.
+- **Fix:** `gfpak_members` decodes compression 3 with the game's own `OodleLZ_Decompress` in the Mac host's tool mode (`oodle`, `DM_OODLE_SERVE`, as for [Trinity packs](#bnsh-in-trinity-packs)), and `profile_guess.py` counts the GFPAK archives with an Oodle entry (`oodle_packs`), so the NSP script builds the host and sets `DM_OODLE_HOST` / `DM_OODLE_MODULES` for the split.
+- **Found on:** Pokémon Legends: Arceus (`01001F5010DFA000`, 1.0.0, SDK 11; provisional profile, no note yet): all 102,415 entries of its 678 GFPAK archives are Oodle; the split finds 12,851 shaders in 9 s.
+
 ### BNSH in Trinity packs
 
 - **How it is stored:** every shader is a BNSH inside the Oodle-compressed files of `arc/data.trpfs` ([01](../agents/01-extract.md)).
