@@ -206,12 +206,32 @@ static void t_rumble_log(void) {
     unsetenv("DM_RUMBLE_LOG");
 }
 
+// Live controller motion (dm_motion_set): player 1's six-axis sensor reports the controller's tilt and rotation instead of lying flat, and goes back to flat when cleared
+static void t_motion_live(void) {
+    g_mode = 1; dm_pad_players(1);
+    uint32_t h; uint32_t id = 0;
+    CHECK(h_hid_SixHandles(&h, 1, &id, STYLE_FULLKEY) == 1, "one six-axis handle for player 1");
+    SixAxisState st[2];
+    CHECK(h_hid_SixStates(st, 2, &h) == 2 && st[0].acc[2] == -1 && st[0].acc[0] == 0, "no live motion: flat");
+    float a[3] = {0.5f, 0, -0.8660254f}, w[3] = {0, 0, 3.14159265f};
+    dm_motion_set(0, a, w);
+    CHECK(h_hid_SixStates(st, 2, &h) == 2, "live: every entry");
+    CHECK(fabsf(st[0].acc[0] - 0.5f) < 1e-4f && fabsf(st[1].acc[0] - 0.5f) < 1e-4f, "live: the controller's acceleration");
+    CHECK(fabsf(st[0].gyro[2] - 0.5f) < 1e-4f, "live: rad/s to revolutions/s");
+    CHECK(fabsf(-st[0].dir[2] - 0.5f) < 0.01f, "live: primed tilted with the measured gravity");
+    CHECK(st[0].sampling == st[1].sampling + 1, "live: numbered by time");
+    CHECK(!h_hid_SixRest(&h), "live and turning: not at rest");
+    dm_motion_clear(0);
+    CHECK(h_hid_SixStates(st, 1, &h) == 1 && st[0].acc[0] == 0 && st[0].acc[2] == -1, "cleared: flat again");
+    CHECK(h_hid_SixRest(&h), "cleared: at rest");
+}
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     t_slots();
     t_npads();
     t_vibration();
     t_rumble_log();
+    t_motion_live();
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

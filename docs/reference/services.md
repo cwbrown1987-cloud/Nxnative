@@ -230,6 +230,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md): it reads all 16 history entries per sensor and ignores the count, like its npad history ([History reads fill every requested entry](#history-reads-fill-every-requested-entry)).
 - **Note:** find a game's swing detector by probing the accelerometer value it reads (`DM_PROBE=main:626248@x8+10` in Odyssey 1.4.1).
 
+### Live controller motion
+
+- **Symptom:** motion controls do nothing with a controller that has a gyroscope (Breath of the Wild: aiming with its Motion Controls option on); the six-axis sensor always lies flat.
+- **Cause:** the host's six-axis sensor had no source of motion: flat at rest, apart from the `DM_BTN_SHAKE` shake ([Six-axis sensors](#six-axis-sensors)).
+- **Fix:** a controller with a gyroscope drives its player's sensor on the Mac and iOS (`GCMotion`, `motion_apple.h` → `dm_motion_set`, `hle_hid.c`); on iOS the phone's own device motion drives player 1's while no connected controller has a gyro (`DmGamepad.m`). The orientation is integrated from the gyro with tilt correction toward the measured gravity (`motion_fusion.h`), in `SixAxisSensorState`'s units (G, revolutions/s, revolutions). After 300 ms without a sample the sensor lies flat again; a shake still adds on top. The switches are in [development.md, How it works](../development.md#how-it-works) (Input).
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0): motion aiming on a Mac with a DualSense. The iOS paths have not been tested on a device.
+- **Note:** history entries repeat the newest sample; yaw drifts as on the console, with no recenter. The console's own sensor still reports no states ([SDK 20 six-axis sensor and amiibo (`nfp`) calls](#sdk-20-six-axis-sensor-and-amiibo-nfp-calls)), so motion follows the controller in docked mode.
+
 ### SDK 20 six-axis sensor and amiibo (`nfp`) calls
 
 - **Symptom:** SDK 20 calls that reach a service; `nfp`'s `AttachActivateEvent` / `AttachDeactivateEvent` crashed in the SDK at `sdk+0x3f2a78`.
