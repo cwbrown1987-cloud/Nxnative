@@ -36,7 +36,12 @@ From a fresh save, the title screen's `New Game`, the difficulty `Normal` and th
 
 ## The iPhone
 
-The Japanese release plays on an iPhone, with the same memory layout this one now has (`-SwitchVirtualAddressSpaceSize=4064`, a 5 GB block, the node area cut to 62 MB, Unreal's heap on the host's), so this release should go there as well: the guest's 28 GB reservation fits an iPhone's address space where the old 68 GB did not. What is missing is the iOS shader library (the same MSL compiled with the iPhoneos convention, `dmsh_build.py` with `IOSOUT=`) and the Xcode package; the user sideloads and signs it.
+The Japanese release plays on an iPhone, with the same memory layout this one now has (`-SwitchVirtualAddressSpaceSize=4064`, a 5 GB block, the node area cut to 62 MB, Unreal's heap on the host's), so this release should go there as well. Two earlier objections to the iPhone are gone with the old 68 GB layout:
+
+- The guest's reservation is now 28 GB, which fits the address space the `com.apple.developer.kernel.extended-virtual-addressing` entitlement gives (about 64 GB); the old layout wanted 68 GB and did not.
+- The host's alias region is 4.375 GB, not 64 GB, so the single reservation the host makes for the guest fits.
+
+What is missing is the iOS shader library (the same MSL compiled with the iPhoneos convention, `dmsh_build.py` with `IOSOUT=`) and the Xcode package; the user sideloads and signs it. The one thing left to watch is the device's memory: the Mac build holds 1.2-1.5 GB of Metal allocations, which an iPhone shares with the system.
 
 ## Open
 
