@@ -162,9 +162,8 @@ Prefer a graphical interface to the command line? **[NX2Apple](https://github.co
 
 ```
 git clone https://github.com/seedds/nxnative.git && cd nxnative
-brew install xcodegen zstd spirv-cross glslang
-brew install --cask dotnet-sdk
-python3 -m pip install lz4 capstone fonttools "backports.zstd; python_version < '3.14'"
+brew bundle
+python3 -m pip install -r requirements.txt
 ```
 
 **2. Put one game's NSPs in a folder**: the base game (an NSP, or an XCI cartridge dump), plus its update and DLC if you have them:
