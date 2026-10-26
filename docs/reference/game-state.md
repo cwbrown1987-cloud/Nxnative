@@ -32,6 +32,22 @@ The games' own state: saves, scripted state, and behaviour that looks like a hos
 - **Profile:** it plays handheld with Boost (`op_mode handheld`, `perf_mode boost`), which skips the TV setup and keeps the 1080p draw size.
 - **Found on:** [Rhythm Heaven Groove](../../dm/games/0100D9F01D474000/README.md) (SDK 21.4.0).
 
+## The input
+
+### The keyboard does not reach the game
+
+- **Symptom:** the keyboard does nothing in the game, while the scripted input works.
+- **Cause:** the two do not share a path: `DM_KEYS` goes through player 1's controller (`dm_pad_set` in `dm/host/hle_hid.c`), the Mac keyboard through the front end's own mapping (`dm/host/front_mac.m`'s `on_key` → `key_bit`), and the two are only combined at `dm_pad_set_player`. A scripted run that works therefore says nothing about the keyboard.
+- **Fix:** `DM_KBD_LOG=1` in the front end logs every key event with the state of the input: `[kbd] key 38 down (input on)` (38 = J, the A button). `input released` means the window was not key (the input is released while it is not), which is the other way a key goes missing. The key map is the Nintendo layout: J=A, K=B, U=X, I=Y, Q=L, E=R, Z=ZL, C=ZR, the arrow keys are the D-pad, WASD the left stick, F and G press the sticks.
+- **Found on:** [FINAL FANTASY RESONANCE (Korean release)](../../dm/games/0100B8A026F14000/README.md) (the first run that used the keyboard rather than the scripted input).
+
+### A stick command in `DM_CTL` looks like it did nothing
+
+- **Symptom:** `key LUp~4` in the host's `DM_CTL` control channel does not move the character, and the log says `press 0`.
+- **Cause:** `press 0` is the **button mask** (a stick is not a button), not a failure: the stick was pushed to the full deflection. The line prints the sticks too now.
+- **Fix:** the stick names are `LLeft LUp LRight LDown` and `RLeft RUp RRight RDown`; a command holds them for its time (`~4` is four seconds). `DM_CTL` is a file the host reads (every 100 ms): `shot <path>` saves a frame, `passdump <n>` the render passes, `key` a button or a stick, `cvarf` a console variable (`dm/host/hle_hid.c`).
+- **Found on:** [FINAL FANTASY RESONANCE (Korean release)](../../dm/games/0100B8A026F14000/README.md).
+
 ## Scripted state
 
 ### The software keyboard in scripted runs (`DM_KBD`)
