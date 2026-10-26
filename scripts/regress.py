@@ -255,9 +255,7 @@ def chain_build(tree, g, a):
             if rc or not (lib / '_b_build.json').is_file():
                 raise HarnessError(f'{g.id}: dmsh_build.py of {tree.id} failed (exit {rc}); last lines of {log}:\n' + ''.join(collections.deque(open(log, errors='replace'), maxlen=8)))
             prof = out / 'profile'; prof.mkdir(exist_ok=True)   # the tables the host reads beside the shader map, as this build made them
-            for t in ('shader_map.tsv', 'shader_map.tsv.conflicts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv', 'c1_full.tsv', 'cb_extent.tsv', 'bf_want.tsv'):
-                src = g.profile_dir(tree) / t
-                if src.is_file(): shutil.copyfile(src, prof / t)
+            for src in g.profile_dir(tree).glob('*.tsv'): shutil.copyfile(src, prof / src.name)
             (out / 'built.ok').write_text(f'{tree.id}\n')
         say(f'  {g.id}: hashing the outputs of chain {v}')
         shaders = nvn_manifest(lib, jobs)
@@ -598,13 +596,28 @@ def shot_distance(a, b):
     return bits, round(sum(abs(p - q) for p, q in zip(x, y)) / len(x), 2)
 
 
+def save_source(g, route):
+    """The save a run starts from: a folder of the NSP folder (fixed saves, never written), none for `new`, and for `run` a copy of <id>_build/run/save frozen at its first
+    use in <root>/<id>/save-run (the build's own save changes whenever someone plays)"""
+    if route['save'] == 'new': return None
+    if route['save'] != 'run': return g.folder / route['save']
+    frozen = ROOT / g.id / 'save-run'
+    if not frozen.is_dir():
+        shutil.copytree(g.build / 'run/save', frozen.with_name('save-run.partial'), symlinks=True, dirs_exist_ok=True); frozen.with_name('save-run.partial').rename(frozen)
+    return frozen
+
+
+def save_digest(d):
+    return digest(sorted(p for p in Path(d).rglob('*') if p.is_file()))[:16] if d else 'new'
+
+
 def smoke_run(g, tree, art, route, quick, outdir, a):
     """One run of the route: the prebuild (full mode), then the game, under the watchdog → RUN (see the header)"""
     host, modules, lib, prof = art['host'], art['modules'], art['lib'], art['profile']
     secs = route['quick'] if quick else route['secs']
     shutil.rmtree(outdir, ignore_errors=True); outdir.mkdir(parents=True)
     save, temp = outdir / 'save', outdir / 'temp'
-    src_save = {'run': g.build / 'run/save', 'new': None}.get(route['save'], g.folder / route['save'])
+    src_save = save_source(g, route)
     if src_save: shutil.copytree(src_save, save, symlinks=True)
     else: save.mkdir()
     temp.mkdir()
@@ -615,7 +628,7 @@ def smoke_run(g, tree, art, route, quick, outdir, a):
         if not (prof / 'pso_pairs.tsv').is_file() and (g.build / 'shader/pso_pairs.tsv').is_file(): env['DM_PSO_PAIRS'] = str(g.build / 'shader/pso_pairs.tsv')
     if (g.build / 'aoc').is_dir(): env['DM_AOC_DIR'] = str(g.build / 'aoc')
     for kv in a.env: k, _, v = kv.partition('='); env[k] = v
-    res = {'secs': secs, 'host': art['host_key'], 'modules': art['modules_key']}
+    res = {'secs': secs, 'host': art['host_key'], 'modules': art['modules_key'], 'save': save_digest(src_save)}
     prebuild = g.kind == 'nvn' and not quick and route['prebuild'] == 'on'
     if prebuild:   # the pipeline prebuild into <run>/pso_archive, as the NSP script's Mac build and the Mac app's prepare step run it
         penv = dict(env, DM_PSO_PREBUILD='tool'); penv.pop('DM_WINDOW', None)
@@ -804,8 +817,15 @@ def artifacts(tree, g, a, rewrite):
     m, out = chain_build(tree, g, a)
     host, hkey, _ = host_for(tree, g, a.jobs)
     mods, mkey = modules_for(tree, g, rewrite, a.jobs)
-    lib = out if g.kind == 'nvn' else out
-    return {'manifest': m, 'lib': lib, 'profile': out / 'profile' if g.kind == 'nvn' else g.profile_dir(tree), 'host': host, 'host_key': hkey, 'modules': mods, 'modules_key': mkey}
+    # the tables the host reads beside the shader map (pso_manifest.tsv, the pair lists, ...): the tree's, with c1_full.tsv and cb_extent.tsv as the chain build made them
+    prof = ROOT / g.id / 'profile' / f'{tree.id}-{m["key"]}'
+    if not (prof / '.done').is_file():
+        prof.mkdir(parents=True, exist_ok=True)
+        for f in g.profile_dir(tree).glob('*.tsv'): shutil.copyfile(f, prof / f.name)
+        for f in (out / 'profile').glob('*.tsv') if g.kind == 'nvn' else []:
+            if f.name in ('c1_full.tsv', 'cb_extent.tsv'): shutil.copyfile(f, prof / f.name)
+        (prof / '.done').write_text('')
+    return {'manifest': m, 'lib': out, 'profile': prof, 'host': host, 'host_key': hkey, 'modules': mods, 'modules_key': mkey}
 
 
 def depth_zero(g, tree):
