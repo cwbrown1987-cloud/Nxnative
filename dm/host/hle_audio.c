@@ -160,6 +160,22 @@ static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioT
       if (mute) memset(bl->mBuffers[0].mData, 0, bl->mBuffers[0].mDataByteSize); }
     return noErr;
 }
+#if !TARGET_OS_IPHONE
+// The Mac's I/O buffer: about 5 ms of the device's frames, as front_ios.m asks of the iOS audio session. The default is 512 device frames (10.7 ms at 48 kHz, 11.6 ms at 44.1 kHz),
+// more than the game reliably has queued: Unicorn Overlord underran on 250-290 of every 2000 callbacks at 48 kHz (0.1-0.2 s of zeros, heard as clicks) and on about half of
+// them at 44.1 kHz; with 240 frames, none. The buffer belongs to this process and to the device the default output follows, so it is set again when that device changes.
+// DM_DBG_AU_FRAMES=N asks N frames instead (1024 = the iOS default, which reproduces the crackling)
+static void au_buffer(AudioUnit au, const char *why) {
+    AudioStreamBasicDescription df; UInt32 sz = sizeof df; const char *e = getenv("DM_DBG_AU_FRAMES");
+    Float64 rate = !AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &df, &sz) && df.mSampleRate > 0 ? df.mSampleRate : RATE;
+    UInt32 fr = e ? (UInt32)atoi(e) : (UInt32)(rate / 200 + 0.5);
+    OSStatus st = AudioUnitSetProperty(au, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0, &fr, sizeof fr);
+    LOG("%saudio device buffer: %u frames at %.0f Hz%s (status %d)", st ? "[RED] " : "", fr, rate, why ? why : "", (int)st);
+}
+static void au_device_changed(void *ctx, AudioUnit au, AudioUnitPropertyID id, AudioUnitScope scope, AudioUnitElement el) {
+    (void)ctx; (void)id; (void)scope; (void)el; au_buffer(au, ", for the new output device");
+}
+#endif
 static OSStatus au_create(aout *a) {
     AudioComponentDescription d = {.componentType = kAudioUnitType_Output,
 #if TARGET_OS_IPHONE
@@ -177,9 +193,8 @@ static OSStatus au_create(aout *a) {
                                      .mChannelsPerFrame = ch, .mBitsPerChannel = 16};
     AURenderCallbackStruct cb = {au_render, a};
 #if !TARGET_OS_IPHONE
-    { const char *e = getenv("DM_DBG_AU_FRAMES"); if (e) {   // diagnostic: on the Mac, make the sound card callback ask N frames each time (1024 = the iOS default, reproduces the crackling)
-        UInt32 fr = (UInt32)atoi(e); OSStatus st = AudioUnitSetProperty(a->au, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0, &fr, sizeof fr);
-        LOG("audio device buffer frame count set to %u: status %d", fr, (int)st); } }
+    au_buffer(a->au, NULL);
+    AudioUnitAddPropertyListener(a->au, kAudioOutputUnitProperty_CurrentDevice, au_device_changed, NULL);
 #endif
     OSStatus st = AudioUnitSetProperty(a->au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f);
     if (!st) st = AudioUnitSetProperty(a->au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);

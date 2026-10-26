@@ -121,6 +121,13 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Fix:** `AVAudioSession` `setPreferredIOBufferDuration:0.005` (and 48 kHz) before the game opens audio and again on return to the foreground (`front_ios_audio_session` in `front_ios.m`); the device then calls back with 240 frames and nothing underruns.
 - **Check:** when checking a new device, read the host's `audio #N device callbacks` line, logged every 2000 callbacks: frames per callback, queued blocks, underruns.
 
+### The Mac's default I/O buffer
+
+- **Symptom:** clicks and dropouts on the Mac, heard as clipping; the log's `audio #N device callbacks` lines show hundreds of underruns per 2000 callbacks.
+- **Cause:** the Mac's default output asks for 512 device frames per callback (10.7 ms at 48 kHz; 557 frames of the 48 kHz stream when the device runs at 44.1 kHz), more than a game that keeps only a few small blocks queued has ready every time. Unicorn Overlord on a MacBook Pro's speakers: 250–290 underruns in every 2000 callbacks at 48 kHz (0.1–0.2 s of zeros), about 1,000 at 44.1 kHz. Whether a game underruns depends on how much it queues: 13 Sentinels (2.8 blocks queued, like Unicorn Overlord's 3.0, but larger ones) had none at 512 frames.
+- **Fix:** like iOS's session buffer, the Mac sets its output unit's device buffer to about 5 ms of device frames (`kAudioDevicePropertyBufferFrameSize`, 240 at 48 kHz, 220 at 44.1 kHz) when it creates the unit, and again when the default output switches to another device (`au_buffer` in `hle_audio.c`). Unicorn Overlord at 240 frames: 0 underruns in 10,000 callbacks; 13 Sentinels stays at 0. The buffer is the process's own; other apps keep theirs. `DM_DBG_AU_FRAMES=N` asks N frames instead.
+- **Found on:** [Unicorn Overlord](../../dm/games/010069401ADB8000/README.md) (Asian release 1.05 on the Mac).
+
 ### Interruptions that stop RemoteIO callbacks
 
 - **Symptom:** sound stays silent after Siri, an alarm, a call or another app's audio; a game whose audio thread waits for its buffers back (Wwise's poll-only output, FMOD) then waits forever.

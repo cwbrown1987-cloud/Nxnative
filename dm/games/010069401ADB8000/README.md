@@ -52,6 +52,7 @@ General host changes first needed here; each applies to every game:
 
 - `alloc_big_align` was first needed on 13 Sentinels ([its note](../01003FC01670C000/README.md#memory), [the profile keys](../README.md#keys)).
 - **The hardware multi-stream Opus decoder's C interface** forwarded to the SDK's software decoder (`hle_codec.c`) and **`GenerateCryptographicallyRandomBytes` under the `sdk`'s own `getentropy`** (`HLE_FORCE`, `hle_os.c`): [Hardware Opus decoders built on the SDK's software decoders](../../../docs/reference/audio.md#hardware-opus-decoders-built-on-the-sdks-software-decoders), [Cryptographically random bytes](../../../docs/reference/services.md#cryptographically-random-bytes).
+- **A 5 ms device buffer on the Mac** (`hle_audio.c`): with the Mac's default 512-frame buffer the game underran on 250–290 of every 2000 callbacks (clicks); with 240 frames, none: [The Mac's default I/O buffer](../../../docs/reference/audio.md#the-macs-default-io-buffer).
 - **Vibration handles answered before a controller's haptics are routed** (`hle_hid.c`): the game asks for them once at startup, before GameController reports the pad, and every value went to handle 0 (seen in the log; the game has no rumble, so nothing changed in play) ([Vibration handles before a controller is reported](../../../docs/reference/services.md#vibration-handles-before-a-controller-is-reported)).
 
 ## Open
