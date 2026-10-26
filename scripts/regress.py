@@ -750,7 +750,7 @@ def med(xs):
 def run_failures(r, route):
     f = []
     if r.get('crash'): f.append('crash' + (f" ({r['crash'].get('signal') or r['crash'].get('type') or r['crash'].get('line') or ''})"))
-    elif r.get('exit') not in (None, 0): f.append(f"exited early ({r['exit']})")
+    elif r.get('exit') is not None: f.append(f"exited before the end of the route (exit {r['exit']})")
     if r.get('hang_at_s') is not None: f.append(f"hang (no frame after {r['hang_at_s']} s)")
     if r.get('reached') is False: f.append(f"frame {route['reach'][0]} not reached by {route['reach'][1]:g} s (max {r.get('max_frame')})")
     if r.get('max_frame', -1) < 0: f.append('no frame')

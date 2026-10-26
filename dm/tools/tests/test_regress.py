@@ -87,6 +87,8 @@ class Regress(unittest.TestCase):
         self.assertEqual(d['new_red'], [{'text': 'b #', 'count': 3}])
         lv, known, d = regress.smoke_diff(bad, bad, route)   # a failure the baseline has too is known, not new
         self.assertFalse(lv['NEW-FAIL']); self.assertTrue(known)
+        quit0 = [dict(base[0], exit=0)]   # the game ended by itself before the route did: a failure even with exit status 0
+        self.assertTrue(any('exited before the end' in x for x in regress.smoke_diff(base, quit0, route)[0]['NEW-FAIL']))
 
     def test_status_order(self):
         self.assertEqual(regress.worst('PASS', 'CHANGED', 'REGRESSION'), 'REGRESSION'); self.assertEqual(regress.worst('NEW-FAIL', 'ERROR'), 'ERROR')
