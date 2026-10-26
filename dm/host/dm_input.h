@@ -12,6 +12,10 @@ enum {
 #define DM_BTN_SHAKE (1ull << 63)   // not an NpadButton: the controller is shaken while set (its six-axis sensor, hle_hid.c); never reaches the game's buttons
 #define DM_STICK_MAX 32767
 void dm_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry);
+// Real six-axis motion from the front end (iOS: a connected controller's GCMotion, or the device's own CMDeviceMotion): src 0 = the console (handheld), 1 = player 1's controller.
+// acc in G, gyro in revolutions / s, t the host now_ns() of the sample. six-axis reads (hle_hid.c) use the newest fresh sample and integrate the angle from the gyro.
+// quat: the orientation (x, y, z, w), gravity-corrected (device: CoreMotion's fused attitude; controller: the front end's complementary filter); used for the direction matrix instead of integrating the gyro (no drift).
+void dm_motion_set(int src, const float acc[3], const float gyro[3], const float quat[4], uint64_t t);
 uint64_t dm_input_samples(void);   // Cumulative number of times the game has sampled the controller
 // Physical controller path (Mac GameController, DM_KEYS / DM_CTL): stored separately from the keyboard / touch input; when the game reads player 1, buttons are
 // ORed bitwise and each stick axis takes whichever source is deflected more. All 0 when no controller is connected, so values are bit-for-bit the same as before.

@@ -307,10 +307,38 @@ enum { SIX_PERIOD_NS = 5000000 };
 #define SHAKE_G 3.0
 #define SHAKE_REV 1.5
 static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < atomic_load(&g_shake_end); }
-static void six_sample(SixAxisState *s, int64_t samp, int shakes) {
+// Real six-axis motion from the front end (iOS DmGamepad.m: a connected controller's GCMotion, or the device's own CMDeviceMotion). src 0 = the console
+// (handheld), 1 = player 1's controller. acc in G, gyro in revolutions / s, t the host now_ns() of the sample. The angle integrates the gyro between updates;
+// a sample older than MOT_FRESH_NS counts as no sensor and the synthetic rest / shake below stands in. Without any front-end motion everything is as before.
+static pthread_mutex_t g_mot_mu = PTHREAD_MUTEX_INITIALIZER;
+static float g_mot_acc[2][3], g_mot_gyro[2][3], g_mot_quat[2][4]; static uint64_t g_mot_t[2];
+#define MOT_FRESH_NS 300000000
+void dm_motion_set(int src, const float acc[3], const float gyro[3], const float quat[4], uint64_t t) {
+    if ((unsigned)src > 1) return;
+    pthread_mutex_lock(&g_mot_mu);
+    memcpy(g_mot_acc[src], acc, 3 * sizeof(float)); memcpy(g_mot_gyro[src], gyro, 3 * sizeof(float)); memcpy(g_mot_quat[src], quat, 4 * sizeof(float)); g_mot_t[src] = t;
+    pthread_mutex_unlock(&g_mot_mu);
+    static uint64_t lg[2]; if (t - lg[src] > 1000000000) { lg[src] = t; LOG("[dm] motion src%d acc %.2f %.2f %.2f gyro %.3f %.3f %.3f", src, acc[0], acc[1], acc[2], gyro[0], gyro[1], gyro[2]); }
+}
+static int mot_fresh(int src, uint64_t now) { return g_mot_t[src] && now - g_mot_t[src] < MOT_FRESH_NS; }
+static void six_sample(SixAxisState *s, int64_t samp, int shakes, int mot) {
     memset(s, 0, sizeof *s);
     uint64_t t = (uint64_t)samp * SIX_PERIOD_NS;
     s->delta_ns = SIX_PERIOD_NS; s->sampling = samp; s->attributes = 1;   // IsConnected
+    if (mot >= 0) {   // measured motion: acc / gyro as reported; dir from the front end's fused attitude quaternion (gravity-corrected, no drift), angle its ZYX euler in revolutions
+        pthread_mutex_lock(&g_mot_mu);
+        memcpy(s->acc, g_mot_acc[mot], 3 * sizeof(float)); memcpy(s->gyro, g_mot_gyro[mot], 3 * sizeof(float));
+        float qx = g_mot_quat[mot][0], qy = g_mot_quat[mot][1], qz = g_mot_quat[mot][2], qw = g_mot_quat[mot][3];
+        pthread_mutex_unlock(&g_mot_mu);
+        double n = sqrt((double)qx * qx + (double)qy * qy + (double)qz * qz + (double)qw * qw); if (n < 1e-9) { qx = qy = qz = 0; qw = 1; } else { qx /= n; qy /= n; qz /= n; qw /= n; }
+        s->dir[0] = 1 - 2 * (qy * qy + qz * qz); s->dir[1] = 2 * (qx * qy - qw * qz);     s->dir[2] = 2 * (qx * qz + qw * qy);
+        s->dir[3] = 2 * (qx * qy + qw * qz);     s->dir[4] = 1 - 2 * (qx * qx + qz * qz); s->dir[5] = 2 * (qy * qz - qw * qx);
+        s->dir[6] = 2 * (qx * qz - qw * qy);     s->dir[7] = 2 * (qy * qz + qw * qx);     s->dir[8] = 1 - 2 * (qx * qx + qy * qy);
+        s->angle[0] = (float)(atan2(2 * ((double)qw * qx + (double)qy * qz), 1 - 2 * ((double)qx * qx + (double)qy * qy)) / (2 * M_PI));
+        s->angle[1] = (float)(asin(fmax(-1.0, fmin(1.0, 2 * ((double)qw * qy - (double)qz * qx)))) / (2 * M_PI));
+        s->angle[2] = (float)(atan2(2 * ((double)qw * qz + (double)qx * qy), 1 - 2 * ((double)qy * qy + (double)qz * qz)) / (2 * M_PI));
+        return;
+    }
     s->acc[2] = -1;
     double yaw = 0;
     if (shakes && shaking(t)) {
@@ -330,8 +358,11 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (n <= 0) return 0;
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
     int64_t samp = (int64_t)(guest_ns() / SIX_PERIOD_NS);
-    int shakes = player_of(h >> 8 & 0xff) == 0;
-    for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, shakes);
+    int pl = player_of(h >> 8 & 0xff);
+    int mot = -1;
+    if (pl == 0) { uint64_t now = now_ns(); if (mot_fresh(1, now)) mot = 1; else if (mot_fresh(0, now)) mot = 0; }   // player 1: the controller's sensor wins, then the console's own
+    int shakes = pl == 0 && mot < 0;
+    for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, shakes, mot);
     return n;
 }
 HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for handheld / dual Joy-Cons, one otherwise",
