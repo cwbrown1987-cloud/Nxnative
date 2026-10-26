@@ -205,7 +205,28 @@ Reuse works as for the IPA. Each shader output has its own key, named after the 
 
 `--variant 'label:KEY=VALUE,…'` adds a variant: environment switches, or another host (`host=`), other Mac shader libraries (`msl=` with `shmap=`), other rewritten modules (`patched=`) or another pipeline archive (`pso=`). Variants run in turn, `--runs` times each (2 by default), and the results are medians with their range. `--fps` and `--scale` set the frame rate target and the render scale for every variant. Each run's log, `frames.tsv` and two screenshots, taken at the same moments of the route, are in the output folder (`<id>_build/bench/<date-time>/`), with `results.md` and `results.json`. Load on the Mac moves the numbers, so compare the variants of one run of the script rather than separate runs.
 
-Relative output and variant paths are resolved from the terminal's working directory before the host starts in its run folder. Each metric's median and range use the runs that supplied it; a missing optional GPU or game-speed reading leaves a dash when no run supplied one. A failed launch releases `--lock` so another measurement can run.
+Relative output and variant paths are resolved from the terminal's working directory before the host starts in its run folder. Each metric's median and range use the runs that supplied it; a missing optional GPU or game-speed reading leaves a dash when no run supplied one. A failed launch releases `--lock` so another measurement can run. A lock whose process is gone, with no game running, is stale and removed.
+
+### The regression harness
+
+One translation chain and one host serve every profile, but a contributor can test only the games they own, and CI has no game files and no Metal 4 (GitHub issue #272). `scripts/regress.py` compares two revisions on every game this Mac has a `--platform mac` build of, and writes a report that holds only numbers, hashes, shader keys, normalized `[RED]` texts and timings, so it can go into a pull request:
+
+```sh
+python3 scripts/regress.py check --quick      # the merge base with main against this checkout (uncommitted files included): chain checks and a 60 s boot per game
+python3 scripts/regress.py check              # the same with the whole route and the pipeline prebuild
+python3 scripts/regress.py chain              # the static checks only, no game runs
+python3 scripts/regress.py baseline --rev main --runs 2   # record a baseline (check records a missing one itself)
+python3 scripts/regress.py list               # the games found, their routes and stored baselines
+```
+
+`--games <id>,…` selects games, `--baseline` / `--candidate` take any revision (`worktree` is this checkout), `--lock` (or `DM_MEASURE_LOCK`) is the measuring lock `bench.py --lock` shares, held only while a game runs, and `REGRESS_SKIP=<id>,…` leaves out a game someone else is working on. Everything goes under `--root` (`REGRESS_ROOT`, by default `/Volumes/NX/harness`), never into the repository: each revision is checked out once into `trees/`, and its chain, host and rewriter come from there. The games are the NSP folders under `--games-dir` (`REGRESS_GAMES`). The exit status is 0 without a regression, 1 with one, and 2 when the harness could not check a game.
+
+Per game it checks:
+- **Chain** (no GPU): the shaders built by each revision's `dmsh_build.py` (a Vulkan game: `vk_shaders.py`), shader by shader: built or failed, and the SHA-256 of the MSL, of the reflection without its chain fields and of the variant libraries. A build is kept per chain version, profile inputs and compilers (`<root>/<id>/chain/`), so a revision that did not change the chain reuses it, and the build takes the game's own shader cache (`DMSH_CAS`), so unchanged MSL is not compiled again. A changed chain still translates every shader: Breath of the Wild's 19,592 took 14 minutes on an M2 Max.
+- **Interface** (no GPU): every pipeline base `pso_offline.py` would put into the archive, from `shader_pairs.tsv` and `pso_pairs.tsv`, whose pixel shader reads a `[[user(locnN)]]` input the vertex shader does not write or writes with another type. `metal-tt` refuses such a pipeline and with it the whole archive (GitHub issue #283).
+- **Smoke** (Mac host, window, no audio): the route `dm/games/<id>/smoke.tsv` from a copy of its save, under a watchdog: the frame it must reach, a crash, a hang (no frame for `hang` seconds), the prepare step's time, `[RED]` lines the baseline did not print (numbers, addresses and paths normalized), frame times from `DM_NVN_TSV` (a Vulkan or GL game: presents counted from the log), the peak memory footprint, and perceptual hashes of screenshots at fixed times. The full mode first runs the pipeline prebuild (`DM_PSO_PREBUILD=tool`) under a watchdog and starts the game on its archive; `--quick` skips it (`DM_PSO_PREBUILD=0`).
+
+A route is `key <TAB> value` lines: `save` (a folder in the NSP folder, `run` for `<id>_build/run/save`, `new` for an empty one), `keys` (`DM_KEYS`), `secs` and `quick` (the run lengths), `reach` (`<frame>@<seconds>`), `window` (start and length of the frame-time window), `shots` (seconds), `hang`. A game is `PASS`, `CHANGED` (MSL or numbers differ, nothing worse), `REGRESSION` (new `[RED]` lines, a screenshot, frame time, memory or prepare time beyond the tolerances at the top of the script), `NEW-FAIL` (a shader, the interface check, a crash, a hang or the frame that worked in the baseline fails) or `ERROR`. Failures the baseline has too are listed as known and do not fail the check. `report.json` (its schema is in the script's header) and `report.md` go to `<root>/reports/<date-time>-<command>/`; the screenshots, logs and frame rows stay in `<root>/<id>/runs/`.
 
 ### GPU measurement
 
