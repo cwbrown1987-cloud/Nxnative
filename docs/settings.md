@@ -173,6 +173,27 @@ Apple's performance overlay over the game: frame rate, frame and GPU times, memo
 
 Forgets all launcher choices, so the game's tested defaults apply again, and those of later builds too ([Tested defaults](#tested-defaults)). Settings fixed by `Documents/env.txt` stay as the file says.
 
+## Save sync
+
+**Sync folder** carries this game's save between devices through a folder they share in iCloud Drive, `nxnative-saves`. The Mac app uses it by itself when iCloud Drive is on; on the iPhone you pick it once. To set it up:
+
+1. **Make the folder.** Open the game's Mac app once: it creates `nxnative-saves` in iCloud Drive (iCloud Drive must be on in System Settings → Apple Account → iCloud). Without a Mac, create the folder in the Files app under iCloud Drive, or with the new-folder button in the picker of step 2.
+2. **Pick it on the iPhone.** On the settings screen, tap **Sync folder**, go to **iCloud Drive**, tap **nxnative-saves** to go inside it, then tap **Open**. In LiveContainer, turn on the app's **Fix File Picker** setting first: without it **Open** stays disabled.
+3. **Start the game** on the device that has the save you want. Its save goes to the folder, and the other device takes it at its next start. If both devices already have saves of their own, the first sync asks which one to keep.
+4. **Switch devices by quitting the game.** The save is taken only when the game starts: on the iPhone, swipe the app away in the app switcher and open it again. A game left running in the background keeps the save it started with.
+
+The game keeps each save in the folder as `<title ID>/save.nxsave`. For another folder on the Mac, or none, add a line to its `env.txt` (`~/Library/Application Support/nxnative/<title ID>/env.txt`): `DM_SAVE_SYNC=<folder>`, or `DM_SAVE_SYNC=` (empty) to turn it off.
+
+- **When the game starts,** it brings the save up to date before loading it: if only the folder changed since this device last synced, the folder's save replaces this device's. If only this device changed, this device's save goes to the folder.
+- **After each save,** the game sends the save to the folder in the background.
+- **When both changed** (you played on both devices without the game syncing in between), the game asks which save to keep. The one you do not keep goes to the backups. **Not now** leaves both as they are and syncs nothing until the next start, when it asks again.
+- **When another device saves while you play,** the game stops sending saves and tells you. Your progress stays on this device, and the next start asks which save to keep.
+- **When the folder cannot be reached** (no network, iCloud still downloading), the game says so and plays on this device's save. Syncing resumes at the next start.
+
+Play on one device at a time, and give iCloud a moment to upload before switching. Whatever a sync replaces on this device is kept first: the last 10 versions are in `save.sync/backup/` next to `save/` (in the Files app, under the app's name). `dm/tools/nxsave.py <backup> <new folder>` unpacks one on a Mac; copy its contents over `save/` with the app closed to restore it.
+
+`DM_SAVE_SYNC_RESOLVE=local` or `=cloud` in `env.txt` answers the question without asking. Remove it afterwards, or it decides every later conflict the same way.
+
 ## Settings in a file
 
 A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under the app's name) sets a setting from the file: the settings screen shows it greyed out, and the file wins over your choice and the game's default. Fully close and reopen the app after editing the file. The variables:

@@ -43,3 +43,8 @@ void dm_touch_set(const dm_touch *t, int n);
 // Timing: when a save write fails (disk full etc.) within one of the game's save transactions (between two Commits), so that this Commit is refused and the previously committed save is unchanged, it is called once per refused transaction;
 // the next transaction that succeeds commits as usual, and the front end need not do any recovery. err = the first failing errno (ENOSPC = 28 means out of space). Called on the game thread; the front end switches to the main thread itself and must not block
 void front_save_failed(int err);
+// Save sync (savesync_apple.m, DM_SAVE_SYNC; do-nothing defaults in hle_fs.c). choose: this device and the sync folder both changed since they last synced; returns 1 to keep this
+// device's save, 2 the folder's, 0 neither this run. Called on the game thread before the save is mounted; the front end may block until the player answers. notice: the sync could not
+// be done (the folder unreachable, its file damaged, another device saved meanwhile); must not block
+int front_save_sync_choose(const char *title, const char *message);
+void front_save_sync_notice(const char *message);

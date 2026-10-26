@@ -92,6 +92,7 @@ private struct LauncherView: View {
                             ForEach(m.settings.filter { $0.sectionTitle == section }) { SettingRow(s: $0, m: m) }
                         }
                     }
+                    SaveSyncSection()
                     Section {
                         Button("Reset to tested defaults") { m.reset() }
                             .disabled(!m.changed)

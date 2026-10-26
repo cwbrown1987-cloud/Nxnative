@@ -214,6 +214,38 @@ void front_save_failed(int err) {
     });
 }
 
+// Save sync (front.h, savesync_apple.m): a conflict waits on the game thread for the player's pick; a notice does not wait. Both are alerts over the top view controller
+static UIViewController *top_vc(void) {
+    UIViewController *vc = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) if ([s isKindOfClass:UIWindowScene.class]) for (UIWindow *w in ((UIWindowScene *)s).windows) if (w.isKeyWindow) vc = w.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+int front_save_sync_choose(const char *title, const char *message) {
+    __block int pick = 0; dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    NSString *t = @(title), *m = @(message);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = top_vc();
+        if (!vc) { LOG("[RED] front end: no window for the save sync question"); dispatch_semaphore_signal(done); return; }
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:t message:m preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"Use the sync folder's save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; pick = 2; dispatch_semaphore_signal(done); }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"Keep this device's save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; pick = 1; dispatch_semaphore_signal(done); }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"Not now" style:UIAlertActionStyleCancel handler:^(UIAlertAction *x) { (void)x; dispatch_semaphore_signal(done); }]];
+        [vc presentViewController:a animated:YES completion:nil];
+    });
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    return pick;
+}
+void front_save_sync_notice(const char *message) {
+    NSString *m = @(message);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = top_vc(); if (!vc) return;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Save sync" message:m preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [vc presentViewController:a animated:YES completion:nil];
+    });
+}
+
 // Audio session: the frames RemoteIO asks for in each callback follow the I/O buffer duration, about 21 ms by default on iOS (1024 frames at 48 kHz). The game keeps only 4 blocks × 5 ms = 20 ms in flight,
 // so every callback came up 1.3 ms short and was zero-filled, about 47 gaps per second (crackling; reproducible on the Mac by forcing 1024-frame callbacks: 1999 underruns in 2000 callbacks). Ask for 5 ms and the system picks the nearest it supports;
 // the category stays the default SoloAmbient (silent switch and interrupting other apps' audio behave as before). Set once at boot and again on return to the foreground (the system may reset it after an interruption)

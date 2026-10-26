@@ -4,7 +4,7 @@
 // Bundle layout: Resources/romfs (the game's RomFS), Resources/msl/<b-chain | vk | gl> (the Mac shader libraries), Resources/aoc/<index> (DLC), Resources/dm (the rewritten modules, the
 // shader tables, font/, env.txt). Saves, the pipeline list and temporary files go to ~/Library/Application Support/nxnative/<title ID>/, the host's output to ~/Library/Logs/nxnative/<title ID>.log
 // (the previous run's kept as <title ID>.prev.log). Environment switches: one KEY=VALUE per line in <Application Support folder>/env.txt, then Resources/dm/env.txt (the first one wins; neither
-// replaces a variable already set), as the iOS app reads Documents/env.txt and dm/env.txt.
+// replaces a variable already set), as the iOS app reads Documents/env.txt and dm/env.txt. With iCloud Drive on, the save is synced through iCloud Drive/nxnative-saves (DM_SAVE_SYNC).
 #include <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -106,6 +106,11 @@ int main(void) {
     snprintf(p, sizeof p, "%s/shader_map.tsv", dm); if (!stat(p, &st)) setenv("DM_NVN_SHMAP", p, 0);
     snprintf(p, sizeof p, "%s/aoc", res); if (!stat(p, &st)) setenv("DM_AOC_DIR", p, 0);
     if (*lang) setenv("DM_LANG", lang, 0);
+    // Save sync (savesync_apple.m): with iCloud Drive on, the save is kept in iCloud Drive/nxnative-saves, the folder to pick in the iOS launcher's Sync folder row.
+    // The folder is made here, so that it is there to pick on the iPhone after one start on the Mac, even with no save yet. DM_SAVE_SYNC=<folder> in env.txt picks another,
+    // DM_SAVE_SYNC= (empty) turns it off
+    snprintf(p, sizeof p, "%s/Library/Mobile Documents/com~apple~CloudDocs", home);
+    if (!getenv("DM_SAVE_SYNC") && !stat(p, &st)) { strlcat(p, "/nxnative-saves", sizeof p); mkdirs(p); setenv("DM_SAVE_SYNC", p, 0); fprintf(stderr, "launcher: save sync in %s\n", p); }
     setenv("DM_WINDOW", "1", 0); setenv("DM_AUDIO", "1", 0);
     if (chdir(sup)) { fprintf(stderr, "[RED] launcher: cannot enter %s\n", sup); return 1; }
     struct sigaction sa = {.sa_handler = forward};   // no SA_RESTART: waitpid below sees EINTR and waits again
