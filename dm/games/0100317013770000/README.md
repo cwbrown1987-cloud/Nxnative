@@ -77,6 +77,6 @@ With an opening garden save: boot, dismiss prompts, select Continue and confirm 
 ## Open
 
 - Combat, later worlds and DLC gameplay; rendering beyond the tested opening route.
-- The rebased run additionally warned for texture slot 3 of `35ac28bf364ad740`; its sampling predicate has not been GPU-checked. Any mismatch with an enabled sampling branch needs investigation. The integer-attribute format `0x27` fallback warning also remains.
+- Texture slot 3 of `35ac28bf364ad740` has the same CB0-offset-384 sampling guard. Four further 180-second GPU-checkpoint runs observed 743 real-3D bindings, all enabled (150.0), but did not reproduce its original placeholder binding; that case remains unverified. Any mismatch with an enabled sampling branch needs investigation. The integer-attribute format `0x27` fallback warning also remains.
 - iOS shader compilation, device rendering and virtual address layout.
 - Representative pipeline prewarm seeds; the seed manifest is empty.
