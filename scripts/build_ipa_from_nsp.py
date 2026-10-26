@@ -1399,7 +1399,10 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False):
     if not mac: rmtree(kf)
     try: PROG.watch(ShaderWatch(g, libs, Path(env['WORK'])))
     except Exception: pass   # progress never stops the build (a missing table is dmsh_build.py's to report)
-    benv = dict(env, XLATE=str(xlate), IOSOUT=str(ios))
+    # The Metal work follows from what the build produces: an iPhone build needs only the iOS libraries (the macOS
+    # metallibs are about half of the compile and never enter the IPA), a Mac build only the Mac's, and a build that
+    # wants both compiles both. The Mac sources and reflection are written either way (c1_full / cb_extent come from them).
+    benv = dict(env, XLATE=str(xlate), IOSOUT=str(ios), DMSH_TARGETS='mac' if mac else 'ios')
     if mac: del benv['IOSOUT']   # dmsh_build.py builds the iOS libraries only with IOSOUT
     run([py, repo / 'dm/gfx/tools/own_compilers.py', sh / 'pkg', sh / 'cache'], log, env=benv)   # dmsh_build.py with this Mac's Metal compiler and spirv-cross
     PROG.watch(None)
