@@ -161,9 +161,10 @@ Under each game: the IPA's size, and "60 fps with 1.2.0" where the game runs at 
 
 Prefer a graphical interface to the command line? **[NX2Apple](https://github.com/LNPANDY/NX2Apple)** is a community fork with a macOS app that runs this whole pipeline for you and packs the game files into a sharded RomFS archive for a slimmer IPA. It is a separate project that follows this one; the steps below are nxnative's own command-line way.
 
-**1. Get nxnative and its tools** (once, on a Mac with [Xcode](https://apps.apple.com/app/xcode/id497799835) and [Homebrew](https://brew.sh)):
+**1. Get nxnative and its tools** (once, on a Mac with macOS 26.6 or later, [Xcode](https://apps.apple.com/app/xcode/id497799835) 27.1 and [Homebrew](https://brew.sh)). Xcode 27.1's Metal compiler is the one the games' shaders are tested with: with another one, shaders can come out wrong and the game shows a corrupted picture ([#242](https://github.com/seedds/nxnative/issues/242)), so the script stops and tells you.
 
 ```
+xcodebuild -downloadComponent MetalToolchain
 git clone https://github.com/seedds/nxnative.git && cd nxnative
 brew install xcodegen zstd spirv-cross glslang
 brew install --cask dotnet-sdk
