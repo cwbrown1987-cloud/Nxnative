@@ -33,6 +33,7 @@ int mfx_frame_prepare(double frame_s);
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int slot, id<MTL4CounterHeap> heap, NSUInteger stamp);   // heap: timestamps at stamp / stamp+1 around MetalFX (may be nil)
 void mfx_note_gpu(double ms);   // GPU time of one interpolation, for the statistics line
 void mfx_frame_abort(void);
+void mfx_history_reset(void);   // before mfx_frame_prepare: this frame's scene does not continue the previous one (another canvas)
 id<MTLTexture> mfx_output(int slot);   // RGBA8Unorm view of the sRGB output, like the swapchain textures
 void mfx_stats(char *out, size_t n);
 void mfx_mv_log(void);

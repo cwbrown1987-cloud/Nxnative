@@ -2603,7 +2603,7 @@ static char g_mfx_mask_mark;
 #define MFX_UPSCALE_KEY "bd7ffdd435c6c3bc"   /* Breath of the Wild's upscale of the 1600x900 scene into the canvas (agl_technique_pfx, gsys); MacNativeGames' BOTW_MFXUP_KEY */
 #define MFX_CAM_SLOT 0                     /* the G-buffer pass's camera block: vertex uniform 0, 2336 bytes (view, view-projection, projection, inverse view, near / far, aspect, field of view) */
 #define MFX_CAM_SIZE 2336
-static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int nswap, scene_done, ui_cleared, depth_done, want_cam, role, ready, pass_mfx; uint64_t frames, noui, fused; __weak id<MTLTexture> canvas_tex; } g_mfx;
+static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int nswap, scene_done, ui_cleared, depth_done, want_cam, role, ready, pass_mfx; uint64_t frames, noui, fused, resets, scene_canvas, prev_scene_canvas; __weak id<MTLTexture> canvas_tex; } g_mfx;   // canvas_tex: the texture this frame's upscale drew into; scene_canvas: the canvas this frame's scene came from
 static int mfx_on(void) {   // DM_MFX_INTERP set and the game is Breath of the Wild (its canvas, upscale draw and camera block are what the replay looks for)
     static int ok = -1;
     if (ok < 0) { ok = !strcmp(DM_GAME_ID, "01007EF00011E000"); if (!ok && getenv("DM_MFX_INTERP")) MLOG("[RED] [mfx] DM_MFX_INTERP: frame interpolation is only wired for Breath of the Wild; off"); }
@@ -3118,7 +3118,7 @@ static void mfx_pass_setup(MTL4RenderPassDescriptor *pd, int clear_only) {
             if (g_mfx.last_c0 && g_mfx.canvas != g_mfx.last_c0) { g_mfx.canvas = g_mfx.last_c0; MLOG("[mfx] canvas: texture %llu (%ux%u), copied to presented texture %llu", (unsigned long long)g_mfx.canvas, g_mfx.swap_w, g_mfx.swap_h, (unsigned long long)t0->serial); }
         } else if (c0.width >= 640 && fabs((double)c0.width * g_mfx.swap_h / ((double)c0.height * g_mfx.swap_w) - 1) < 0.01 && pd.colorAttachments[0].level == 0 &&
                    (pf_is_float(c0.pixelFormat) || c0.pixelFormat == MTLPixelFormatRGB10A2Unorm) && !dt) {
-            g_mfx.last_c0 = t0->serial; g_mfx.canvas_tex = c0;
+            g_mfx.last_c0 = t0->serial;
         }
     }
     if (!g_mfx.depth_done && dt && c0 && dt.pixelFormat == MTLPixelFormatDepth32Float && dt.width == c0.width && dt.height == c0.height && dt.width >= 320) {
@@ -3146,7 +3146,7 @@ static void mfx_snapshot_scene(void) {
     id<MTL4ComputeCommandEncoder> b = blit();
     enc_b_copy_texture(b, c, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(c.width, c.height, 1), sc, 0, 0, MTLOriginMake(0, 0, 0));
     enc_b_end(g_blit); g_blit = nil;
-    g_mfx.scene_done = 1; mfx_note_scene();
+    g_mfx.scene_done = 1; g_mfx.scene_canvas = R.rt.color[0]->serial; mfx_note_scene();
 }
 // mode 1 (clear_only): a pass opened only to land pending clears, attaching only the attachments that have clears; mode 2: the lookahead proves this pass does not use depth-stencil, so depth is not attached.
 // clear_only: a pass opened only to land pending clears, attaching only the attachments that have clears - the other attachments are not touched by this pass, and attaching them costs a pointless load and store on TBDR
@@ -8731,7 +8731,9 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (g_enc && g_sm_pass && draw_samples_rt(pr)) { PD("M %llu a draw in the slice-merged pass samples its attachment; split here", g_stat_pass); rp_end(); }
     if (!g_enc && mode == 0 && !g_rp_layered && !defer_q_draw && g_exec_next && !tbdr_on() && !g_geo_program && sm_on()) sm_plan(pr);
     if (mfx_on() && pr && R.rt.n > 0 && R.rt.color[0] && !g_defer_replaying) {   // frame interpolation (g_mfx)
-        if (pr->sh[1] && !strncmp(pr->sh[1]->key, MFX_UPSCALE_KEY, 16)) g_mfx.ready = 1;   // the upscale draw: after it the canvas holds the finished scene
+        if (pr->sh[1] && !strncmp(pr->sh[1]->key, MFX_UPSCALE_KEY, 16)) {   // the upscale draw into the canvas: after it the canvas holds the finished scene
+            if (R.rt.color[0]->serial == g_mfx.canvas) { g_mfx.ready = 1; g_mfx.canvas_tex = tex_mtl(R.rt.color[0]); }
+        }
         else if (!g_mfx.scene_done && g_mfx.ready && g_mfx.canvas && R.rt.color[0]->serial == g_mfx.canvas) mfx_snapshot_scene();   // the first UI draw: copy the scene first
     }
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
@@ -10768,9 +10770,14 @@ static int mfx_present_frame(const tex_t *t, double period) { @autoreleasepool {
         rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
         [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [en endEncoding];
-        mfx_note_scene();
+        mfx_note_scene(); g_mfx.scene_canvas = g_mfx.canvas;
         if (++g_mfx.noui <= 2 || g_mfx.noui % 100 == 0) MLOG("[mfx] %llu frames without UI so far (game frame %llu): the canvas is the scene, the UI layer is empty", (unsigned long long)g_mfx.noui, (unsigned long long)atomic_load(&g_cur_frame));
     }
+    if (g_mfx.scene_done && g_mfx.scene_canvas != g_mfx.prev_scene_canvas) {   // another canvas than the previous scene's (the load screen's and the world's at a load): no frame between the two
+        if (g_mfx.prev_scene_canvas && (++g_mfx.resets <= 4 || g_mfx.resets % 100 == 0)) MLOG("[mfx] the scene comes from canvas %llu, the previous one from %llu: no interpolated frame between them (%llu so far)", (unsigned long long)g_mfx.scene_canvas, (unsigned long long)g_mfx.prev_scene_canvas, (unsigned long long)g_mfx.resets);
+        mfx_history_reset();
+    }
+    if (g_mfx.scene_done) g_mfx.prev_scene_canvas = g_mfx.scene_canvas;
     int slot = mfx_frame_prepare(period);
     NSArray *keep = nil;
     if (slot >= 0) {
@@ -10792,7 +10799,7 @@ static int mfx_present_frame(const tex_t *t, double period) { @autoreleasepool {
         mfx_mv_log();   // DM_MFX_MVLOG (diagnostic)
         if (keep && mfx_dump_due()) { while (atomic_load(&g_mfx_busy[a])) usleep(200); mfx_dump((long)atomic_load(&g_cur_frame), nil, nil); }   // DM_MFX_DUMP (diagnostic): waits for the GPU
     }
-    g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = g_mfx.ready = 0;
+    g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = g_mfx.ready = 0; g_mfx.canvas_tex = nil;
     if (++g_mfx.frames % 300 == 0) { char b[320]; mfx_stats(b, sizeof b); MLOG("[mfx] up to frame %llu: %s", (unsigned long long)atomic_load(&g_cur_frame), b); }
     return slot;
 } }

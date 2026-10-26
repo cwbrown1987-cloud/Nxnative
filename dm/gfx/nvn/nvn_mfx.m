@@ -48,6 +48,7 @@ int mfx_frame_prepare(double frame_s) { (void)frame_s; return -1; }
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int slot, id<MTL4CounterHeap> heap, NSUInteger stamp) { (void)cb; (void)slot; (void)heap; (void)stamp; return nil; }
 void mfx_note_gpu(double ms) { (void)ms; }
 void mfx_frame_abort(void) {}
+void mfx_history_reset(void) {}
 id<MTLTexture> mfx_output(int slot) { (void)slot; return nil; }
 void mfx_stats(char *out, size_t n) { snprintf(out, n, "not available on visionOS"); }
 void mfx_mv_log(void) {}
@@ -316,6 +317,7 @@ int mfx_frame_prepare(double frame_s) {
     g.enc_depth = depth;
     return s;
 }
+void mfx_history_reset(void) { g.prev_ok = g.hist_ok = 0; }   // the next frame starts a new pair (its scene is not a continuation of the last)
 void mfx_frame_abort(void) { g.enc_depth = nil; g.prev_ok = g.hist_ok = 0; g.skip_busy++; }
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> heap, NSUInteger stamp) {
     id<MTLTexture> depth = g.enc_depth; g.enc_depth = nil; g.last_depth = depth; g.last_slot = s;
