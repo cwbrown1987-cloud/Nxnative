@@ -206,10 +206,29 @@ static void t_rumble_log(void) {
     unsetenv("DM_RUMBLE_LOG");
 }
 
+// Scripted presses (DM_KEYS, DM_CTL: script_set) on a path of their own: a connected controller publishes its whole state on every change (a DualShock 4's sticks all the
+// time), which overwrote a scripted press that went through the controller's path
+static void t_script(void) {
+    g_mode = 1; dm_pad_players(0);
+    script_set(DM_BTN_A, 0, 0, 0, 0);
+    dm_pad_set(0, 120, 0, 0, 0);   // the controller publishes: nothing pressed, a stick drifting
+    CHECK(buttons_of(0, STYLE_FULLKEY) & DM_BTN_A, "a scripted press survives the controller publishing its state");
+    script_set(0, 0, 0, 0, 0); dm_pad_set(DM_BTN_B, 0, 0, 0, 0);
+    CHECK(buttons_of(0, STYLE_FULLKEY) == DM_BTN_B, "released, only the controller's button remains");
+    dm_pad_set(0, 0, 0, 0, 0); buttons_of(0, STYLE_FULLKEY);
+    script_set(DM_BTN_X, 0, 0, 0, 0); script_set(0, 0, 0, 0, 0);
+    CHECK(buttons_of(0, STYLE_FULLKEY) == DM_BTN_X, "a scripted press shorter than the game's read is latched until it reads");
+    CHECK(buttons_of(0, STYLE_FULLKEY) == 0, "and read once");
+    script_set(0, -0x7000, 0, 0, 0); dm_pad_set(0, 0x100, 0, 0, 0);
+    CHECK(lx_of(0) == -0x7000, "the scripted stick deflected more wins over the controller's drift");
+    script_set(0, 0, 0, 0, 0); dm_pad_set(0, 0, 0, 0, 0); buttons_of(0, STYLE_FULLKEY);
+}
+
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     t_slots();
     t_npads();
+    t_script();
     t_vibration();
     t_rumble_log();
     printf("hid players: %d checks, %d failed\n", checks, fails);
