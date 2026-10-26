@@ -164,10 +164,12 @@ The Mac is the development host. To test or debug a game on the Mac, `--platform
 It skips the iOS shaders, the Xcode project and the IPA. For Mario Kart 8 Deluxe that saves about 30,000 iOS shader compiles and the 12 GB IPA. It keeps the extracted files even with `--no-keep-extracted`, because the game runs from them. It needs a Mac with Apple silicon, and it cannot be combined with `--prepare-xcode`. The last line it prints is the command that runs the game, built from the run's own paths (step 5 of [Build by hand (Mac)](#build-by-hand-mac)), for example:
 
 ```
-cd "<NSP folder>/<id>_build/run" && DM_ROOT="<NSP folder>/<id>_build" DM_ROMFS="<NSP folder>/<id>_build/extract/<version>/RomFS" DM_SAVE="<NSP folder>/<id>_build/run/save" DM_TEMP="<NSP folder>/<id>_build/run/temp" DM_MSL_DIR="<NSP folder>/<id>_build/shader/cache" DM_FONT_DIR="<NSP folder>/<id>_build/font" DM_NVN_SHMAP="<repository>/dm/games/<id>/shader_map.tsv" DM_LANG=en-US DM_WINDOW=1 DM_AUDIO=1 "<NSP folder>/<id>_build/tools/dmhost" "<NSP folder>/<id>_build/patched_<version>"
+cd "<NSP folder>/<id>_build/run" && DM_ROOT="<NSP folder>/<id>_build" DM_ROMFS="<NSP folder>/<id>_build/extract/<version>/RomFS" DM_SAVE="<NSP folder>/<id>_build/run/save" DM_TEMP="<NSP folder>/<id>_build/run/temp" DM_MSL_DIR="<NSP folder>/<id>_build/shader/cache" DM_FONT_DIR="<NSP folder>/<id>_build/font" DM_NVN_SHMAP="<repository>/dm/games/<id>/shader_map.tsv" DM_WINDOW=1 DM_AUDIO=1 "<NSP folder>/<id>_build/tools/dmhost" "<NSP folder>/<id>_build/patched_<version>"
 ```
 
 The save is in `<id>_build/run/save` and stays there from run to run. `DM_AOC_DIR` is added when the folder has DLC. `DM_NVN_SHMAP` is added for an NVN game; it names the profile's shader map, or the derived or provisional profile's. A Vulkan or GL game's `DM_MSL_DIR` is `<id>_build/shader`. The switches of `--env-file` are added to the command.
+
+The command names the game language (`DM_LANG=<code>`) only when one was asked for (`--language` / `LANGUAGE`); otherwise the Mac host takes the language from the Mac itself: `dm/host/lang_mac.m` reads the user's preferred languages (`[NSLocale preferredLanguages]`, the order System Settings > General > Language & Region shows), `hle_oe.c` maps them to Switch language codes (`it-IT` → `it`, `en-AU` → `en-GB`, `es-MX` → `es-419`, `zh-Hant-HK` → `zh-Hant`, …) and picks the first one the game's control data lists — `control.nacp` beside the version's RomFS folder, the file `nacp.py --languages` reads, with the same stand-in for another region's language (`en-GB` for `en-US`, and so on). The log says what it chose: `language: it (macOS preferred it-IT, en-GB; game supports en-US en-GB ja fr de es it)`. A `DM_LANG` set by hand, by a script or by the iOS app still wins; without a `control.nacp` the first preferred language the Switch has a code for is used, and when none maps `en-US` if the game has it, else the game's first language.
 
 Reuse works as for the IPA. Each shader output has its own key, named after the one chain version: `shader/ios/b-<chain>.key` for the iOS libraries and `shader/mac-b-<chain>.key` for the Mac's (`shader/ios/vk.key` and `shader/vk.key` for a Vulkan game, the same with `gl` for a GL game). An iOS build writes both keys, since it builds the Mac's libraries too, so a Mac-only build of a folder already packed as an IPA reuses its shaders. Either key is taken only while the Mac libraries carry a full build's stamp; `c1_full.tsv` or `cb_extent.tsv` that does not name it is made again from them, as for the IPA. An iOS build after a Mac-only build still has the iPhone's libraries to make. It translates the shaders again, because `dmsh_build.py`'s per-shader cache keys include the iOS compile convention. It then takes the Mac libraries from the Metal compile cache (`shader/cache/cas/metallib`) and compiles only the iPhone's.
 
@@ -194,10 +196,11 @@ The bundle holds what the IPA holds, with the Mac's shader libraries:
 
 ```
 <game name>.app/Contents/
-  Info.plist                 name, version, bundle ID, the profile's app_category; DMTitleID, DMRomfsMarker, DMLanguage and DMModuleFiles for the launcher
+  Info.plist                 name, version, bundle ID, the profile's app_category; DMTitleID, DMRomfsMarker, DMModuleFiles, and DMLanguage only when --language names one (pack_app.py takes --lang), for the launcher
   MacOS/nxnative             the launcher (dm/mac/launcher.c, compiled by pack_app.py)
   MacOS/dmhost               the Mac host built for the profile
   Resources/romfs/           the packed version's RomFS
+  Resources/control.nacp     the game's control data, whose languages the host checks when it follows the Mac's language
   Resources/msl/b-<chain>/   the Mac shader libraries, reflection JSON and runtime TSV tables (vk/ or gl/ for a Vulkan or GL game)
   Resources/aoc/<index>/     the DLC, when the folder has some
   Resources/dm/              the rewritten modules and their rewriter tables, nro.tsv, the profile's shader_map.tsv, pso_manifest.tsv, c1_full.tsv and cb_extent.tsv, font/, env.txt (--env-file)
@@ -293,7 +296,7 @@ Notes on these steps:
 - It also bundles a standard font (macOS's Arial Unicode, `STD_FONT=` overrides it) and the generated `nintendo_ext.ttf`.
 - The icon is the `icon.jpg` that `nx_extract` saves next to `RomFS/`; `DM_ICON=` points at another image.
 - `DM_ENV_FILE=` bakes environment switches into the app, and `DM_DISPLAY_NAME=` renames it.
-- `DM_LANG=<code>` is the game language (`DMLanguage` in `Info.plist`, default `en-US`; `main.m` sets `DM_LANG` from it unless `Documents/env.txt` or the baked env file sets it).
+- `DM_LANG=<code>` is the game language (`DMLanguage` in `Info.plist`, default `en-US`; `main.m` sets `DM_LANG` from it unless `Documents/env.txt` or the baked env file sets it). On the Mac it is the game language too, but left out the host follows the Mac's own language ([A Mac-only build for development](#a-mac-only-build-for-development)); a Mac app (`--platform mac-app`) fixes `DMLanguage` only when `--language` / `LANGUAGE` names one, so by default it follows the Mac too.
 - `DM_METAL_CAPTURE=1` makes a build that can write GPU frame captures (`MetalCaptureEnabled` in `Info.plist`, for `DM_GPU_CAPTURE`, [GPU measurement](#gpu-measurement)).
 - `DM_SHOW_FPS=1` turns the frame-rate counter on (`DMShowFPS` in `Info.plist`, which `front_ios.m` reads; `DM_SHOW_FPS` in `Documents/env.txt` overrides it). It counts the frames put on screen each second (`mtl_present_count`), so frames the display link merges away are not counted.
 - The unsigned build pins its build product and intermediate directories inside `$W/build/ios/pkg/dd`, independently of Xcode's Locations preference.

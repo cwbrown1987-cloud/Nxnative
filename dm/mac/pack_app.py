@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # Pack a self-contained, double-clickable Mac app of a game (the NSP script's --platform mac-app): the launcher (dm/mac/launcher.c, compiled here) as CFBundleExecutable, the Mac host beside it,
-# and in Contents/Resources what the IPA carries (dm/ios/tools/build_ipa.sh): romfs/ (the RomFS), msl/<b-chain | vk | gl>/ (the Mac shader libraries, the folder named as in the IPA),
+# and in Contents/Resources what the IPA carries (dm/ios/tools/build_ipa.sh): romfs/ (the RomFS) with the game's control.nacp beside it (its languages, for the host), msl/<b-chain | vk | gl>/ (the Mac shader libraries, the folder named as in the IPA),
 # aoc/<index>/ (DLC), and dm/ (the rewritten modules and their rewriter tables, nro.tsv, the profile's shader_map.tsv / pso_manifest.tsv / c1_full.tsv / cb_extent.tsv, font/, env.txt),
-# plus AppIcon.icns from the game's icon (sips, iconutil) and the Info.plist keys the launcher reads (DMTitleID, DMRomfsMarker, DMLanguage).
+# plus AppIcon.icns from the game's icon (sips, iconutil) and the Info.plist keys the launcher reads (DMTitleID, DMRomfsMarker, and DMLanguage when --lang names one).
 # The large folders are APFS clones (cp -c) when the app is on the same APFS volume as the build, so they take no space; plain copies otherwise.
 # Signing: the inner host first, then the bundle (codesign --force --sign <identity>; '-' = ad-hoc), without the hardened runtime: the host maps the game's code executable, which the hardened
 # runtime refuses without entitlements, and so the app cannot be notarized.
@@ -88,7 +88,10 @@ def info_plist(a, minos, icon):
     p = {'CFBundleName': a.name, 'CFBundleDisplayName': a.name, 'CFBundleIdentifier': a.bundle_id or f'org.nxnative.{a.title_id.lower()}',
          'CFBundleVersion': a.version or '1.0', 'CFBundleShortVersionString': a.version or '1.0', 'CFBundlePackageType': 'APPL', 'CFBundleExecutable': EXE,
          'CFBundleInfoDictionaryVersion': '6.0', 'LSMinimumSystemVersion': minos, 'LSArchitecturePriority': ['arm64'], 'NSHighResolutionCapable': True,
-         'LSApplicationCategoryType': a.category or 'public.app-category.games', 'DMTitleID': a.title_id.upper(), 'DMRomfsMarker': a.marker or '', 'DMLanguage': a.lang or 'en-US'}
+         'LSApplicationCategoryType': a.category or 'public.app-category.games', 'DMTitleID': a.title_id.upper(), 'DMRomfsMarker': a.marker or ''}
+    # DMLanguage only when a language was asked for (--lang): without it the launcher leaves DM_LANG unset and the Mac host gives the game the first of the Mac's preferred
+    # languages the game supports (hle_oe.c), so the app follows the player's Mac instead of English
+    if a.lang: p['DMLanguage'] = a.lang
     if icon: p['CFBundleIconFile'] = 'AppIcon'
     return p
 
@@ -136,6 +139,11 @@ def pack(a):
     step('shader libraries'); msl_dst = res / 'msl' / (a.msl_name or msl.name); msl_dst.mkdir(parents=True); copy(msls, msl_dst, clone)
     if aoc: step('add-on content'); copy([aoc], res / 'aoc', clone)
     step('game files'); copy([romfs], res / 'romfs', clone)
+    # The game's control data beside romfs/, where the extraction keeps it beside RomFS/: the host reads its supported languages there (hle_oe.c, the folder above DM_ROMFS) to give the
+    # game the first of the Mac's preferred languages it has; without it the first preferred language with a Switch code is taken, whether the game has it or not
+    nacp = romfs.parent / 'control.nacp'
+    if not nacp.is_file() and a.nacp and Path(a.nacp).is_file(): nacp = Path(a.nacp)   # an update may carry no control data of its own: the base game's (--nacp) stands in
+    if nacp.is_file(): shutil.copyfile(nacp, res / 'control.nacp')
     icon = bool(a.icon and Path(a.icon).is_file())
     if icon: step('icon'); make_icns(a.icon, res / 'AppIcon.icns')
     info = info_plist(a, minos, icon)
@@ -164,7 +172,7 @@ def parse(argv):
     ap.add_argument('--aoc', help='the DLC RomFS folders by index')
     ap.add_argument('--env-file', help='environment switches baked in (Resources/dm/env.txt)')
     ap.add_argument('--title-id', required=True); ap.add_argument('--name', required=True)
-    ap.add_argument('--version'); ap.add_argument('--bundle-id'); ap.add_argument('--category'); ap.add_argument('--lang'); ap.add_argument('--marker', help='the profile\'s romfs_marker')
+    ap.add_argument('--version'); ap.add_argument('--bundle-id'); ap.add_argument('--category'); ap.add_argument('--lang', help='the game language to fix (DMLanguage); omitted: the game follows the Mac\'s preferred languages'); ap.add_argument('--nacp', help='the fallback control.nacp (the base game\'s) when the packed version has none beside its RomFS'); ap.add_argument('--marker', help='the profile\'s romfs_marker')
     ap.add_argument('--icon', help='the game icon (icon.jpg from the control data)')
     ap.add_argument('--sign', default='-', help='codesign identity (default: - = ad-hoc)')
     return ap.parse_args(argv)
