@@ -246,7 +246,8 @@ def dotnet_env(env):
 def toolchain_fp():
     out = []
     for cmd in (['spirv-cross', '--version'], ['xcrun', '-sdk', 'macosx', 'metal', '--version'], ['xcrun', '-sdk', 'macosx', '--show-sdk-build-version']):
-        r = sh(cmd); out.append(r.stdout + r.stderr)
+        try: r = sh(cmd); out.append(r.stdout + r.stderr)
+        except FileNotFoundError: out.append('missing')   # spirv-cross on PATH: only revisions before the in-repo build (dm/gfx/tools/spirv_cross_bin) run it; a tree's own is in its chain key
     return hashlib.sha256('\0'.join(out).encode()).hexdigest()
 
 
@@ -261,7 +262,8 @@ def chain_key(tree, g, tools):
         side += digest([pairs])
     elif g.kind == 'vk':
         v, inp = digest([tree.path / 'dm/gfx/tools/vk_shaders.py'])[:12], g.ver
-        side = ''
+        sc = tree.path / 'dm/gfx/tools/spirv_cross_bin/spirv-cross'   # the tree's in-repo spirv-cross, which its vk_shaders.py runs (an NVN chain version covers it through the lock)
+        side = digest([sc]) if sc.is_file() else ''
         vk = load_module('regress_vk_sources', REPO / 'dm/gfx/tools/vk_shaders.py')
         sources = digest(sorted(Path(p) for root in g.shader_roots() for p in vk.spirv_files(root)), root=g.build)
     else: raise HarnessError(f'{g.id}: the chain check does not cover {g.kind} games yet')
