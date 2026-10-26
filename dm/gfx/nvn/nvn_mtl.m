@@ -5479,14 +5479,36 @@ static MTL4RenderPipelineDescriptor *pre_desc(NSString *vk, NSString *fk, int ze
         a.rgbBlendOperation = a.alphaBlendOperation = MTLBlendOperationUnspecialized; }
     return m;
 }
+// Each base is first compiled by a compiler without the serializer (pre_trial), outside g_arch_rw, within DM_PSO_PREBUILD_BUDGET seconds (default 60); only a base built in time is
+// compiled again with the serializer, under the lock as before (Link's Awakening's 17,742 bases took no measurably longer). Apple's GPU compiler can work on one base for good: Super Mario Odyssey's alRenderMaterialUber
+// var0 pixel shader (444,013 lines of MSL) grows MTLCompilerService past several GB until it aborts in llvm::report_bad_alloc_error, the relaunched service takes the request
+// again, and the compile never returns (GitHub issue #294). Compiled under g_arch_rw, that base held the read side while arch_flush waited for the write side, so every compile
+// and draw behind the flush waited too, and nothing built since the last flush was written. A base whose trial outlasts the budget is left to the draws; its trial runs on in the
+// compiler service (a Metal 4 compiler task cannot be cancelled) but holds no lock and captures nothing. A platform limit, worked around here: the compile itself is Metal's
+static id<MTL4Compiler> g_comp4_trial; static _Atomic int g_pre_slow;
+static double pre_budget(void) { const char *e = getenv("DM_PSO_PREBUILD_BUDGET"); double s = e ? atof(e) : 0; return s > 0 ? s : 60; }
+// 1: built within the budget, 0: the compile failed (*e), -1: still compiling when the budget ran out
+static int pre_trial(MTL4RenderPipelineDescriptor *m, NSError **e) {
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0); __block int ok = 0; __block NSError *err = nil;
+    [g_comp4_trial newRenderPipelineStateWithDescriptor:m compilerTaskOptions:nil completionHandler:^(id<MTLRenderPipelineState> ps, NSError *ce) { ok = ps != nil; err = ce; dispatch_semaphore_signal(sem); }];
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(pre_budget() * NSEC_PER_SEC)))) return -1;
+    if (e) *e = err;
+    return ok;
+}
 static void pre_pair(NSString *vk, NSString *fk, int zero) {
     @autoreleasepool {
         MTL4RenderPipelineDescriptor *m = pre_desc(vk, fk, zero);
         if (!m) { g_pre_skipped++; return; }
         for (id<MTL4Archive> a in g_arch4p) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
         for (id<MTL4Archive> a in g_arch4) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
-        NSError *e = nil;
-        pthread_rwlock_rdlock(&g_arch_rw); id ps = ga_capture(m, nil, &e); pthread_rwlock_unlock(&g_arch_rw);
+        NSError *e = nil; id ps = nil;
+        int t = g_comp4_trial ? pre_trial(m, &e) : 1;
+        if (t < 0) {
+            g_pre_skipped++;
+            if (g_pre_slow++ < 4) MLOG("[RED] pipeline prebuild: the base of %s + %s still compiling after %.0f s (DM_PSO_PREBUILD_BUDGET): left to the draws", vk.UTF8String, fk.UTF8String, pre_budget());
+            return;
+        }
+        if (t) { pthread_rwlock_rdlock(&g_arch_rw); ps = ga_capture(m, nil, &e); pthread_rwlock_unlock(&g_arch_rw); }
         if (ps) { g_pre_built++; atomic_fetch_add(&g_arch_new, 1); }
         else { if (g_pre_failed++ < 4) MLOG("[RED] pipeline prebuild: the base of %s + %s failed: %s", vk.UTF8String, fk.UTF8String, e.localizedDescription.UTF8String); }
     }
@@ -5555,6 +5577,8 @@ static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
     if (!g_ser4 || !g_arch_dir) { g_pre_running = 0; return -1; }
     NSString *stamp = [g_arch_dir stringByAppendingPathComponent:@"prebuilt.tsv"];
     if ([[NSString stringWithContentsOfFile:stamp encoding:NSUTF8StringEncoding error:nil] isEqualToString:want]) { g_pre_running = 0; return -1; }
+    static dispatch_once_t trial_once;
+    dispatch_once(&trial_once, ^{ g_comp4_trial = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:nil]; });   // no serializer (pre_trial); none: no budget
     int n = (int)pairs.count; uint64_t t0 = bp_now();
     MLOG("pipeline prebuild: %d shader pairs of %s%s%s, %d workers (%s)", n, pp.UTF8String, txt2 ? " and " : "", txt2 ? pp2.UTF8String : "", threads, wait ? "tool" : prepare_on() ? "prepare step, before the first frame" : "background");
     __block _Atomic int next = 0;
@@ -5573,7 +5597,8 @@ static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
     dispatch_block_t done = ^{
         dispatch_sync(g_arch_q, ^{ arch_flush(); });
         if (!g_pre_failed) [want writeToFile:stamp atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        MLOG("pipeline prebuild done: %d pairs, %d bases built, %d already archived, %d left to the draws, %d failed, %.1f s", n, (int)g_pre_built, (int)g_pre_archived, (int)g_pre_skipped, (int)g_pre_failed, (bp_now() - t0) / 1e9);
+        MLOG("pipeline prebuild done: %d pairs, %d bases built, %d already archived, %d left to the draws (%d of them past the compile budget), %d failed, %.1f s", n, (int)g_pre_built,
+             (int)g_pre_archived, (int)g_pre_skipped, (int)g_pre_slow, (int)g_pre_failed, (bp_now() - t0) / 1e9);
         g_pre_running = 0;
     };
     if (wait) { dispatch_group_wait(g, DISPATCH_TIME_FOREVER); done(); }
