@@ -4,7 +4,7 @@
 // Keyboard and mouse controls (a game whose stubs turn the camera by the mouse, hle.h dm_mouse_camera) are on from the start, ` switches to the classic keys and back. A click in the
 // window captures the mouse (cursor hidden and held still); leaving the window (⌘Tab) or ` lets it go. The keyboard takes a PC layout (kbm_bit) and the captured mouse turns the camera by angle (raw counts from GCMouse to dm_mouse_move): WASD left stick, left click Y,
 // right click ZL, middle click R3, F ZR, Space X, Shift B, E or Return A, Q L (while held, the mouse points the right stick, which picks in the ability wheel, and right click is B), G R, Ctrl or C L3, 1-4 D-pad right / left / up / down (Tears of the Kingdom's quick menus:
-// weapons, shields, abilities, whistle; while one is held WASD is the right stick and the scroll wheel flicks it, which pick in them), Tab or M −, Esc + (with an object held in Ultrahand E is R, Q ZL, the scroll wheel D-pad down / up and left / right, and a shake of the mouse or R shakes the right stick; in the pause menu and the Purah Pad E is R, left click A, right click B; while aiming or using an ability right click is B), arrows D-pad.
+// weapons, shields, abilities, whistle; while one is held WASD is the right stick and the scroll wheel flicks it, which pick in them, left click is X, right click B, E Y), Tab or M −, Esc + (with an object held in Ultrahand E is R, Q ZL, the scroll wheel D-pad down / up and left / right, and a shake of the mouse or R shakes the right stick; in the pause menu and the Purah Pad E is R, left click A, right click B; while aiming or using an ability right click is B), arrows D-pad.
 // Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
 // Controllers: buttons by position as on the iPhone (right A, bottom B, top X, left Y), shoulders L R, triggers ZL ZR, Menu + Options −, both sticks and their presses.
 // Each controller is a player of its own (local co-op): the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (pad_slots.h);
@@ -96,6 +96,9 @@ static int menu_open(void);
 #define DPAD (DM_BTN_UP | DM_BTN_RIGHT | DM_BTN_DOWN | DM_BTN_LEFT)
 // The ability wheel (L held by the keyboard and mouse layout, outside the menus): the mouse points the right stick, which picks in it, instead of turning the camera
 static int wheel_open(void) { return g_kbm && g_mouse_cap && (g_btn & DM_BTN_L) && !menu_open(); }
+// A quick menu (weapons, shields, abilities: a D-pad key held, outside the menus and not with an object held, where the D-pad moves it): left click is X, right click B
+// and E is Y, the menu's own buttons (B closes it)
+static int quick_open(void) { return g_kbm && (g_btn & DPAD) && !menu_open() && dm_mouse_camera_kind() != 5; }
 static void push(void) {
     int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
     double now = CACurrentMediaTime();
@@ -166,7 +169,8 @@ static void mouse_button(int n, int down) {
     if (!g_mouse_cap || !g_input_on) return;
     if (down) {
         int m = menu_open(), k = dm_mouse_camera_kind();
-        held[n] = n == 0 ? (m || k >= 3 ? DM_BTN_A : DM_BTN_Y) : n == 1 ? (m || k >= 2 || wheel_open() ? DM_BTN_B : DM_BTN_ZL) : DM_BTN_RS;   // right: B also in the ability wheel (dismisses it)
+        int q = quick_open();
+        held[n] = n == 0 ? (q ? DM_BTN_X : m || k >= 3 ? DM_BTN_A : DM_BTN_Y) : n == 1 ? (m || q || k >= 2 || wheel_open() ? DM_BTN_B : DM_BTN_ZL) : DM_BTN_RS;   // right: B also in the ability wheel and the quick menus (closes them)
     }
     g_mbtn = down ? (g_mbtn | held[n]) : (g_mbtn & ~held[n]); push();
 }
@@ -249,7 +253,7 @@ static void on_key(NSEvent *e, int down) {
             if (menu_open() == m) g_menu = 0; else { g_menu = m; g_menu_t = CACurrentMediaTime(); }
         }
         int held = down && dm_mouse_camera_kind() == 5;
-        int kb = c == 14 && down && (menu_open() || held) ? 7 : c == 12 && held ? 8 : kbm_bit(c);   // E: R in the menus and with an object held (Ultrahand: rotate); Q: ZL with an object held
+        int kb = c == 14 && down && (menu_open() || held) ? 7 : c == 14 && down && quick_open() ? 3 : c == 12 && held ? 8 : kbm_bit(c);   // E: R in the menus and with an object held (Ultrahand: rotate), Y in a quick menu; Q: ZL with an object held
         if (c >= 128) return;
         if (down) g_kmask[c] = kb >= 0 ? 1ull << kb : 0;
         g_btn = down ? (g_btn | g_kmask[c]) : (g_btn & ~g_kmask[c]);
