@@ -55,7 +55,7 @@ How sharp a texture stays when you look along it rather than at it: the ground a
 
 - **When to change it:** any game with ground or walls stretching away from the camera. It works in games that have no render scale.
 - **Cost:** a little more GPU time where it applies. Nothing is allocated and no render target changes, so memory is unaffected.
-- **Note:** a texture with no mipmaps is unaffected, as is one the game filters with nearest neighbour. **Trilinear filtering** below turns it on for a texture whose mips the game picked nearest.
+- **Note:** only mipmapped colour textures are affected. Shadow maps and the depth pyramids a game uses to decide what is visible keep what the game asked for, because filtering those along an angle changes what they mean rather than how they look. **Trilinear filtering** below turns mip blending on for a texture whose mips the game picked nearest.
 
 ### Trilinear filtering
 

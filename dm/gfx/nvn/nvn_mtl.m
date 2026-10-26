@@ -4144,7 +4144,12 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // Caller holds g_rmu
     // DM_ANISO=2..16 raises the game's own anisotropy to at least that, for every sampler. The games were
     // built for a handheld and mostly ask for 1, so ground and wall textures blur at a glancing angle.
     // Sampling only: no render target, no allocation, and a sampler that asks for more keeps what it asked for.
-    { float a = p.aniso, want = dm_aniso(); if (want > a) a = want;
+    // Only a sampler that reads a mipmapped colour texture is raised. A comparison sampler is a shadow map: anisotropy
+    // changes which depth texels the comparison averages, and across a cascade boundary the two sides then disagree,
+    // which draws a line along the join on open ground (seen in Breath of the Wild's fields). A reduction sampler is a
+    // min or max pyramid, whose value has to stay the extreme of the footprint. Without mipmaps there is no second level.
+    { float a = p.aniso;
+      if (!p.cmp_mode && !p.reduction && d.mipFilter != MTLSamplerMipFilterNotMipmapped && dm_aniso() > a) a = dm_aniso();
       d.maxAnisotropy = a < 1 ? 1 : a > 16 ? 16 : (NSUInteger)a; }
     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
     // Reduction (NVN 1 min / 2 max): the minimum or maximum of the texels a filtered sample covers, per channel (Metal 26). Pokémon Legends: Z-A builds its depth pyramid with a min sampler
