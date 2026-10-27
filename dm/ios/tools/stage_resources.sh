@@ -22,8 +22,9 @@ case "$DM_RESOURCE_MSLDIR" in b-*)
     [ "$DM_RESOURCE_MSLDIR" = "b-$V" ] || die "The prepared shaders are chain $DM_RESOURCE_MSLDIR, the sources are now at b-$V: prepare the game again (build_ipa_from_nsp.py --prepare-xcode)";;
 esac
 echo 'Copy game resources (the first build copies the complete game; later builds sync changes)'
-mkdir -p "$APP/romfs" "$APP/msl/$DM_RESOURCE_MSLDIR"
-/usr/bin/rsync -a --delete -- "$DM_RESOURCE_ROMFS/" "$APP/romfs/"
+mkdir -p "$APP/msl/$DM_RESOURCE_MSLDIR"
+# DM_COPY_ROMFS=NO: the game files stay out of the app (main.m takes Documents/romfs first, copied there once): a reinstall then sends the code and shaders, not the whole game
+if [ "${DM_COPY_ROMFS:-YES}" != NO ]; then mkdir -p "$APP/romfs"; /usr/bin/rsync -a --delete -- "$DM_RESOURCE_ROMFS/" "$APP/romfs/"; else rm -rf "$APP/romfs"; fi
 /usr/bin/rsync -a --delete -- "$DM_RESOURCE_SHADERS/" "$APP/msl/$DM_RESOURCE_MSLDIR/"
 for old in "$APP/msl/"*; do
     [ "$old" = "$APP/msl/$DM_RESOURCE_MSLDIR" ] || rm -rf "$old"

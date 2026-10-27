@@ -293,6 +293,15 @@ The first Xcode build copies the complete game, so allow free space on the game'
 
 Each prepared game is a scheme in the shared workspace (by default `NxNative.xcworkspace` beside the NSP folder; `--xcode-workspace`, `XCODE_WORKSPACE` in Spyder, collects games from different folders in one). Give each game its own bundle ID (`--bundle-id`) to keep them installed together; keep it when updating an installed game, as another ID is a separate app with separate saves. The script rejects a bundle ID that another project in the workspace uses. Preparing a game again regenerates only its project and keeps its Release bundle ID and team, including changes made in Xcode; `--bundle-id` / `--team-id` (`BUNDLE_ID` / `TEAM_ID` in Spyder, or `DM_TEAM_ID`) override them. Other manual project edits are replaced; edit `dm/ios/project.yml` for shared changes. Prepare a game again after changing its game files, profile, shaders or the project template; switching games needs only the scheme menu.
 
+### Quick reinstalls
+
+A full install sends the whole app, about 11 GB for Animal Crossing: New Horizons (3 to 4 minutes). The game files can stay on the phone instead:
+
+1. Once per game, with any build of the app installed: `scripts/push_romfs.sh <device UDID> <bundle ID> "<NSP folder>/<title ID>_build/xcode/Gen/resources.env"`. It packs the game files into one RomFS image (`dm/tools/romfs_image.py`, next to the extracted RomFS folder; about 40 seconds for Tears of the Kingdom's 17 GB) and copies it to the app's `Documents/romfs.img`, which `main.m` takes before any folder. The host (`dm/host/hle_fs.c`) reads files out of it by its index, and a `DM_ROMFS_OVERLAY` folder still wins over it. One file copies at full speed (about a minute for Tears of the Kingdom), where a folder of its 304,000 files failed through `devicectl` with POSIX error 24 (too many open files) and crawled on the small files. The index is the last part of the file, so a copy cut off halfway is refused; rerun the script after a failure. An old `Documents/romfs` folder is moved aside and deleted in the background once the image is there. The Mac takes an image too: `DM_ROMFS=<image>` (in `~/Library/Application Support/nxnative/<title ID>/env.txt`).
+2. Build with `DM_COPY_ROMFS=NO` (a build setting read by `stage_resources.sh`, for example `xcodebuild ... DM_COPY_ROMFS=NO`). The shaders, add-on content and pipeline archive still go into the app.
+
+Animal Crossing's app is then 1.2 GB and installs in 30 to 60 seconds. Deleting the app deletes its `Documents`, so push the game files again after a delete. The copy needs one `devicectl` transfer at a time.
+
 The unsigned IPA build still uses the repository's `dm/ios/DmIOS.xcodeproj`, skips the resource phase (`DM_COPY_GAME_RESOURCES=NO`) and packs the resources straight from the drive as before.
 
 ## Port another game
