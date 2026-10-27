@@ -889,10 +889,18 @@ def extract_aoc(nx, keys, repo, work, app, fam, logs):
     return dst
 
 
-def build_mismatch(d, name, g):   # the modules of an extraction whose build ID is not the one the profile's build row of that version registers ([] = the registered build)
+def build_mismatch(d, name, g):
+    """Return build IDs that differ from or are missing in the profile's row."""
     want = g.builds().get(name)
     if want is None: return [f'{name} has no build row']
-    return [f'{m} {build_id(d / "ExeFS" / m)} (registered {bid})' for m, bid in want.items() if m != 'display' and build_id(d / 'ExeFS' / m) != bid]
+    mismatch = [f'{m} {build_id(d / "ExeFS" / m)} (registered {bid})'
+                for m, bid in want.items() if m != 'display' and build_id(d / 'ExeFS' / m) != bid]
+    registered = {m for m in want if m != 'display'}
+    for m in g.words('modules'):
+        p = d / 'ExeFS' / m
+        if m not in registered and p.exists():
+            mismatch.append(f'{m} {build_id(p)} (not registered for {name})')
+    return mismatch
 
 
 def patch_files(repo, exe_dir, mods, game_id=None):

@@ -153,6 +153,33 @@ class ExternalRegistry(unittest.TestCase):
             self.registry()
 
 
+class BuildMismatch(unittest.TestCase):
+    def test_unregistered_modules_mismatch_even_when_main_matches(self):
+        spec = importlib.util.spec_from_file_location('build_ipa_from_nsp', REPO / 'scripts/build_ipa_from_nsp.py')
+        assert spec is not None and spec.loader is not None
+        nsp = importlib.util.module_from_spec(spec); spec.loader.exec_module(nsp)
+        tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tmp)
+        (tmp / 'ExeFS').mkdir()
+        ids = {'main': 'a' * 32, 'subsdk0': 'b' * 32, 'sdk': 'c' * 32}
+        for module, bid in ids.items():
+            (tmp / 'ExeFS' / module).write_bytes(b'NSO0' + bytes(0x3c) + bytes.fromhex(bid))
+
+        class Profile:
+            def __init__(self):
+                self.rows = {'v0': {'display': '?', 'main': ids['main']}}
+
+            def builds(self): return self.rows
+            def words(self, key): return list(ids) if key == 'modules' else []
+
+        profile = Profile()
+        self.assertEqual(nsp.build_mismatch(tmp, 'v0', profile), [
+            f'subsdk0 {ids["subsdk0"]} (not registered for v0)',
+            f'sdk {ids["sdk"]} (not registered for v0)',
+        ])
+        profile.rows['v0'].update(subsdk0=ids['subsdk0'], sdk=ids['sdk'])
+        self.assertEqual(nsp.build_mismatch(tmp, 'v0', profile), [])
+
+
 class RewriteKey(unittest.TestCase):
     def test_patch_files_of_the_games_builds(self):
         spec = importlib.util.spec_from_file_location('build_ipa_from_nsp', REPO / 'scripts/build_ipa_from_nsp.py')
