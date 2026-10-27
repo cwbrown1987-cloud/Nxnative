@@ -12,6 +12,17 @@
 // zero only for Metal-4-only diagnostics/optimisations which are not present
 // on this path.  These live outside the legacy source so an upstream rebase
 // cannot silently fold the two renderer implementations back together.
+void *mtl_device_classic(void) {
+    // The legacy renderer already uses classic Metal command queues, so its
+    // ordinary device is exactly the device requested by the GL/Vulkan paths.
+    return mtl_device();
+}
+
+int mtl_pso_prebuild_tool(void) {
+    // Offline Metal 4 pipeline archives do not exist on this renderer.
+    return 0;
+}
+
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) {
     return mtl_wait(fence, timeout_ns);
 }
@@ -10988,4 +10999,13 @@ void mtl_wait_state_dump(void) {
 }
 void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_alloc_waits; *grown = g_alloc_grown; *n = g_alloc_n; }   // Main submit allocator pool: how many times it waited, how many times it grew, how many exist now
 #pragma clang attribute pop
+
+// DM_CTL may publish live renderer diagnostics on every platform.  The three
+// diagnostics understood by the compatibility renderer do not exist in the
+// current Metal 4 path, so accepting and ignoring them keeps the shared host
+// interface linkable without adding legacy state to the upstream renderer.
+void dm_gfx_env_changed(const char *key, const char *value) {
+    (void)key;
+    (void)value;
+}
 #endif
