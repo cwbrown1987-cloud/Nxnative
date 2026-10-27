@@ -4,9 +4,26 @@
 #   with the app closed). Format: a text header ("NXSAVE 1", "digest <sha256 of the body>", "device <name>", "time <unix seconds>", an empty line), then the body compressed with raw
 #   deflate; the body is one entry per directory and file in path order: type ('d' / 'f'), u16 path length, path, u16 guest-name length, guest name (the
 #   org.d2rmobile.guest-name attribute of a case-collision name), and for a file u64 size and its bytes (little-endian)
-import hashlib, os, struct, sys, time, zlib
+import hashlib, os, struct, subprocess, sys, time, zlib
 
 GUEST_NAME = 'org.d2rmobile.guest-name'
+
+
+def set_guest(path, guest):
+    """The guest-name attribute; macOS's Python has no os.setxattr, so its xattr tool writes it there"""
+    if sys.platform == 'linux':
+        os.setxattr(path, GUEST_NAME, guest.encode(), follow_symlinks=False)
+    elif sys.platform == 'darwin':
+        subprocess.run(['xattr', '-s', '-w', GUEST_NAME, guest, str(path)], check=True)
+    else:
+        print(f'{path}: guest name {guest!r} (not set: this system has no extended attributes)', file=sys.stderr)
+
+
+def get_guest(path):
+    if sys.platform == 'linux':
+        return os.getxattr(path, GUEST_NAME, follow_symlinks=False).decode()
+    r = subprocess.run(['xattr', '-s', '-p', GUEST_NAME, str(path)], capture_output=True, text=True)
+    return r.stdout.rstrip('\n') if r.returncode == 0 else None
 
 
 def read(path):
@@ -46,10 +63,8 @@ def unpack(path, to):
         else:
             with open(f, 'xb') as o:
                 o.write(data)
-        if guest and hasattr(os, 'setxattr'):
-            os.setxattr(f, GUEST_NAME, guest.encode(), follow_symlinks=False)
-        elif guest:
-            print(f'{rel}: guest name {guest!r} (not set: this system has no extended attributes)', file=sys.stderr)
+        if guest:
+            set_guest(f, guest)
 
 
 def main(argv):

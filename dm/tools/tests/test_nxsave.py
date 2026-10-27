@@ -1,7 +1,7 @@
 """dm/tools/nxsave.py reads the save sync's archives (dm/host/savesync_apple.m): header and entries, unpacking with guest names, and refusing a damaged file or a path that leaves the folder."""
 import hashlib
 import importlib.util
-import os
+import sys
 from pathlib import Path
 import struct
 import tempfile
@@ -10,6 +10,7 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('nxsave', ROOT / 'dm/tools/nxsave.py')
+assert spec and spec.loader
 nxsave = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nxsave)
 
@@ -37,8 +38,8 @@ class NxSaveTests(unittest.TestCase):
             out = Path(tmp) / 'out'
             nxsave.unpack(self.write(tmp, archive(body)), out)
             self.assertEqual((out / 'sub/B.DAT').read_bytes(), b'b')
-            if hasattr(os, 'getxattr'):
-                self.assertEqual(os.getxattr(out / '.dm-case-1', nxsave.GUEST_NAME), b'a.dat')
+            if sys.platform in ('linux', 'darwin'):
+                self.assertEqual(nxsave.get_guest(out / '.dm-case-1'), 'a.dat')
 
     def test_refuses_damaged_and_escaping_archives(self):
         with tempfile.TemporaryDirectory() as tmp:
