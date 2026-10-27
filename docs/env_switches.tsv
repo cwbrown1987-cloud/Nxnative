@@ -229,6 +229,8 @@ DM_SLOWFRAME	diagnostic	`=1` writes the per-frame timing breakdown to the log on
 DM_SPIN	switch	`0` makes the rewriter's spin gate return at once, so guest poll loops spin with no sleep; the gate stays (on by default)
 DM_SPIN_LIST	diagnostic	`=1` makes `patch_nso.py` print every guest poll loop it found and sends through a spin gate
 DM_SPIN_POLL	switch	`=<µs>`: how long a spin-gate wait polls before it sleeps with the yield back-off (default 2000; `0` yields on every pass)
+DM_STEAM_DEADZONE	switch	`=0..0.9` (exclusive upper bound) sets the radial deadzone for both raw Steam Controller sticks; default 0.10, `0` disables it; invalid values use the default
+DM_STEAM_HID	switch	`=0` disables the Mac direct Steam Controller HID adapter and leaves input to Apple GameController; enabled otherwise
 DM_SVC	diagnostic	`=1` logs memory SVCs (`SetHeapSize`, `MapMemory`, `Map`/`UnmapPhysicalMemory`) with their addresses and sizes
 DM_SYMCHECK	diagnostic	`=1` checks every hashed module symbol lookup against a linear search and logs a red line for each mismatch
 DM_TEAM_ID	switch	Apple team ID for the per-game Xcode project, used when `--team-id` / `TEAM_ID` is not given; `build_ipa.sh` uses the placeholder `0000000000` (unsigned) when unset
@@ -256,6 +258,7 @@ DM_TOUCH_HAPTICS	player	`0` turns off the light haptic tap when a touch control 
 DM_TOUCH_LOG	diagnostic	`=1` logs each touch-screen read with touch points (sample, finger, position, attributes) and each gesture entry, up to 500 lines
 DM_UDC_SELFTEST	diagnostic	`=1` runs a start-up check of DontCare load and store on private depth-stencil and RGBA8 textures (clear, Load + DontCare, read back) and logs one result line
 DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.py`, for `shader_split.py` (default `ue_shaders` beside the RomFS); needed when the RomFS has Unreal paks
+DM_UI_HOLD	test	When set, keeps the controller mapping test window open for 60 seconds after its UI screenshot for manual inspection
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
