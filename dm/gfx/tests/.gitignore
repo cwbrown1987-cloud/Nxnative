@@ -136,3 +136,6 @@ t_rast_discard
 t_rast_discard.dSYM/
 t_feedback
 t_feedback.dSYM/
+
+t_float_pad
+t_float_pad.dSYM/
