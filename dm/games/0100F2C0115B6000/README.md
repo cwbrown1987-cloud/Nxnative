@@ -54,6 +54,7 @@ Game-specific findings. The general host changes they led to are listed under [F
 ## Services
 
 - **Resolved in the input adapter; current hardware retest pending:** [PR #221](https://github.com/seedds/nxnative/pull/221#issuecomment-6428699708) reports working USB-C buttons, sticks and rumble with the 2026 Steam Controller, and working bow gyro aiming after a 10% stick deadzone, including after walking and while moving. Tested by hrdkbhatnagar on M4 Pro, macOS 27.0.1 and update 1.4.3; trackpads, rear buttons, mapping UI, Bluetooth and Puck were not covered. See [Steam Controller stick drift](../../../docs/reference/services.md#steam-controller-stick-drift-suppresses-gyro-aiming). The reported gyro scale has not been calibrated against a known rotation.
+- **Resolved in the host; gameplay retest pending:** the same [PR #221 investigation](https://github.com/seedds/nxnative/pull/221#issuecomment-6427021412) found a pre-existing six-axis handle-format mismatch. [SDK-compatible handles](../../../docs/reference/services.md#six-axis-handle-encoding) are covered by wire fixtures; this was separate from the gyro-aiming failure.
 - SDK 20 calls it needed (each aborted in `sm::Initialize` or read a null applet proxy, one per boot): `oe::GetPreviousProgramIndex`, the hardware Opus decoder's C interface, cache storage, `fs::IsSaveDataExisting` for another title (it asks for Breath of the Wild's save: none), `MountSaveDataReadOnly`, `time::ClockSnapshot::CreateWithStandardSystemClock` ([Applet resource user ID, launch parameters and VR mode](../../../docs/reference/services.md#applet-resource-user-id-launch-parameters-and-vr-mode), [Hardware Opus decoders](../../../docs/reference/audio.md#hardware-opus-decoders-built-on-the-sdks-software-decoders), [Cache storage and other titles' save data](../../../docs/reference/services.md#cache-storage-and-other-titles-save-data), [Steady clock, clock snapshots and user clocks](../../../docs/reference/services.md#steady-clock-clock-snapshots-and-user-clocks)).
 - `main` imports `nn::ro` (it loads NRO modules at run time).
 - Focus handling mode 2 (focus notifications are sent).
@@ -75,6 +76,8 @@ Game-specific findings. The general host changes they led to are listed under [F
 ## Found on this game
 
 General host changes first needed here; each applies to every game:
+
+- **Six-axis SDK handle encoding:** [Handle style, device and sensor count](../../../docs/reference/services.md#six-axis-handle-encoding).
 
 - **Steam Controller stick drift suppressing gyro aiming:** [Radial stick deadzone](../../../docs/reference/services.md#steam-controller-stick-drift-suppresses-gyro-aiming).
 

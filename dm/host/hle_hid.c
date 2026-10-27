@@ -367,10 +367,14 @@ static void six_sample(SixAxisState *s, int64_t samp, int shake) {
     float c = (float)cos(2 * M_PI * yaw), sn = (float)sin(2 * M_PI * yaw);
     s->dir[0] = c; s->dir[1] = sn; s->dir[3] = -sn; s->dir[4] = c; s->dir[8] = 1;
 }
-// SixAxisSensorHandle: byte 0 the style's bit number, byte 1 the npad id, byte 2 the device (left / right Joy-Con of a pair). The styles made of two Joy-Cons (handheld, dual) have
-// two sensors, the others one. A handle reads as connected while its controller is connected in that style; otherwise its entries are zero (not connected) and the count 0.
+// SixAxisSensorHandle (libnx _hidGetSixAxisSensorHandles): byte 0 the SDK style index (FullKey 3 .. JoyRight 7), byte 1 the npad id, byte 2 the device, byte 3 reserved.
+// FullKey / Handheld expose one combined sensor (device 2); JoyDual exposes left / right (0 / 1), and single Joy-Cons only their side. A disconnected handle returns zero entries.
 // Mapped Shake follows its controller's player, including controllers merged into player 1 for one-player games.
-static int six_connected(uint32_t h) { return (h & 0xff) < 32 && (style_of(h >> 8 & 0xff) >> (h & 0xff) & 1); }
+static int six_connected(uint32_t h) {
+    unsigned type = h & 0xff, id = h >> 8 & 0xff, device = h >> 16 & 0xff;
+    if (h >> 24 || type < 3 || type > 7 || style_of(id) != (1u << (type - 3))) return 0;
+    return type <= 4 ? device == 2 : type == 5 ? device <= 1 : device == (type == 7);
+}
 static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (n <= 0) return 0;
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
@@ -392,17 +396,22 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     return n;
 }
 static unsigned six_rest(uint32_t h) {
+    if (!six_connected(h)) return 1;
     int p=player_of(h >> 8 & 0xff); if (shake_source(p,guest_ns()) >= 0) return 0;
     dm_motion m; pthread_mutex_lock(&motion_lock); int present=physical_motion(p,guest_ns(),&m); pthread_mutex_unlock(&motion_lock);
     if (!present) return 1;
     float speed=0,acc=0; for(int i=0;i<3;i++) { speed+=m.gyro[i]*m.gyro[i]; acc+=m.acc[i]*m.acc[i]; }
     return speed < 0.0001f && fabsf(acc-1) < 0.1f;
 }
-HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for handheld / dual Joy-Cons, one otherwise",
+HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for dual Joy-Cons, one otherwise",
           int, h_hid_SixHandles, uint32_t *h, int n, const uint32_t *id, uint32_t style) {
-    int k = style & (STYLE_HANDHELD | STYLE_JOYDUAL) ? 2 : 1; if (k > n) k = n;
-    for (int i = 0; i < k; i++) h[i] = (uint32_t)(style ? __builtin_ctz(style) : 0) | (*id & 0xff) << 8 | (uint32_t)i << 16;
-    return k > 0 ? k : 0;
+    style &= STYLE_FULLKEY | STYLE_HANDHELD | STYLE_JOYDUAL | STYLE_JOYLEFT | STYLE_JOYRIGHT;
+    if (n <= 0 || !style) return 0;
+    unsigned type = (unsigned)__builtin_ctz(style) + 3;
+    unsigned device = type <= 4 ? 2 : type == 7 ? 1 : 0;
+    int k = type == 5 ? 2 : 1; if (k > n) k = n;
+    for (int i = 0; i < k; i++) h[i] = type | (*id & 0xff) << 8 | (device + (unsigned)i) << 16;
+    return k;
 }
 HLE_FORCE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor; always sampling on the host", void, h_hid_SixStart, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", "six-axis sensor states: every requested entry, newest first",

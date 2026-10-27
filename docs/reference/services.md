@@ -240,9 +240,16 @@ Most service calls can be found before they crash, before the first boot or the 
 
 - **Symptom:** motion moves never happen; shaking does nothing (Super Mario Odyssey: cap throws by shaking).
 - **Cause:** the host handed out six-axis handles but reported no sensor.
-- **Fix:** it now reports one per connected controller: two for handheld or dual Joy-Cons, one otherwise, with the style, npad id and device in the handle. At rest the sensor lies flat: acceleration (0, 0, −1) G, no rotation, identity direction. Samples are 5 ms apart on the guest clock and numbered by time, so a history read returns the samples at those times. `DM_BTN_SHAKE` (`dm_input.h`: the iPhone shaken, Space on the Mac, `DM_KEYS` `Shake`) plays a side-to-side shake in whole cycles.
+- **Fix:** it reports one combined sensor per FullKey or Handheld controller, two for dual Joy-Cons and one for a single Joy-Con, with the SDK style index, npad id and device in the handle ([handle encoding](#six-axis-handle-encoding)). At rest the sensor lies flat: acceleration (0, 0, −1) G, no rotation, identity direction. Samples are 5 ms apart on the guest clock and numbered by time, so a history read returns the samples at those times. `DM_BTN_SHAKE` (`dm_input.h`: the iPhone shaken, Space on the Mac, `DM_KEYS` `Shake`) plays a side-to-side shake in whole cycles.
 - **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md): it reads all 16 history entries per sensor and ignores the count, like its npad history ([History reads fill every requested entry](#history-reads-fill-every-requested-entry)).
 - **Note:** find a game's swing detector by probing the accelerometer value it reads (`DM_PROBE=main:626248@x8+10` in Odyssey 1.4.1).
+
+### Six-axis handle encoding
+
+- **Symptom:** six-axis handles use byte 0 = 0 for a FullKey controller, which the SDK reserves for no style; Handheld exposes two sensors instead of its combined sensor.
+- **Cause:** `GetSixAxisSensorHandles` encoded the style bit number rather than the SDK style index, and treated Handheld like a Joy-Con pair. The reader accepted the same private format, hiding the mismatch.
+- **Fix (resolved):** use SDK style indices 3 through 7, with device 2 for FullKey / Handheld, 0 and 1 for JoyDual, and the corresponding side for single Joy-Cons, following [libnx's handle construction](https://github.com/switchbrew/libnx/blob/master/nx/source/services/hid.c). Readers validate the style, device, player and reserved byte consistently; invalid handles return no connected samples and report at rest. Tests use independent wire-format fixtures and cover docked / handheld histories, bounds and invalid handles.
+- **Found on:** the [Tears of the Kingdom PR #221 hardware investigation](../../dm/games/0100F2C0115B6000/README.md#services). This mismatch predates the Steam Controller adapter; correcting the style alone did not fix that game's aiming, which required the [stick deadzone](#steam-controller-stick-drift-suppresses-gyro-aiming). No new local gameplay validation.
 
 ### Mapped Shake on secondary controllers
 
