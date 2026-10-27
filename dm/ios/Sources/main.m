@@ -37,6 +37,8 @@ static int boot_env(void) {
     NSString *log = [doc stringByAppendingPathComponent:@"log.txt"], *prev = [doc stringByAppendingPathComponent:@"log.prev.txt"];
     [fm removeItemAtPath:prev error:nil]; [fm moveItemAtPath:log toPath:prev error:nil];
     if (freopen(log.fileSystemRepresentation, "w", stderr)) setvbuf(stderr, NULL, _IOLBF, 0);
+    else NSLog(@"[RED] boot: cannot open Documents log (errno %d)", errno);
+    NSLog(@"boot: Documents writable=%d", [fm isWritableFileAtPath:doc]);
     // Environment switch files (for on-device diagnostics: a sideloaded app cannot be given environment variables from outside): one KEY=VALUE per line, # starts a comment; Documents/env.txt takes precedence over dm/env.txt in the bundle (put there by build_ipa.sh's DM_ENV_FILE)
     NSMutableArray<NSString *> *from_file = [NSMutableArray array];
     for (NSString *ef in @[[doc stringByAppendingPathComponent:@"env.txt"], [[res stringByAppendingPathComponent:@"dm"] stringByAppendingPathComponent:@"env.txt"]]) {
@@ -91,11 +93,17 @@ void front_ios_boot(void) {   // Called by front_ios.m once the window and Metal
 }
 int front_ios_boot_ok(void) { return g_boot_ok; }
 
+@class SceneDelegate;
 @interface App : UIResponder <UIApplicationDelegate>
 @end
 @implementation App
 - (UISceneConfiguration *)application:(UIApplication *)a configurationForConnectingSceneSession:(UISceneSession *)s options:(UISceneConnectionOptions *)o {
-    return [[UISceneConfiguration alloc] initWithName:@"Default" sessionRole:s.role];
+    // Returning a newly allocated configuration does not reliably inherit the
+    // delegate named by the Info.plist manifest on iOS 16.  Bind it explicitly;
+    // otherwise UIKit waits for scene creation until the launch watchdog fires.
+    UISceneConfiguration *c = [[UISceneConfiguration alloc] initWithName:@"Default" sessionRole:s.role];
+    c.delegateClass = NSClassFromString(@"SceneDelegate");
+    return c;
 }
 @end
 

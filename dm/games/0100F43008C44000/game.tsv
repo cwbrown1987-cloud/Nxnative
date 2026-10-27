@@ -11,7 +11,8 @@ program_id	0100F43008C44000
 name	Pokémon Legends: Z-A
 ipa	PokMonLegendsZA.ipa
 app_category	public.app-category.games
-pad_layout	simple
+pad_layout	full
+render_cond	on
 
 # ---- Versions ----
 build	v393216	2.0.2	main=b1f12fd919eae86ab8a978317677e64b	sdk=df7a3960c74c3a4803f826c587153252
@@ -23,6 +24,8 @@ shader_versions	v393216
 modules	main sdk
 romfs_marker	arc/data.trpfs
 zip_store	.bnk:.pck:.trpfd:.trpfs:.metallib
+# Old Apple GPU builds are invalid without this profile's proven shader companions.
+ios_companions	ios_companions.json
 
 # ---- Memory ----
 # nninitStartup (main+0x1b2e650) initializes its StandardAllocator with virtual address memory over 12 GB of address space (StandardAllocator::Initialize(nullptr, 0x300000000), main+0x1b3e3ec),
