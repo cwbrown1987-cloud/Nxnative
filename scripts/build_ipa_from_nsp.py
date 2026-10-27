@@ -1146,6 +1146,33 @@ def decode_ue_shaders(repo, dirs, pkg_ver, patched, work, env, logs, g):
     PROG.end(f'{total:,} shaders in {hms(time.time() - t0)}')
 
 
+def extract_ue_io_shaders(repo, dirs, work, logs):
+    """UE5's IoStore shader cache: the .ucas of the RomFS holds the shader records, one per shader, each with a
+    code area and a control section (FINAL FANTASY RESONANCE). uepak.py io takes them out into <version dir>/ue_shaders_io,
+    one file per shader, which shader_split.py reads (io_shaders). The .ucas is a whole game's shaders in one file, so
+    this needs no Mac host: the records that are not compressed are taken as they are."""
+    sys.path.insert(0, str(repo / 'dm/gfx/tools')); import uepak
+    todo = {v: d for v, d in dirs.items() if not (d / 'ue_shaders_io').exists()}
+    if not todo:
+        say('reusing the extracted IoStore shader records')
+        return
+    PROG.stage('IoStore shader records')
+    for v, d in todo.items():
+        ucas = sorted(p for p in Path(d / 'RomFS').rglob('*.ucas'))
+        if not ucas:
+            PROG.end(ok=False)
+            raise BuildError(f'no IoStore .ucas under {d / "RomFS"}')
+        out = d / 'ue_shaders_io.partial'; rmtree(out)
+        n = 0
+        for u in ucas:
+            listing = uepak.io_extract(str(u), str(out))
+            plain = sum(1 for x in listing if x['plain'])
+            say(f'{v}: {u.name}: {len(listing):,} shader records ({plain:,} plain, {len(listing) - plain:,} compressed)')
+            n += plain
+        swap_in(out, d / 'ue_shaders_io')
+    PROG.end(f'{n:,} shader records')
+
+
 CAPTURE_SECS = 120   # the longest run-time shader capture: Super Mario Galaxy creates its 3,089 Vulkan modules within 6 s of its first one (about 15 s after boot on an M4 Pro)
 # Run-time shader captures, by graphics API: the host's switch, the profile's table of the keys a capture must hold, and a capture file's name → its key (None: not a whole file;
 # the host writes each under a temporary name and renames it). Vulkan: <16 hex>.spv (dm/gfx/vk/hle_vk.m); GL: <16 hex>.vert / .frag (dm/gfx/gl/hle_gl.m sh_capture)
@@ -1979,11 +2006,12 @@ def main(args=None):
     vkcap = gfx == 'vulkan' and src['vk_capture'][0]   # SPIR-V shaders the game generates at run time, captured in the Mac host (capture_shaders)
     glcap = gfx == 'gl' and src['gl_capture'][0]   # GLSL the game puts together at run time (LÖVE), captured in the Mac host (capture_shaders)
     uedec = gfx == 'nvn' and src['ue_decode'][0]   # Unreal Engine shaders, Oodle-compressed in the paks' shader code archives, decoded in the Mac host (decode_ue_shaders)
+    uedio = gfx == 'nvn' and src['ue_io'][0]   # UE5's IoStore shader cache: the shader records in the .ucas (extract_ue_io_shaders)
     if gfx == 'vulkan': say(f'Vulkan game ({src["graphics"][1]}): vk_shaders.py translates the shaders instead of the NVN shader chain')
     if gfx == 'gl': say(f'OpenGL game ({src["graphics"][1]}): gl_shaders.py translates the shaders instead of the NVN shader chain')
-    for on, k in ((glslc, 'glslc_capture'), (vkcap, 'vk_capture'), (glcap, 'gl_capture'), (uedec, 'ue_decode'), (gfx == 'nvn' and src['oodle_packs'][0], 'oodle_packs'), (gfx == 'nvn' and src['ue_legacy'][0], 'ue_legacy')):
+    for on, k in ((glslc, 'glslc_capture'), (vkcap, 'vk_capture'), (glcap, 'gl_capture'), (uedec, 'ue_decode'), (uedio, 'ue_io'), (gfx == 'nvn' and src['oodle_packs'][0], 'oodle_packs'), (gfx == 'nvn' and src['ue_legacy'][0], 'ue_legacy')):
         if on: say(src[k][1])
-    PROG.add(glslc + vkcap + glcap + uedec + (gfx == 'nvn'))
+    PROG.add(glslc + vkcap + glcap + uedec + uedio + (gfx == 'nvn'))
     aoc = extract_aoc(nx, keys, repo, work, app, fam, logs)
     dlc_roms = sorted(p for p in aoc.iterdir() if p.is_dir()) if aoc else []
     base = next((dirs[v] for v in versions if picks[v][1] is None), dirs[versions[0]])   # the folder the base game was extracted to alone
@@ -2016,6 +2044,7 @@ def main(args=None):
             else: say('no heap check: it boots the game in the Mac host, which needs a Mac with Apple silicon; the profile keeps its guessed heap keys')
     if glslc: capture_glslc(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
     if uedec: decode_ue_shaders(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
+    if uedio: extract_ue_io_shaders(repo, {v: dirs[v] for v in sv}, work, logs)
     sh = work / 'shader'
     if gfx == 'vulkan':   # the packed version's merged RomFS holds the SPIR-V files the game loads; a capture holds those it generates
         cap = capture_shaders(repo, game, patched, work, env, logs, g, 'vk') if vkcap else None

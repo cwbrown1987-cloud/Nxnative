@@ -256,6 +256,10 @@ int svc_thread(int num, uint64_t *regs);   // hle_thread.c: thread and synchroni
 uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     { void hlecount_svc(int); hlecount_svc(num); }   // DM_HLECOUNT: svc counts by number
     mem_init();
+    if (g_flag.svc) {   // the first call of every system call: what a title asks for and does not get
+        static uint8_t first[256];
+        if (!first[num & 0xff]) { first[num & 0xff] = 1; LOG("svc %#x (the first call) x0=%#llx x1=%#llx x2=%#llx", num, (unsigned long long)regs[0], (unsigned long long)regs[1], (unsigned long long)regs[2]); }
+    }
     if (svc_thread(num, regs)) return regs[0];
     switch (num) {
     case 0x01: {  // SetHeapSize(out_addr*, size)  → x1 = heap base

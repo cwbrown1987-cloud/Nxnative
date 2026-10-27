@@ -97,6 +97,9 @@ static int key_bit(unsigned short code) {
     return -1;
 }
 static void on_key(NSEvent *e, int down) {
+    static int klog = -1; if (klog < 0) klog = getenv("DM_KBD_LOG") ? 1 : 0;
+    // DM_KBD_LOG=1: every key event, with the state of the input (it is released while the window is not key): tells whether a key the player pressed reached the game
+    if (klog) LOG("[kbd] key %d %s (input %s)", e.keyCode, down ? "down" : "up", g_input_on ? "on" : "released");
     if (!g_input_on) return;
     unsigned short c = e.keyCode;
     switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }

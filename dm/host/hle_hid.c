@@ -164,7 +164,7 @@ static void *ctl_main(void *arg) {
                 }
                 key_step st = {0, 0.15, 0}; char *h = strchr(line, '~'); if (h) { *h = 0; st.hold = atof(h + 1); }
                 parse_keys(line, &st);
-                LOG("DM_CTL: press %#llx (hold %.2f s)", (unsigned long long)st.btn, st.hold);
+                LOG("DM_CTL: press %#llx (hold %.2f s) sticks %d,%d / %d,%d", (unsigned long long)st.btn, st.hold, st.lx, st.ly, st.rx, st.ry);
                 if (st.tap) { dm_touch t = {0, st.tx, st.ty}; dm_touch_set(&t, 1); }
                 script_set(st.btn, st.lx, st.ly, st.rx, st.ry); usleep((useconds_t)(st.hold * 1e6)); script_set(0, 0, 0, 0, 0);
                 if (st.tap) dm_touch_set(NULL, 0);

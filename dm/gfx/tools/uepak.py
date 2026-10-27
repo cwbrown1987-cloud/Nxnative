@@ -35,7 +35,8 @@
 #        uepak.py job <RomFS> <main NSO> <work dir> [<Mac host> <rewritten modules>]   the shader code archives of every pak, and an Oodle job of their Oodle-compressed shaders (LZ4 ones
 #                                                                       decoded at once); IoStore shader libraries (UE 5.6) decoded at once through the game's Oodle in the host (OodleHost)
 #        uepak.py finish <work dir> <out dir>                           after the host has run the job: the archives with every shader decoded
-import ctypes, json, os, struct, sys
+import ctypes, json, mmap, os, re, struct, sys
+from typing import NamedTuple
 
 PAK_MAGIC, ARCHIVE_VERSION = 0x5A6F12E1, 2
 JOB_MAGIC, OUT_MAGIC = 0x4a4f4d44, 0x524f4d44   # "DMOJ", "DMOR" (hle_oodle.c)
@@ -151,13 +152,32 @@ class R:
 LEGACY = (4,)   # legacy pak versions read (the per-file index); 11 has the encoded one
 LEGACY_METHODS = {1: 'Zlib', 2: 'Gzip', 3: 'LZ5', 4: 'Custom'}   # compression flags of a legacy pak (3: DRAGON QUEST XI S's engine, see the header)
 
+def find_footer(f):
+    """(offset of the footer's start, version): a version 11 pak's footer is the last 0xdd bytes with its magic 0xc8
+    from the end, but a pak written by UE5's IoStore path (FINAL FANTASY RESONANCE, FFRS-Switch.pak, 2.9 GB) has the
+    footer before a tail of padding, so the magic is found by scanning backwards from the end.  The footer's start is
+    the magic's offset minus 0x15 (the fields before the magic)."""
+    f.seek(0, 2); n = f.tell()
+    for back in (0xc8, 0x2c, 0xcc):   # the usual places
+        if n < back + 8: continue   # the file is too small for a footer there
+        f.seek(-back, 2); m, ver = struct.unpack('<II', f.read(8))
+        # a version 11 footer's magic sits 0x15 bytes into it, a legacy footer's one byte into it
+        if m == PAK_MAGIC: return (n - back - 0x15) if ver == 11 else (n - back - 1), ver
+    # scan the last 64 KB for the magic
+    window = min(n, 1 << 16)
+    f.seek(n - window); buf = f.read(window)
+    i = buf.rfind(struct.pack('<I', PAK_MAGIC))
+    if i < 0: raise ValueError('no pak footer')
+    at = n - window + i
+    ver, = struct.unpack_from('<I', buf, i + 4)
+    return (at - 0x15) if ver == 11 else at - 1, ver
+
 def magic_back(f):
     """(how far from the end the footer's magic is, the pak version): a legacy footer is the last 0x2d bytes (magic 0x2c from the end); version 11's magic is 0xc8 from the end in
     Octopath Traveler 0 (UE5) and 0xcc in Unreal Engine 4.27 (DRAGON QUEST VII Reimagined: five whole 32-byte compression method names after the SHA-1)"""
-    for back in (0x2c, 0xc8, 0xcc):
-        f.seek(-back, 2); m, ver = struct.unpack('<II', f.read(8))
-        if m == PAK_MAGIC: return back, ver
-    raise ValueError('no pak footer')
+    at, ver = find_footer(f)
+    f.seek(0, 2); n = f.tell()
+    return n - at - (0x15 if ver == 11 else 1), ver
 
 def pak_version(f):
     return magic_back(f)[1]
@@ -486,6 +506,124 @@ def lslg(s):
     c = k - 4 - ncode
     if c < 4 or struct.unpack_from('<I', s, c - 4)[0] != ncode or k + nctl > len(s): return None
     return s[4:6].decode('latin1'), s[k:k + nctl], s[c:c + ncode]
+
+# ---- UE5's IoStore: the shader records in a .ucas beside a .utoc (FINAL FANTASY RESONANCE) ----
+# A .ucas holds UE's records; the shader ones start with the magic 'LSLG' and a stage tag ('SV' vertex, 'SP' pixel,
+# 'SC' compute).  A shader record is: 'LSLG', the stage tag, two flag bytes, a u24 (big endian) size field whose
+# first byte has bit 0x40 when the record's code is compressed, a header of UE's own (the shader's hashes, a GUID and
+# the counts of its parameters and resources) that ends in a 20-byte hash, the shader's name (a printable path ending
+# in .usf or .ush, the shader's function after a colon), a few bytes, then the code area: the graphics magic
+# 0x12345678 or the compute magic 0x12345679, the SPH word 0 at +4 (its bits 10..13 are the stage, as in the other
+# games' code areas but four bytes in, not 0x30) and the NVN code, then the control section (the magic
+# 0x98761234, 0x880 bytes).  A chunk header (8C 0A ...) precedes every record.
+# The .ucas's control section is the 0x98761234 blob that follows the code area (0x880 bytes, as in the shader code
+# archives), but its fields are not the ones the other games' control sections have: +0x20 does not hold the
+# section's own length, +0x704 does not hold the code area's length, and +0x748 leaves the compute thread group
+# empty.  So the caller has to pass the code area's length itself (shader_split.py's check).
+GFX_MAGIC_B, CS_MAGIC_B, CTL_MAGIC_B = b'\x78\x56\x34\x12', b'\x79\x56\x34\x12', b'\x34\x12\x76\x98'
+IO_STAGE = {'SV': 'vs', 'SP': 'ps', 'SC': 'cs'}
+
+def io_records(data):
+    """The shader records in a .ucas: [(offset, stage)] in file order.  A record starts with the magic 'LSLG' and a
+    stage tag; the .ucas holds other records (assets) with the same magic, so the shader ones are told apart by
+    their name (a .usf or .ush path)."""
+    out, pos = [], 0
+    while True:
+        i = data.find(b'LSLG', pos)
+        if i < 0: break
+        tag = data[i + 4:i + 6]
+        if tag in (b'SV', b'SP', b'SC'): out.append((i, IO_STAGE[tag.decode()]))
+        pos = i + 4
+    return out
+
+class IoRecord(NamedTuple):
+    """A shader record of a UE5 IoStore .ucas: its stage, name and hash, where its code area and control section lie, its size field and whether its code is compressed"""
+    stage: str
+    name: str
+    hash: str
+    code_at: int
+    code_len: int
+    ctl_at: int
+    ctl_len: int
+    size: int
+    compressed: bool
+
+def io_record(data, off, limit):
+    """A shader record: the stage, the name, the shader's hash, the code area's offset and length, the record's
+    size field and whether the record's code is compressed.  The record is: 'LSLG', the stage tag, two flag bytes,
+    a u24 (big endian) size field (the byte at +8 has bit 0x40 when the code is compressed), a header of UE's own
+    that ends in a 20-byte hash, the shader's source name, then the code area (the graphics magic 0x78563412 or the
+    compute magic 0x79563412).  The code area runs to the next record's chunk header.  A record whose name is not a
+    .usf or .ush path is not a shader (the .ucas holds assets with the same magic) and comes back None.
+    The code area ends where the control section begins (the magic 0x98761234), as in the shader code archives."""
+    s = data[off:limit]
+    if len(s) < 0x40: return None
+    tag = s[4:6].decode('latin1')
+    if tag not in IO_STAGE: return None
+    compressed = bool(s[8] & 0x40)
+    size = int.from_bytes(s[9:12], 'big')
+    k = s.find(GFX_MAGIC_B)
+    graphics = k >= 0
+    if not graphics: k = s.find(CS_MAGIC_B)
+    if k < 0: return None      # a compressed record: its code is not in the file as it is
+    # a graphics code area holds an SPH word 0 four bytes in, whose bits 10..13 are the stage
+    if graphics:
+        w = struct.unpack_from('<I', s, k + 4)[0] if k + 8 <= len(s) else 0
+        if not 1 <= (w >> 10) & 0xf <= 5: return None    # not a shader (an asset record with the same magic)
+    elif tag != 'SC': return None
+    # the name: the printable run before the code area (the bytes in between are not printable); it starts
+    # with the path separator and ends with the shader's function
+    e = k
+    while e > 0 and not (32 <= s[e-1] < 127): e -= 1
+    b0 = e
+    while b0 > 0 and 32 <= s[b0-1] < 127: b0 -= 1
+    b = s.find(b'/', b0, e)
+    if b < 0: return None
+    name = s[b:e].decode('utf-8', 'replace')
+    if '.usf' not in name and '.ush' not in name: return None
+    # the code area ends where the control section begins (the magic 0x98761234), as in the shader code archives
+    ct = s.find(CTL_MAGIC_B, k)
+    if ct < 0: return None
+    return IoRecord(stage=IO_STAGE[tag], name=name, hash=s[b-20:b].hex() if b >= 20 else '',
+                    code_at=off + k, code_len=ct - k, ctl_at=off + ct, ctl_len=0x880, size=size, compressed=compressed)
+
+def io_extract(ucas, out):
+    """The shader records of a UE5 IoStore .ucas into <out>: every shader as a file named
+    <index>_<stage>_<name>.lsg (the code area and the control section) and a listing (shaders.json).
+    The records whose code is compressed are listed but not written out: where their Oodle-compressed
+    code lies and how long it is has not been found yet.  The .ucas holds other records (assets) with the
+    same magic; they are not shaders and are left out.  → the list of shader records"""
+    os.makedirs(out, exist_ok=True)
+    with open(ucas, 'rb') as f:
+        data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    n = len(data)
+    recs = io_records(data)
+    listing = []
+    for k, (off, stage) in enumerate(recs):
+        limit = recs[k + 1][0] if k + 1 < len(recs) else n
+        r = io_record(data, off, limit)
+        if not r:
+            if data[off + 8] & 0x40:   # a shader whose code is compressed
+                listing.append(dict(stage=stage, name='', file='', plain=False, code=0, compressed=True))
+            continue
+        base = f'{k:05d}_{r.stage}_' + re.sub(r'[^A-Za-z0-9_.-]', '_', os.path.basename(r.name))[:80]
+        with open(os.path.join(out, base + '.lsg'), 'wb') as f:
+            f.write(data[r.code_at:r.code_at + r.code_len])
+            f.write(data[r.ctl_at:r.ctl_at + r.ctl_len])
+        listing.append(dict(stage=r.stage, name=r.name, file=base + '.lsg', plain=True,
+                            code=r.code_len, hash=r.hash, size=r.size))
+    json.dump(listing, open(os.path.join(out, 'shaders.json'), 'w'), indent=1)
+    return listing
+
+def open_pak(pak, nso=None):
+    """A pak opened for reading: its key, when the index is encrypted (Octopath Traveler 0), is looked for in main (the NSO), which is only needed then"""
+    with open(pak, 'rb') as f: enc = footer(f)[0]
+    key = None
+    if enc:
+        if not nso: raise ValueError(f'{pak}: the index is encrypted, the main NSO is needed for its key')
+        img, lo, hi = nso_image(nso); key = find_key(img, lo, hi, pak)
+        if key is None: raise ValueError(f'{pak}: the index is encrypted and no window of main decrypts it')
+    return Pak(pak, key)
 
 if __name__ == '__main__':
     cmd = sys.argv[1] if len(sys.argv) > 1 else ''

@@ -8579,6 +8579,11 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             image_prepare(geometry_program, (1u << 0) | (1u << 2));
             geo_draw(geometry_program, dw, di); return;
         }
+        // A geometry shader with a function (a slice writer is a stub and prog_fold_gs replaced it) but no geometry metadata: the host cannot run it
+        // (Metal has no geometry stage; the compute path needs the metadata), so the draw goes on without it and reaches only the vertices the vertex shader made.
+        if (geometry_program && geometry_program->sh[2] && geometry_program->sh[2]->fn) {
+            static int n; if (n++ < 8) MLOG("[RED] draw with geometry shader %s, which the host cannot run (no geometry metadata): the draw reaches only the vertices the vertex shader made", geometry_program->sh[2]->key);
+        }
     }
     int mdx_on = (dw && dw->mdi_cnt) || (di && di->mdi_cnt) ? mdx_wanted(dw, di) : 0;   // an indirect-count multi-draw's record masked on the GPU (mdx_run), else read after a wait
     if (!mdx_on && ((di && di->mdi_cnt && !mdi_live(di->mdi_cnt, di->mdi_i)) || (dw && dw->mdi_cnt && !mdi_live(dw->mdi_cnt, dw->mdi_i)))) return;   // past the multi-draw's count
@@ -10406,8 +10411,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
             for (int i = 1; i < 300; i++) { double v = a[i]; int j = i - 1; while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; } a[j + 1] = v; }
             double b[300]; memcpy(b, e2e, sizeof b);
             for (int i = 1; i < 300; i++) { double v = b[i]; int j = i - 1; while (j >= 0 && b[j] > v) { b[j + 1] = b[j]; j--; } b[j + 1] = v; }
-            MLOG("display link up to tick %llu: ticks 300, presents %llu, empty ticks %llu (held for the present interval %llu), old frames dropped by merging %llu; submission ahead of target display p50 %.3f ms / min %.3f ms; game enqueue to target display p50 %.3f ms / min %.3f / max %.3f ms",
-                 (unsigned long long)g_link_tick_n, (unsigned long long)g_present_n, (unsigned long long)(g_link_tick_n - g_present_n), (unsigned long long)g_link_held,
+            MLOG("display link up to tick %llu: the screen is at %d Hz; ticks 300, presents %llu, empty ticks %llu (held for the present interval %llu), old frames dropped by merging %llu; submission ahead of target display p50 %.3f ms / min %.3f ms; game enqueue to target display p50 %.3f ms / min %.3f / max %.3f ms",
+                 (unsigned long long)g_link_tick_n, mtl_display_hz(), (unsigned long long)g_present_n, (unsigned long long)(g_link_tick_n - g_present_n), (unsigned long long)g_link_held,
                  (unsigned long long)g_link_dropped, a[149], a[0], b[149], b[0], b[299]);
         }
     }
@@ -10473,12 +10478,23 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
         MLOG("display link recovered: stalled %.0f ms (%.0f ms of it active), fallback dropped %llu frames (stall #%llu)", (t - g_stall_t0) / 1e6, (t - (g_stall_t0 > since ? g_stall_t0 : since)) / 1e6, (unsigned long long)g_stall_drop, (unsigned long long)g_stall_n); g_stall_t0 = 0; }
     pthread_mutex_unlock(&g_pq_mu);
     double vp = g_link_vperiod, tol = 0.002;   // tol: how early a tick may come and still end a hold (below)
-    if (vp > 0) {   // virtual ticks: only the refresh nearest each slot of a steady clock at the wanted rate counts (link_range)
-        static double next, vp_was; double t = update.targetPresentationTimestamp;
-        if (vp != vp_was || t > next + vp) { next = t; vp_was = vp; }   // the first callback, a new rate, or after a stall: the clock starts again here
-        if (t < next - g_link_vhalf) return;
-        next += vp; tol += 2 * g_link_vhalf;   // a tick lies up to half a refresh off its slot, so two of them up to one refresh nearer each other than the slots
+    if (vp > 0) {   // virtual ticks: one tick per vp, taken from the display's own timestamps
+        static double last, vp_was; double t = update.targetPresentationTimestamp;
+        if (vp != vp_was) { last = t; vp_was = vp; }   // a new rate: start here
+        if (t - last < vp - g_link_vhalf) return;        // too early for this slot: the next callback is the one
+        // The slot follows the timestamps the display gives, not a clock of its own: a separate clock drifts
+        // against a variable-refresh display (ProMotion), and when it has drifted more than half a refresh
+        // the callbacks are rejected several in a row — then the display link looks silent for 100 ms and
+        // more, the host drops the queued frames and the picture freezes and jumps (FINAL FANTASY RESONANCE:
+        // a stall every 1.5 s, the frame time at 70 ms instead of 33).
+        last = t;
+        tol += 2 * g_link_vhalf;   // a tick lies up to half a refresh off its slot, so two of them up to one refresh nearer each other than the slots
     }
+    // (the old rule kept its own clock: next += vp, and a callback more than half a refresh before the next
+    // slot was rejected. On a display whose refresh timing moves, the two clocks drift until several callbacks
+    // in a row are rejected: the link then looks silent for 600 ms, the host drops the queued frames and the
+    // picture jumps. The rule above re-anchors the slot to the timestamp of every tick that is taken, so the
+    // gap between ticks stays one period.)
     pthread_mutex_lock(&g_link_mu);
     __atomic_store_n(&g_link_tick_ns, now_ns(), __ATOMIC_RELAXED);
     g_link_tick_n++;
