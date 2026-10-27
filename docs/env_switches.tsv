@@ -62,6 +62,12 @@ DM_MEMSTAT_DUMP	diagnostic	`=<seconds>`: with `DM_MEMSTAT`, at that second write
 DM_MEM_CAP_GB	switch	`=<GB>`: the memory watchdog exits when resident memory exceeds that many GB (default 24 on the Mac, none on iOS; `0` turns it off)
 DM_METAL_CAPTURE	diagnostic	`=1` makes `build_ipa.sh` produce a build that can write GPU frame captures (`MetalCaptureEnabled` in `Info.plist`), for `DM_GPU_CAPTURE`
 DM_METAL_HUD	player	`1` shows Apple's Metal performance HUD over the game (frame rate, frame and GPU time, memory)
+DM_MFX_DUMP	diagnostic	`=<folder>` with frame interpolation: while the camera turns, saves the two scenes, depth, motion and interpolated output of 16 frame pairs as raw files (waits for the GPU; for unpaced runs)
+DM_MFX_FI_CACHE	diagnostic	`=0` makes a new MetalFX frame interpolator at each size change instead of reusing one of up to four cached ones
+DM_MFX_INTERP	switch	`interp30` (Mac) turns on MetalFX frame interpolation for a game whose profile has `scene_upscale` and `camera_block`: with `DM_FPS_TARGET=30` the game renders 30 frames a second and MetalFX makes the frame between each pair; unset or `0` off
+DM_MFX_MSL_DIR	path	With frame interpolation: the folder holding the build's `b-<chain>` MSL folder (`<id>_build/shader/cache`) or that folder itself; the UI draws' attachment-7 copies are compiled from its sources of this host's chain only
+DM_MFX_MVLOG	diagnostic	`=<n>` with frame interpolation: every n interpolated frames, logs the motion vectors' median against the camera step (waits for the GPU)
+DM_MFX_YFLIP	diagnostic	`=-1` with frame interpolation: tries the other clip-space y convention for the motion vectors (default `1`)
 DM_MOVIE_TRACE	diagnostic	When set, the movie decoder logs every call with its thread and decoder (by default the first 12 calls, then every 2^k-th)
 DM_MSL_DIR	path	Parent folder of the shader libraries: NVN loads from `b-<chain version>/` beneath it, Vulkan from `vk/`, GL from `gl/`; the app and the Mac launcher set it
 DM_NICK	switch	The account nickname the game sees (default `Player`)
