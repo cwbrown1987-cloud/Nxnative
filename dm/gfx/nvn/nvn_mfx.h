@@ -1,22 +1,16 @@
-// MetalFX frame interpolation, ported from MacNativeGames (totk_mfx.h, MIT). See nvn_mfx.m.
+// Copyright (c) 2026 MacNativeGames contributors (github.com/ly05010419/MacNativeGames), MIT License; the license text is in dm/third_party/macnativegames/LICENSE.
+// MetalFX frame interpolation, adapted from MacNativeGames' totk_mfx.h. See nvn_mfx.m.
 #pragma once
 #import <Metal/Metal.h>
 
-/* Frame interpolation modes (user, 2026-10-16 night: key 2 cycles off -> 30+30 -> 50+50 -> uncapped -> off):
-   MFX_30   the game renders 30 frames a second, MetalFX makes the frame between ("30+30");
-   MFX_HALF the game renders every second display refresh ("50+50" on a 100 Hz display, 30+30 at 60 Hz);
-   MFX_MAX  the game is not paced (uncapped) and every frame gets one in between; the screen still shows one picture per
-            refresh, so above half the refresh rate some game frames are replaced by interpolated ones.
-   DM_MFX_INTERP=interp30 | interp | interpmax starts in that mode; flag mfx_interp <0..3> sets it, -1 (key 2) cycles. A change
-   takes effect at the next game frame boundary (mfx_latch at the present), so a frame is never half on. */
+/* Frame interpolation mode, fixed for the run: DM_MFX_INTERP=interp30 (MFX_30): the game renders 30 frames a second and MetalFX
+   makes the frame between ("30+30"); with DM_FPS_TARGET=30 the display link runs at 60 Hz and shows the two pictures one tick
+   each (nvn_mtl.m). MacNativeGames' other modes (every second refresh, uncapped) and its run-time switch are not wired here. */
 #include "nvn_mfx_mode.h"
 const char *mfx_mode_name(int mode);
-void mfx_set(int mode);
-void mfx_set_mv_dyn(int on);   // flag mfx_mv_dyn (default on): pixels that are not still world get no camera motion  // mode < 0 cycles the requested mode
-int mfx_latch(void);     // at the game's present, after this frame's interpolation: take the requested mode; 1 = it changed
 // Per game frame, from the replay: the scene copy (the canvas copied before the first UI draw, in the canvas format),
-// the UI layer (colour attachment 7 of the later canvas passes), the G-buffer depth and the camera block (84 floats of
-// the 2368-byte block at vertex uniform 1).
+// the UI layer (colour attachment 7 of the later canvas passes), the G-buffer depth and the camera block (the first 84 floats
+// of the profile's camera_block).
 id<MTLTexture> mfx_scene_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFormat format);
 id<MTLTexture> mfx_ui_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h);
 void mfx_note_scene(void);
@@ -26,13 +20,15 @@ id<MTLResidencySet> mfx_residency(void);   // our textures; the queue adds it on
 // At the game's present. prepare: checks this frame's inputs and returns the output slot of the interpolated frame
 // between the previous and this frame, or -1 (first frame, missing input, scene cut; state already advanced). frame_s:
 // the pacing period (two display refreshes; 0 in unpaced measurement runs). encode: motion vectors and the interpolation into cb (Metal 4, own command buffer, GPU order after this
-// frame). abort: a prepared frame that cannot be encoded (no free command buffer); drops the history.
-int mfx_frame_prepare(double frame_s);
+// frame). busy: bit s set = output slot s is still named by a present not yet committed (the present queue holds up to 8);
+// prepare picks another, and when every slot is busy it interpolates nothing this frame. skip: instead of prepare, when no
+// command buffer is free: this frame's inputs are dropped and the history reset.
+int mfx_frame_prepare(double frame_s, unsigned busy);
+void mfx_frame_skip(void);
 // Keep the returned resources alive until this command buffer's GPU completion.
 // Cached interpolators drop their public texture bindings after encoding.
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int slot, id<MTL4CounterHeap> heap, NSUInteger stamp);   // heap: timestamps at stamp / stamp+1 around MetalFX (may be nil)
 void mfx_note_gpu(double ms);   // GPU time of one interpolation, for the statistics line
-void mfx_frame_abort(void);
 void mfx_history_reset(void);   // before mfx_frame_prepare: this frame's scene does not continue the previous one (another canvas)
 id<MTLTexture> mfx_output(int slot);   // RGBA8Unorm view of the sRGB output, like the swapchain textures
 void mfx_stats(char *out, size_t n);

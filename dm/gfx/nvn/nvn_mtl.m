@@ -2594,19 +2594,19 @@ static struct { uint32_t cfmt[8], dfmt, sfmt, samples; int hd, hs; NSUInteger tw
    the first UI draw), the UI layer (attachment 7 of the later canvas passes, each UI draw also writing its colour there), the G-buffer depth and the camera.
    canvas: the last float or RGB10A2 target of the presented texture's aspect ratio before a pass into a presented texture (Breath of the Wild: 1920x1080
    RGB10A2); ready: the upscale draw has run this frame, so the canvas holds the finished scene and every later draw into it is UI; role: this draw's copy into
-   the UI layer (MFX_ROLE_UI blends like the game, MFX_ROLE_UI_OPAQUE writes alpha 1); pass_mfx: the open pass carries the UI layer. Breath of the Wild only */
+   the UI layer (MFX_ROLE_UI blends like the game, MFX_ROLE_UI_OPAQUE writes alpha 1); pass_mfx: the open pass carries the UI layer. The game's own values come from its
+   profile: scene_upscale (DM_GAME_SCENE_UPSCALE, the draw that scales the finished scene into the canvas) and camera_block (DM_GAME_CAMERA_STAGE / _SLOT / _SIZE, the
+   uniform block the G-buffer pass's first draw reads the camera from: view, view-projection, projection, inverse view, near / far, aspect, field of view at the
+   offsets nvn_mfx.m reads). Hooks adapted from MacNativeGames (github.com/ly05010419/MacNativeGames, MIT) */
 #include "nvn_mfx.h"
 #define MFX_ROLE_UI 2
 #define MFX_ROLE_UI_OPAQUE 3
 static char g_mfx_mask_mark;
 #define MFX_MASK_MARK ((const void *)&g_mfx_mask_mark)   /* pso_key fsfn: a UI draw whose copy function is not available (yet): attachment 7 masked */
-#define MFX_UPSCALE_KEY "bd7ffdd435c6c3bc"   /* Breath of the Wild's upscale of the 1600x900 scene into the canvas (agl_technique_pfx, gsys); MacNativeGames' BOTW_MFXUP_KEY */
-#define MFX_CAM_SLOT 0                     /* the G-buffer pass's camera block: vertex uniform 0, 2336 bytes (view, view-projection, projection, inverse view, near / far, aspect, field of view) */
-#define MFX_CAM_SIZE 2336
 static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int nswap, scene_done, ui_cleared, depth_done, want_cam, role, ready, pass_mfx; uint64_t frames, noui, fused, resets, scene_canvas, prev_scene_canvas; __weak id<MTLTexture> canvas_tex; } g_mfx;   // canvas_tex: the texture this frame's upscale drew into; scene_canvas: the canvas this frame's scene came from
-static int mfx_on(void) {   // DM_MFX_INTERP set and the game is Breath of the Wild (its canvas, upscale draw and camera block are what the replay looks for)
+static int mfx_on(void) {   // DM_MFX_INTERP set and the profile names the scene's upscale draw and the camera block
     static int ok = -1;
-    if (ok < 0) { ok = !strcmp(DM_GAME_ID, "01007EF00011E000"); if (!ok && getenv("DM_MFX_INTERP")) MLOG("[RED] [mfx] DM_MFX_INTERP: frame interpolation is only wired for Breath of the Wild; off"); }
+    if (ok < 0) { ok = DM_GAME_SCENE_UPSCALE[0] && DM_GAME_CAMERA_SIZE; if (!ok && mfx_enabled()) MLOG("[RED] [mfx] DM_MFX_INTERP: this game's profile has no scene_upscale and camera_block keys; frame interpolation off"); }
     return ok && mfx_enabled();
 }
 static int g_rp_layered;   // the pass about to open is for a vertex shader that writes the layer (draw → rp_begin_ex)
@@ -4841,7 +4841,7 @@ static int pso_mixed_uint(const pso_key *k, NvShader *fs, int merged) {
     return ints && floats;
 }
 /* Frame interpolation: the fragment function with its colour 0 output also written to attachment 7, the UI layer (role MFX_ROLE_UI_OPAQUE writes alpha 1). Made from
-   the shader's MSL in DM_MFX_MSL_DIR (the build's shader/cache/b-<chain> folder: the app carries compiled libraries only) on a background queue, so no draw waits for
+   the shader's MSL in DM_MFX_MSL_DIR's b-<DMSH_CHAIN> folder (the build's shader/cache: the app carries compiled libraries only) on a background queue, so no draw waits for
    it: nil until it is made (the draw masks attachment 7 meanwhile, MFX_MASK_MARK) and for good when the source is missing or colour 0 cannot be copied. Its pipelines
    take the MTLDevice path (no Metal 4 descriptor, fn4_of). g_mfx_fn_role keys on the function's address, so pso_desc can look any pso_key fsfn up */
 static NSMutableDictionary<NSString *, id> *g_mfx_fns;   // "key role" → the function, NSNull (cannot be made) or @YES (being made)
@@ -4866,8 +4866,12 @@ static id<MTLFunction> fs_fn_mfx(NvShader *fs, int role) {
     dispatch_async(q, ^{ @autoreleasepool {
         const char *key = keyS.UTF8String;
         id result = NSNull.null;
+        // Only the source of this host's translation chain matches the library the draw uses (its bindings, its reflection): DM_MFX_MSL_DIR is a chain folder
+        // b-<DMSH_CHAIN> (the build's shader/cache/b-<chain>) or a folder holding one (shader/cache); a source of another chain is never compiled
         const char *dir = getenv("DM_MFX_MSL_DIR");
-        NSString *path = dir ? [NSString stringWithFormat:@"%s/%s%s.metal", dir, key, [keyS hasSuffix:@"_b"] ? "" : "_b"] : nil;   // the shader's key names its library: <key>.metal beside <key>.metallib
+        NSString *chain = @"b-" DMSH_CHAIN, *base = dir ? @(dir) : nil;
+        if (base && ![base.lastPathComponent isEqualToString:chain]) base = [base stringByAppendingPathComponent:chain];
+        NSString *path = base ? [base stringByAppendingPathComponent:[NSString stringWithFormat:@"%s%s.metal", key, [keyS hasSuffix:@"_b"] ? "" : "_b"]] : nil;   // the shader's key names its library: <key>.metal beside <key>.metallib
         NSString *src = path ? [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] : nil;
         if (!src) MLOG("[RED] [mfx] fragment shader %s: no MSL source (%s); its draws stay out of the UI layer", key, dir ? path.UTF8String : "DM_MFX_MSL_DIR is not set");
         else {
@@ -6243,12 +6247,12 @@ static void ubo_read(int stage, int reg, int off, size_t n, void *out) {
     memcpy(out, base + mo, n);
 }
 static uint32_t ubo_handle(int stage, int reg, int off) { uint32_t h; ubo_read(stage, reg, off, 4, &h); return h; }
-/* Frame interpolation: the camera of the G-buffer pass, from its first draw (vertex uniform MFX_CAM_SLOT, MFX_CAM_SIZE bytes): the first 84 floats, as this draw sees them */
+/* Frame interpolation: the camera of the G-buffer pass, from its first draw (the profile's camera_block): the first 84 floats, as this draw sees them */
 static void mfx_take_camera(void) {
     g_mfx.want_cam = 0;
-    const p_bind_buf *u = &S.ubo[0][MFX_CAM_SLOT]; float cam[84];
-    if (!u->addr || u->size != MFX_CAM_SIZE) { static int said; if (said++ < 4) MLOG("[RED] [mfx] the G-buffer pass's first draw has no %d-byte camera block at vertex uniform %d (size %llu)", MFX_CAM_SIZE, MFX_CAM_SLOT, (unsigned long long)u->size); return; }
-    ubo_read(0, MFX_CAM_SLOT, 0, sizeof cam, cam);
+    const p_bind_buf *u = &S.ubo[DM_GAME_CAMERA_STAGE][DM_GAME_CAMERA_SLOT]; float cam[84];
+    if (!u->addr || u->size != DM_GAME_CAMERA_SIZE) { static int said; if (said++ < 4) MLOG("[RED] [mfx] the G-buffer pass's first draw has no %d-byte camera block at %s uniform %d (size %llu)", DM_GAME_CAMERA_SIZE, DM_GAME_CAMERA_STAGE ? "fragment" : "vertex", DM_GAME_CAMERA_SLOT, (unsigned long long)u->size); return; }
+    ubo_read(DM_GAME_CAMERA_STAGE, DM_GAME_CAMERA_SLOT, 0, sizeof cam, cam);
     mfx_note_camera(cam, 84);
 }
 // A handle read from a uniform buffer names IDs of the pools bound when the draw runs: as bound handles are moved at recording (hle_nvn.c bind_handles), these take the bases here (0 = none)
@@ -8731,7 +8735,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (g_enc && g_sm_pass && draw_samples_rt(pr)) { PD("M %llu a draw in the slice-merged pass samples its attachment; split here", g_stat_pass); rp_end(); }
     if (!g_enc && mode == 0 && !g_rp_layered && !defer_q_draw && g_exec_next && !tbdr_on() && !g_geo_program && sm_on()) sm_plan(pr);
     if (mfx_on() && pr && R.rt.n > 0 && R.rt.color[0] && !g_defer_replaying) {   // frame interpolation (g_mfx)
-        if (pr->sh[1] && !strncmp(pr->sh[1]->key, MFX_UPSCALE_KEY, 16)) {   // the upscale draw into the canvas: after it the canvas holds the finished scene
+        if (pr->sh[1] && !strncmp(pr->sh[1]->key, DM_GAME_SCENE_UPSCALE, 16)) {   // the upscale draw into the canvas: after it the canvas holds the finished scene
             if (R.rt.color[0]->serial == g_mfx.canvas) { g_mfx.ready = 1; g_mfx.canvas_tex = tex_mtl(R.rt.color[0]); }
         }
         else if (!g_mfx.scene_done && g_mfx.ready && g_mfx.canvas && R.rt.color[0]->serial == g_mfx.canvas) mfx_snapshot_scene();   // the first UI draw: copy the scene first
@@ -10782,11 +10786,14 @@ static int mfx_present_frame(const tex_t *t, double period) { @autoreleasepool {
         mfx_history_reset();
     }
     if (g_mfx.scene_done) g_mfx.prev_scene_canvas = g_mfx.scene_canvas;
-    int slot = mfx_frame_prepare(period);
+    unsigned busy = 0;   // output slots named by presents not committed yet (tickets after g_pq_done): the new frame must not overwrite them
+    pthread_mutex_lock(&g_pq_mu);
+    for (uint64_t k = g_pq_done + 1; k <= g_pq_in; k++) { const pq_item *q = &g_pq[(k - 1) % PQ]; if (q->interp >= 0) busy |= 1u << q->interp; }
+    pthread_mutex_unlock(&g_pq_mu);
+    int slot = a < 0 ? (mfx_frame_skip(), -1) : mfx_frame_prepare(period, busy);   // no command buffer free: nothing to compute
     NSArray *keep = nil;
     if (slot >= 0) {
-        if (a < 0) { mfx_frame_abort(); slot = -1; }
-        else {
+        {
             if (!cb) { cb = g_mfx_cb[a]; [g_mfx_alloc[a] reset]; [cb beginCommandBufferWithAllocator:g_mfx_alloc[a]]; }
             mfx_residency_once();
             keep = mfx_frame_encode(cb, slot, nil, 0);

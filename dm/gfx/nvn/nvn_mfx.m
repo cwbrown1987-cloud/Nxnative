@@ -1,5 +1,6 @@
-// MetalFX frame interpolation (DM_MFX_INTERP=interp30 / interp / interpmax; Mac, Breath of the Wild 1.9.0). Ported from
-// MacNativeGames (games/totk/third_party/d2r_gfx/gfx/nvn/totk_mfx.m, MIT), where its comments below were written for Tears of the
+// Copyright (c) 2026 MacNativeGames contributors (github.com/ly05010419/MacNativeGames), MIT License; the license text is in dm/third_party/macnativegames/LICENSE.
+// MetalFX frame interpolation (DM_MFX_INTERP=interp30; Mac; the game from its profile keys scene_upscale and camera_block). Adapted from
+// MacNativeGames' games/totk/third_party/d2r_gfx/gfx/nvn/totk_mfx.m, where its comments below were written for Tears of the
 // Kingdom and Breath of the Wild. MetalFX makes one more frame between two game frames. Modes (nvn_mfx.h): the game at 30 fps ("30+30"), at every
 // second display refresh ("50+50" on the user's 100 Hz display: every refresh a new picture, steadier than the uncapped
 // 65-97 fps, about one refresh more latency), or uncapped with every frame interpolated. First planned for the phone
@@ -35,19 +36,16 @@
 /* visionOS has no MetalFX frame interpolator. Keep every entry point off, including environment initialization. */
 int mfx_enabled(void) { return 0; }
 const char *mfx_mode_name(int mode) { return mode == MFX_OFF ? "off" : "not available on visionOS"; }
-void mfx_set(int mode) { if (mode) MLOG("frame interpolation is not available on visionOS"); }
-void mfx_set_mv_dyn(int on) { (void)on; }
-int mfx_latch(void) { return 0; }
 id<MTLTexture> mfx_scene_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFormat format) { (void)dev; (void)w; (void)h; (void)format; return nil; }
 id<MTLTexture> mfx_ui_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h) { (void)dev; (void)w; (void)h; return nil; }
 void mfx_note_scene(void) {}
 void mfx_note_depth(id<MTLTexture> depth) { (void)depth; }
 void mfx_note_camera(const float *cam, int n) { (void)cam; (void)n; }
 id<MTLResidencySet> mfx_residency(void) { return nil; }
-int mfx_frame_prepare(double frame_s) { (void)frame_s; return -1; }
+int mfx_frame_prepare(double frame_s, unsigned busy) { (void)frame_s; (void)busy; return -1; }
+void mfx_frame_skip(void) {}
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int slot, id<MTL4CounterHeap> heap, NSUInteger stamp) { (void)cb; (void)slot; (void)heap; (void)stamp; return nil; }
 void mfx_note_gpu(double ms) { (void)ms; }
-void mfx_frame_abort(void) {}
 void mfx_history_reset(void) {}
 id<MTLTexture> mfx_output(int slot) { (void)slot; return nil; }
 void mfx_stats(char *out, size_t n) { snprintf(out, n, "not available on visionOS"); }
@@ -56,7 +54,7 @@ int mfx_dump_due(void) { return 0; }
 void mfx_dump(long frame, id<MTLTexture> prev, id<MTLTexture> cur) { (void)frame; (void)prev; (void)cur; }
 #else
 
-#define MFX_OUT 3
+#define MFX_OUT 4   /* output slots: one per interpolated frame between its encode and its present; the present queue normally holds two (MacNativeGames: 3) */
 static struct {
     id<MTLDevice> dev;
     id<MTL4FXFrameInterpolator> fi;
@@ -83,9 +81,7 @@ static struct {
     double gpu_ms[300]; int ngpu;   // GPU time of the last interpolations (MetalFX part)
     double last_prepare_s, dt;      // time of the previous game frame's prepare; this pair's interval (MetalFX deltaTime)
 } g;
-/* Flag mfx_mv_dyn (default on): pixels that are not still world get no screen motion instead of the camera's. */
-static _Atomic int g_mv_dyn = 1;
-void mfx_set_mv_dyn(int on) { atomic_store(&g_mv_dyn, on != 0); MLOG("[flag] mfx_mv_dyn = %d: %s", on != 0, on ? "moving pixels get no camera motion" : "camera motion everywhere"); }
+/* Pixels that are not still world get no screen motion instead of the camera's (MacNativeGames' flag mfx_mv_dyn, always on here). */
 
 /* Reconstructing identical MetalFX interpolators repeatedly grows device
  * allocations on the tested Mac, even after the old Objective-C object dies.
@@ -115,9 +111,8 @@ static id<MTL4FXFrameInterpolator> fi_cached(NSUInteger iw, NSUInteger ih) {
     return nil;
 }
 
-/* g_on: the mode of this game frame (read by the replay, the present path and the pacing in hle_nvn.c); g_req: what the
-   user asked for (key 2 / flag mfx_interp), taken over at the next present. */
-static _Atomic int g_on, g_req;
+/* g_on: the mode, from DM_MFX_INTERP at the first use (read by the replay and the present path) */
+static int g_on;
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 const char *mfx_mode_name(int m) {
     static const char *const names[MFX_NMODES] = {"off", "30+30 (the game at 30 fps)", "half the refresh rate (50+50 on a 100 Hz display)", "uncapped (every game frame interpolated)"};
@@ -127,29 +122,11 @@ static void mfx_init(void) {
     const char *e = getenv("DM_MFX_INTERP"); int v;
     if (!e || !*e || !strcmp(e, "0")) v = MFX_OFF;
     else if (!strcmp(e, "interp30")) v = MFX_30;
-    else if (!strcmp(e, "interp")) v = MFX_HALF;
-    else if (!strcmp(e, "interpmax")) v = MFX_MAX;
-    else MDIE("DM_MFX_INTERP must be interp30, interp, interpmax or 0, got %s", e);
-    atomic_store(&g_req, v); atomic_store(&g_on, v);
+    else { MLOG("[RED] DM_MFX_INTERP takes interp30 or 0, got %s: frame interpolation off", e); v = MFX_OFF; }
+    g_on = v;
     if (v) MLOG("DM_MFX_INTERP=%s: MetalFX frame interpolation, %s", e, mfx_mode_name(v));
 }
-int mfx_enabled(void) { pthread_once(&g_once, mfx_init); return atomic_load_explicit(&g_on, memory_order_relaxed); }
-void mfx_set(int m) {
-    pthread_once(&g_once, mfx_init);
-    if (m >= MFX_NMODES) { MLOG("[flag] mfx_interp takes 0..%d (-1 cycles), got %d", MFX_NMODES - 1, m); return; }
-    int v = m < 0 ? (atomic_load(&g_req) + 1) % MFX_NMODES : m;
-    atomic_store(&g_req, v);
-    MLOG("[flag] mfx_interp = %d: %s (from the next game frame)", v, mfx_mode_name(v));
-}
-int mfx_latch(void) {
-    pthread_once(&g_once, mfx_init);
-    int r = atomic_load(&g_req), was = atomic_load(&g_on);
-    if (r == was) return 0;
-    g.prev_ok = g.hist_ok = 0; g.scene_ok = g.cam_ok = 0; g.depth = nil; g.last_prepare_s = 0;   // the next interpolated pair starts fresh
-    atomic_store(&g_on, r);
-    MLOG("frame interpolation %s -> %s", mfx_mode_name(was), mfx_mode_name(r));
-    return 1;
-}
+int mfx_enabled(void) { pthread_once(&g_once, mfx_init); return g_on; }
 
 static id<MTLTexture> mk(MTLPixelFormat f, NSUInteger w, NSUInteger h, MTLTextureUsage u) {
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:w height:h mipmapped:NO];
@@ -286,7 +263,10 @@ static int camera_cut(void) {
     return sqrt(dx * dx + dy * dy + dz * dz) > 8.0 || f < cos(25.0 * M_PI / 180.0);
 }
 
-int mfx_frame_prepare(double frame_s) {
+void mfx_frame_skip(void) {   // no command buffer free: nothing of this frame is computed, the next pair starts fresh
+    g.frames++; g.scene_ok = g.cam_ok = 0; g.depth = nil; g.prev_ok = g.hist_ok = 0; g.skip_busy++;
+}
+int mfx_frame_prepare(double frame_s, unsigned busy) {
     g.frames++;
     id<MTLTexture> depth = g.depth;
     int ok = g.scene_ok && g.cam_ok && depth && g.ui;
@@ -309,16 +289,18 @@ int mfx_frame_prepare(double frame_s) {
     for (int i = 0; i < 16; i++) { vc[i] = g.cam[12 + i]; vp[i] = g.prev_cam[12 + i]; }
     if (!inv4(vc, ic)) { g.skip_input++; g.prev_ok = g.hist_ok = 0; return -1; }
     mul4(vp, ic, m);
-    int s = g.slot = (g.slot + 1) % MFX_OUT;
+    int s = -1;   // the next output slot no pending present names (busy): a slot is overwritten only after its present is committed, which the encode's queue barrier then waits for
+    for (int k = 1; k <= MFX_OUT && s < 0; k++) { int c = (g.slot + k) % MFX_OUT; if (!(busy >> c & 1)) s = c; }
+    if (s < 0) { g.skip_busy++; g.prev_ok = g.hist_ok = 0; return -1; }
+    g.slot = s;
     float *par = g.mv_par[s].contents;
     for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) par[c * 4 + r] = (float)m[r * 4 + c];   // float4x4 is column-major
     par[16] = (float)depth.width; par[17] = (float)depth.height; par[18] = 1.0f / depth.width; par[19] = 1.0f / depth.height; par[20] = (float)g.yflip;
-    par[21] = atomic_load(&g_mv_dyn) && g.pdepth_frame && g.pdepth_frame == g.frames - 1 ? 1.0f : 0.0f;   // the previous game frame's depth is there
+    par[21] = g.pdepth_frame && g.pdepth_frame == g.frames - 1 ? 1.0f : 0.0f;   // the previous game frame's depth is there
     g.enc_depth = depth;
     return s;
 }
 void mfx_history_reset(void) { g.prev_ok = g.hist_ok = 0; }   // the next frame starts a new pair (its scene is not a continuation of the last)
-void mfx_frame_abort(void) { g.enc_depth = nil; g.prev_ok = g.hist_ok = 0; g.skip_busy++; }
 NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> heap, NSUInteger stamp) {
     id<MTLTexture> depth = g.enc_depth; g.enc_depth = nil; g.last_depth = depth; g.last_slot = s;
     [g.mv_args[s] setTexture:depth.gpuResourceID atIndex:0]; [g.mv_args[s] setTexture:g.mv.gpuResourceID atIndex:1]; [g.mv_args[s] setAddress:g.mv_par[s].gpuAddress atIndex:0];
@@ -355,7 +337,7 @@ NSArray *mfx_frame_encode(id<MTL4CommandBuffer> cb, int s, id<MTL4CounterHeap> h
     return resources;
 }
 /* DM_MFX_MVLOG=<every n frames>: read the motion texture back after the interpolation and log its median and the
-   camera step (diagnostic; waits for the GPU). */
+   camera step. Diagnostic, off unless the switch is set: it waits for the GPU (waitUntilCompleted), which no frame does otherwise. */
 void mfx_mv_log(void) {
     static int every = -1; if (every < 0) { const char *e = getenv("DM_MFX_MVLOG"); every = e ? atoi(e) : 0; }
     if (every <= 0 || !g.mv || g.made % (uint64_t)every) return;
@@ -376,8 +358,9 @@ void mfx_mv_log(void) {
 }
 /* DM_MFX_DUMP=<dir>: while the camera turns (more than 1 degree between the two frames), save the previous and this
    frame's scene, the depth, the motion vectors and the interpolated output of the 30th, 60th and 90th such frame as raw
-   files (scene RGBA16F, depth float32, motion 2 x float16, output RGBA8 sRGB), with a line in the log. Diagnostic: it
-   waits for the GPU and is meant for unpaced runs. */
+   files (scene in the canvas format: RGBA16F, RG11B10F or RGB10A2; depth float32, motion 2 x float16, output RGBA8 sRGB), with a
+   line in the log. Diagnostic, off unless the switch is set: it waits for the GPU (waitUntilCompleted, as its caller does for the
+   frame's command buffer), which no frame does otherwise; meant for unpaced runs. */
 static void dump_tex(id<MTLCommandQueue> q, id<MTLTexture> t, NSUInteger bpp, const char *dir, const char *name, uint64_t n) {
     NSUInteger w = t.width, h = t.height;
     id<MTLBuffer> b = [g.dev newBufferWithLength:w * h * bpp options:MTLResourceStorageModeShared];
@@ -400,8 +383,9 @@ int mfx_dump_due(void) {   // called after each encode; 1 = dump this frame (the
    30th turning frame as a reference) is dumped with the presented images of both frames. Returns 1 when dumped. */
 static float uf11(uint32_t v) { uint32_t e = (v >> 6) & 31, m = v & 63; return e == 0 ? ldexpf(m / 64.0f, -14) : e == 31 ? 65504.0f : ldexpf(1 + m / 64.0f, (int)e - 15); }
 static float uf10(uint32_t v) { uint32_t e = (v >> 5) & 31, m = v & 31; return e == 0 ? ldexpf(m / 32.0f, -14) : e == 31 ? 65504.0f : ldexpf(1 + m / 32.0f, (int)e - 15); }
-static void scene_rgb(const void *base, NSUInteger i, float c[3]) {   // one pixel of a scene copy (RG11B10F or RGBA16F)
+static void scene_rgb(const void *base, NSUInteger i, float c[3]) {   // one pixel of a scene copy (RG11B10F, RGB10A2 or RGBA16F)
     if (g.scene_fmt == MTLPixelFormatRGBA16Float) { const _Float16 *p = (const _Float16 *)base + i * 4; for (int k = 0; k < 3; k++) c[k] = (float)p[k]; return; }
+    if (g.scene_fmt == MTLPixelFormatRGB10A2Unorm) { uint32_t v = ((const uint32_t *)base)[i]; for (int k = 0; k < 3; k++) c[k] = ((v >> (10 * k)) & 1023) / 1023.0f; return; }   // Breath of the Wild's canvas
     uint32_t v = ((const uint32_t *)base)[i]; c[0] = uf11(v & 0x7ff); c[1] = uf11((v >> 11) & 0x7ff); c[2] = uf10(v >> 22);
 }
 static double centre_diff(id<MTLCommandQueue> q) {
