@@ -14,6 +14,9 @@ ipa	OctopathTravelerII.ipa
 app_category	public.app-category.games
 
 # ---- Versions ----
+# Base-game v0 main is verified by the allocator patch; its display version and other module IDs are unavailable without the NSP.
+# Keep the unknown display marker and omit unverified modules: base-only packaging derives a profile and reports module builds not registered here.
+build	v0	?	main=65619a04b8a04b10d44f9996ef141062
 build	v131072	1.1.1	main=0d9649011312f62e93f6a5673a09d7e9	subsdk0=dade22cfe6f24efe62d76409522c850b	sdk=5bcf525f24eb28658a8d67ac27800d9b
 package	v131072
 shader_versions	v131072
