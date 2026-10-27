@@ -6,7 +6,7 @@ The screen before the game starts shows the settings the game supports. Tap **Pl
 - [Game](#game): [Frame rate](#frame-rate), [Console mode](#console-mode), [Game language](#game-language)
 - [Picture](#picture): [Render scale](#render-scale), [Upscaling](#upscaling)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength)
-- [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Frame-rate counter](#frame-rate-counter), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
+- [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Halve when hot](#halve-when-hot), [Frame-rate counter](#frame-rate-counter), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [Settings in a file](#settings-in-a-file)
 
 ## Tested defaults
@@ -170,6 +170,14 @@ flowchart LR
 
 Shows the frames per second at the top left.
 
+### Halve when hot
+
+While iOS reports the device as hot (thermal state *serious* or worse), the frame rate is held at 30 until the device has been cooler for 30 seconds. **On**, the default, lets it cool and keeps the motion even. **Off** keeps aiming for 60.
+
+- **When to change it:** with a phone cooler, or when even 30 is worse than an uneven 45 to 55 for you.
+- **Cost of turning it off:** more heat, and at that temperature iOS has already lowered the GPU clock, so some frames still miss.
+- **Note:** iOS can lower the clock well before it reports the device as hot. On an iPhone 17 Pro Max a third of frames were dropped for ten minutes while the thermal state read nominal, so this setting does not catch every slowdown.
+
 ### Performance HUD
 
 Apple's performance overlay over the game: frame rate, frame and GPU times, memory. Useful to see what a setting changes; leave it off for play.
@@ -198,6 +206,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Pipeline prebuild | `DM_PSO_PREBUILD` | `1`, `0` |
 | Encode thread | `DM_NVN_ENC_THREAD` | `1`, `0` |
 | Hold frames when late | `DM_FPS_HOLD` | `on`, `off` |
+| Halve when hot | `DM_THERMAL_CAP` | `1`, `0` |
 | Performance HUD | `DM_METAL_HUD` | `1`, `0` |
 
 `DM_LAUNCHER=0` skips the settings screen. How the settings are listed for each game: [dm/games/settings.tsv](../dm/games/settings.tsv).

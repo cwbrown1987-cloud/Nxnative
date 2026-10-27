@@ -24,5 +24,6 @@ DM_PSO_MTL4	toggle	-	DM_GAME_PSO_MTL4	gfxapi:nvn	Performance	Metal 4 pipelines	K
 DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.
 DM_NVN_ENC_THREAD	toggle	-	1	gfxapi:nvn	Performance	Encode thread
 DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
+DM_THERMAL_CAP	toggle	-	1	DM_GAME_FPS_TARGET!=0	Performance	Halve when hot	Holds 30 fps while iOS reports the device as hot, so it cools down. Off keeps 60 at the cost of heat and of the frames the slower GPU still drops.
 DM_SHOW_FPS	toggle	-	build:DM_SHOW_FPS	always	Performance	Frame-rate counter
 DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD
