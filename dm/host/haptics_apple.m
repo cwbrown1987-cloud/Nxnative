@@ -8,6 +8,7 @@
 #import <AVFAudio/AVFAudio.h>
 #else
 #import <AppKit/AppKit.h>
+#import <IOKit/hid/IOHIDManager.h>
 #endif
 #include <math.h>
 #include <pthread.h>
@@ -68,9 +69,16 @@ static void report(NSError *e, NSString *target, const char *stage) {
 }
 - (void)engineFailed:(NSError *)error stage:(const char *)stage {
     [self failed:error stage:stage];
-    // Only an engine that cannot be made or started moves a split route to the default locality;
-    // a player or parameter failure (a service reset, say) is retried on the same handle.
+    // An engine that cannot be made or started moves a split route to the default locality at once;
+    // a single player or parameter failure (a service reset, say) is retried on the same handle (playerFailed).
     if (self.fallback) self.fallback(self.retryAfter);
+}
+- (void)playerFailed:(NSError *)error stage:(const char *)stage {
+    [self failed:error stage:stage];
+    // A handle whose player fails twice in a row, with no effect in between, is no passing service reset: on macOS 27.0.1 a DualShock 4's
+    // left handle answered every create player with NSCocoaErrorDomain 4097 (issue #219 logged it too), and each failure cleared the
+    // player's output, so the right handle stayed silent as well. Move the split route to the default locality, as for an engine failure.
+    if (self.failures >= 2 && self.fallback) self.fallback(self.retryAfter);
 }
 - (void)apply:(dm_haptic_level)level {
     uint64_t silence = ++self.silenceGeneration;
@@ -105,10 +113,10 @@ static void report(NSError *e, NSString *target, const char *stage) {
         ] relativeTime:0 duration:30];
         CHHapticPattern *pattern = [[CHHapticPattern alloc] initWithEvents:@[event] parameters:@[] error:&error];
         self.pattern = pattern ? [self.engine createAdvancedPlayerWithPattern:pattern error:&error] : nil;
-        if (!self.pattern) { [self failed:error stage:"create player"]; return; }
+        if (!self.pattern) { [self playerFailed:error stage:"create player"]; return; }
         self.pattern.loopEnabled = YES;
         self.pattern.isMuted = YES;
-        if (![self.pattern startAtTime:CHHapticTimeImmediate error:&error]) { [self failed:error stage:"start player"]; return; }
+        if (![self.pattern startAtTime:CHHapticTimeImmediate error:&error]) { [self playerFailed:error stage:"start player"]; return; }
     }
     // Controls live outside the loop: the loop boundary never replays an initial intensity.
     NSArray *parameters = @[
@@ -130,10 +138,106 @@ static void report(NSError *e, NSString *target, const char *stage) {
 }
 @end
 
+#if !TARGET_OS_IPHONE
+// A DualShock 4, or a controller that presents itself as one (a GameSir Cyclone over Bluetooth: Sony 054C / 05C4), whose Core Haptics
+// helper fails on every locality (NSCocoaErrorDomain 4097 on macOS 27.0.1, a plain test app too) still takes the effects report that
+// SDL's hidapi driver sends, as the Switch emulators do: 0x11 over Bluetooth (78 bytes, CRC32 over 0xA2 and the first 74 bytes, rumble
+// only, so the light bar is left alone), 0x05 over USB (32 bytes). Two channels share one report: the strong (left) and weak (right) motor.
+typedef struct { IOHIDDeviceRef dev; BOOL bluetooth; uint8_t motor[2], sent[2]; } ds4_out;
+static ds4_out ds4[DM_PLAYERS];
+static IOHIDManagerRef hidManager;
+static uint32_t ds4_crc(const uint8_t *p, size_t n) {
+    uint32_t c = ~0u;
+    while (n--) { c ^= *p++; for (int k = 0; k < 8; k++) c = c >> 1 ^ (0xEDB88320u & -(c & 1)); }
+    return ~c;
+}
+static void ds4_send(int p) {
+    ds4_out *o = &ds4[p]; uint8_t r[78] = {0}; size_t n;
+    if (o->bluetooth) {
+        r[0] = 0x11; r[1] = 0xC4; r[3] = 0x01; r[6] = o->motor[1]; r[7] = o->motor[0]; n = 78;
+        uint8_t c[75] = {0xA2}; memcpy(c + 1, r, 74);
+        uint32_t crc = ds4_crc(c, sizeof c); r[74] = crc; r[75] = crc >> 8; r[76] = crc >> 16; r[77] = crc >> 24;
+    } else { r[0] = 0x05; r[1] = 0x01; r[4] = o->motor[1]; r[5] = o->motor[0]; n = 32; }
+    IOReturn e = IOHIDDeviceSetReport(o->dev, kIOHIDReportTypeOutput, r[0], r, n);
+    if (e != kIOReturnSuccess) { if (++errors <= 8 || errors % 64 == 0) fprintf(stderr, "[RED] haptics: DualShock 4 effects report: IOReturn 0x%x\n", e); return; }
+    o->sent[0] = o->motor[0]; o->sent[1] = o->motor[1];
+}
+// The emulators' mapping (as Ryujinx's NpadController feeds SDL): the strong motor follows the low band and the weak one the high band,
+// mostly from the left and the right motor respectively, linearly. Core Haptics' combined level (dm_haptics_level: both bands, root of
+// the sum of squares) ran Mario Kart 8 Deluxe's quiet driving texture at 30–90 of 255 on the DS4's rotating motors: felt as rumble that
+// never stopped after a crash, and that went on for seconds in the menus while the game faded it out
+// DM_DS4_RUMBLE_MIN (0 to 0.9, default 0): amplitudes below it stay silent and the rest is stretched over the full range. Mario Kart 8
+// Deluxe drives its low band at 0.1–0.4 all race long (about 30 changes a second, with 0.84 peaks every few seconds); on a Joy-Con's
+// resonant actuator that is a texture, on the DS4's rotating motors a rumble that never lets up
+static float ds4_min;
+static uint8_t ds4_byte(float x) {
+    x = isfinite(x) ? fmaxf(0, fminf(1, x)) : 0;
+    x = x <= ds4_min ? 0 : (x - ds4_min) / (1 - ds4_min);
+    return (uint8_t)lrintf(x * 255);
+}
+static void ds4_apply(dm_haptic_state s) {
+    ds4_out *o = &ds4[s.player];
+    if (!o->dev) return;
+    const dm_vibration *l = &s.motor[0], *r = &s.motor[1];
+    o->motor[0] = ds4_byte((0.85f * l->amplitude_low + 0.15f * r->amplitude_low) * gain);
+    o->motor[1] = ds4_byte((0.15f * l->amplitude_high + 0.85f * r->amplitude_high) * gain);
+    if (o->motor[0] == o->sent[0] && o->motor[1] == o->sent[1]) return;
+    ds4_send(s.player);
+    if (getenv("DM_RUMBLE_LOG")) fprintf(stderr, "rumble: DualShock 4 report: strong %u weak %u (left low %.2f@%.0f high %.2f@%.0f, right low %.2f@%.0f high %.2f@%.0f)\n",
+                                         o->sent[0], o->sent[1], l->amplitude_low, l->frequency_low, l->amplitude_high, l->frequency_high,
+                                         r->amplitude_low, r->frequency_low, r->amplitude_high, r->frequency_high);
+}
+static void ds4_release(int p) {
+    ds4_out *o = &ds4[p];
+    if (o->dev) { o->motor[0] = o->motor[1] = 0; if (o->sent[0] || o->sent[1]) ds4_send(p); CFRelease(o->dev); }
+    *o = (ds4_out){0};
+}
+@interface DmDs4Channel : DmRumbleChannel
+@property(nonatomic) int motor;   // 0 the strong (left) motor, 1 the weak (right) one
+@end
+@implementation DmDs4Channel
+- (void)apply:(dm_haptic_level)level { (void)level; }   // the route takes both motors' raw values at once (ds4_apply)
+- (void)stop {
+    ds4_out *o = &ds4[self.player];
+    o->motor[self.motor] = 0;
+    if (o->dev && (o->sent[0] || o->sent[1]) && !o->motor[0] && !o->motor[1]) ds4_send(self.player);
+}
+@end
+// Only a controller GameController calls a DualShock 4, and only while one Sony DualShock 4 HID device is there to address
+static BOOL ds4_route(int p, GCController *controller) {
+    if (![controller respondsToSelector:@selector(productCategory)] || ![controller.productCategory isEqualToString:GCProductCategoryDualShock4]) return NO;
+    if (!hidManager) {
+        hidManager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+        IOHIDManagerSetDeviceMatching(hidManager, (__bridge CFDictionaryRef)@{@kIOHIDVendorIDKey: @0x054C});
+        if (IOHIDManagerOpen(hidManager, kIOHIDOptionsTypeNone) != kIOReturnSuccess) { CFRelease(hidManager); hidManager = NULL; return NO; }
+    }
+    NSSet *devices = CFBridgingRelease(IOHIDManagerCopyDevices(hidManager));
+    for (id d in devices) {
+        IOHIDDeviceRef dev = (__bridge IOHIDDeviceRef)d;
+        int pid = [(__bridge NSNumber *)IOHIDDeviceGetProperty(dev, CFSTR(kIOHIDProductIDKey)) intValue];
+        if (pid != 0x05C4 && pid != 0x09CC && pid != 0x0BA0) continue;   // DualShock 4 v1, v2, the USB wireless adapter
+        ds4_release(p);
+        ds4[p].dev = (IOHIDDeviceRef)CFRetain(dev);
+        ds4[p].bluetooth = [(__bridge NSString *)IOHIDDeviceGetProperty(dev, CFSTR(kIOHIDTransportKey)) isEqualToString:@"Bluetooth"];
+        for (DmRumbleChannel *old in channels[p]) [old stop];
+        channels[p] = [NSMutableArray new];
+        for (int m = 0; m < 2; m++) { DmDs4Channel *c = [DmDs4Channel new]; c.player = p; c.motor = m; c.target = @"DualShock 4 report"; [channels[p] addObject:c]; }
+        dm_haptics_route(p, 1);
+        fprintf(stderr, "haptics: player %d rumble through the DualShock 4 effects report (%s, product 0x%04x)\n",
+                p + 1, ds4[p].bluetooth ? "Bluetooth" : "USB", pid);
+        return YES;
+    }
+    return NO;
+}
+#endif
+
 static void apply(dm_haptic_state s) {
     dispatch_async(queue, ^{ @autoreleasepool {
         if (s.epoch != dm_haptics_epoch(s.player)) return;
         NSArray<DmRumbleChannel *> *out = channels[s.player];
+#if !TARGET_OS_IPHONE
+        if ([out.firstObject isKindOfClass:DmDs4Channel.class]) { ds4_apply(s); return; }
+#endif
         for (NSUInteger i = 0; i < out.count; i++) {
             if (s.epoch != dm_haptics_epoch(s.player)) break;   // a failed channel may replace this route
             dm_haptic_level level = out.count == 2 ? dm_haptics_level(&s.motor[i], 1, gain) : dm_haptics_level(s.motor, 2, gain);
@@ -145,13 +249,26 @@ static void add_engine(int p, NSString *target, CHHapticEngine *(^create)(NSErro
     DmRumbleChannel *c = [DmRumbleChannel new]; c.createEngine = create; c.target = target; c.player = p;
     [channels[p] addObject:c];
 }
-static void default_controller(int p, GCDeviceHaptics *h, NSTimeInterval retryAfter) {
+static void default_controller(int p, GCController *controller, NSTimeInterval retryAfter) {
+    GCDeviceHaptics *h = controller.haptics;
     add_engine(p, @"controller default", ^CHHapticEngine *(NSError **e) { (void)e; return [h createEngineWithLocality:GCHapticsLocalityDefault]; });
     channels[p].lastObject.retryAfter = retryAfter;
+#if !TARGET_OS_IPHONE
+    // The last resort on the Mac: a DualShock 4 whose default locality fails too gets its effects report instead (ds4_route);
+    // any other controller keeps retrying the default locality after the backoff
+    __weak NSArray *route = channels[p];
+    channels[p].lastObject.fallback = ^(NSTimeInterval after) { (void)after; if (route && channels[p] == route) ds4_route(p, controller); };
+#endif
 }
 static void configure(int p, GCController *controller) {
     for (DmRumbleChannel *c in channels[p]) [c stop];
     channels[p] = [NSMutableArray new];
+#if !TARGET_OS_IPHONE
+    ds4_release(p);
+    // A DualShock 4 takes its effects report at once, as SDL drives it: a controller that only presents itself as one (GameSir Cyclone)
+    // fails Core Haptics on every locality, and walking the handle and default routes first lost the first effects of a session
+    if (controller && ds4_route(p, controller)) return;
+#endif
     if (controller) {
         GCDeviceHaptics *h = controller.haptics;
         NSSet *localities = h.supportedLocalities;
@@ -165,12 +282,12 @@ static void configure(int p, GCController *controller) {
                 if (!route || channels[p] != route) return;
                 for (DmRumbleChannel *old in channels[p]) [old stop];
                 channels[p] = [NSMutableArray new];
-                default_controller(p, h, retryAfter);
+                default_controller(p, controller, retryAfter);
                 dm_haptics_route(p, 1);
                 fprintf(stderr, "haptics: player %d retrying with the default controller locality\n", p + 1);
             };
         }
-        else if (localities.count) default_controller(p, h, 0);
+        else if (localities.count) default_controller(p, controller, 0);
         fprintf(stderr, "haptics: player %d controller %s, localities %s, %lu channels\n", p + 1,
                 controller.vendorName.UTF8String ?: "unknown", [[localities.allObjects sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@", "].UTF8String ?: "none", (unsigned long)channels[p].count);
     }
@@ -209,6 +326,10 @@ void dm_haptics_apple_init(void) {
         dispatch_queue_set_specific(queue, &queue, &queue, NULL);
         const char *e = getenv("DM_RUMBLE_GAIN");
         if (e) { float v = strtof(e, NULL); if (isfinite(v)) gain = fmaxf(0, fminf(3, v)); }
+#if !TARGET_OS_IPHONE
+        e = getenv("DM_DS4_RUMBLE_MIN");
+        if (e) { float v = strtof(e, NULL); if (isfinite(v)) ds4_min = fmaxf(0, fminf(0.9f, v)); }
+#endif
         e = getenv("DM_RUMBLE");
         dm_haptics_init(apply, !e || atoi(e) != 0);
 #if TARGET_OS_IPHONE

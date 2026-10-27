@@ -49,6 +49,7 @@
 @property NSMutableArray<TestEngine *> *engines;
 @property NSMutableArray<GCHapticsLocality> *requestedLocalities;
 @property int attempts, failureStage;
+@property BOOL leftPlayerAlwaysFails;
 @end
 @implementation TestHaptics
 - (instancetype)init {
@@ -69,6 +70,7 @@
         e.failPlayer = self.failureStage == 4; e.failSend = self.failureStage == 5;
         e.resetDuringStart = self.failureStage == 2;
     }
+    if (self.leftPlayerAlwaysFails && [locality isEqual:GCHapticsLocalityLeftHandle]) e.failPattern = YES;
     return (id)e;
 }
 @end
@@ -169,6 +171,18 @@ int main(void) { @autoreleasepool {
     assert(split2.haptics.attempts == 3 && [asked[1] isEqual:GCHapticsLocalityLeftHandle] && [asked[2] isEqual:GCHapticsLocalityRightHandle]);
     assert(fabsf(split2.haptics.engines[1].testPlayer.levels.lastObject.floatValue - 0.3f) < 1e-6f);
     assert(fabsf(split2.haptics.engines[2].testPlayer.levels.lastObject.floatValue - 0.4f) < 1e-6f);
+    // A handle whose player fails every time (DualShock 4 on macOS 27.0.1: NSCocoaErrorDomain 4097) moves the route to the default locality on the second failure
+    TestController *split3 = [TestController new]; split3.haptics = [TestHaptics new];
+    split3.haptics.supportedLocalities = split.haptics.supportedLocalities;
+    split3.haptics.leftPlayerAlwaysFails = YES;
+    dm_haptics_apple_controller(0, (id)split3); drain();
+    send_pair(0.3, 0.4); drain();
+    assert(channels[0].count == 2);   // the first player failure keeps the handle route
+    expire_retries(); send_pair(0.3, 0.4); drain();
+    assert(channels[0].count == 1);   // the second in a row falls back
+    expire_retries(); send_pair(0.3, 0.4); drain();
+    assert([split3.haptics.requestedLocalities.lastObject isEqual:GCHapticsLocalityDefault]);
+    assert(fabsf(split3.haptics.engines.lastObject.testPlayer.levels.lastObject.floatValue - 0.5f) < 1e-6f);
     dm_haptics_apple_controller(0, nil); drain();   // disconnect discards the controller factory and its old callbacks
     assert(!(dm_haptics_available() & 1));
     TestController *unsupported = [TestController new]; unsupported.haptics = [TestHaptics new];
