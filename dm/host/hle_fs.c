@@ -90,6 +90,8 @@ static int save_txn_from_path(const char *hp) {
 }
 // The default weak implementation only logs (Mac); the iOS front end provides a strong implementation of the same name that shows a native alert. Called on the game thread, the front end switches to the main thread itself
 __attribute__((weak)) void front_save_failed(int err) { LOG("front_save_failed(errno=%d): no front end attached (default weak implementation)", err); }
+__attribute__((weak)) int front_save_sync_choose(const char *title, const char *message) { (void)title; (void)message; return 0; }   // save sync conflict (savesync_apple.m): neither save this run
+__attribute__((weak)) void front_save_sync_notice(const char *message) { (void)message; }   // save sync trouble: the log line is all
 // DM_FSLOG=<file>: each ReadFile logs one TSV line "seconds since boot\tguest path\toffset\tlength\tguest buffer address" (which bytes boot read, for offline reverse lookup against the manifest)
 static FILE *g_fslog; static char *g_fdpath[4096]; static pthread_mutex_t g_fslog_lock = PTHREAD_MUTEX_INITIALIZER;
 static void fslog_init(void) { static int done; if (done) return; done = 1; const char *e = getenv("DM_FSLOG"); if (e && !(g_fslog = fopen(e, "w"))) die("cannot open DM_FSLOG %s", e); if (g_fslog) setvbuf(g_fslog, NULL, _IOLBF, 0); }   // line-buffered: runs end at the time-limit alarm or a crash, which never flush stdio
@@ -114,8 +116,17 @@ static int dm_fs_test_fail(const char *pt) {
 }
 static int in_txn_dir(const char *hp) { return save_txn_from_path(hp); }
 static int rm_tree(const char *p);
+// Save sync through a cloud folder (savesync_apple.m, DM_SAVE_SYNC): brought up to date at the first mount, before the work directory is cloned, and pushed after each commit.
+// These defaults do nothing, for the unit tests that build this file alone
+__attribute__((weak)) void dm_savesync_mount(const char *dir, const char *title) { (void)dir; (void)title; }
+__attribute__((weak)) void dm_savesync_commit(const char *dir) { (void)dir; }
 static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     pthread_once(&g_txn_lock_once, txn_locks_init);
+    if (txn) {   // outside the locks: it may wait for the cloud, or for the player to settle a conflict
+        char title[20]; const char *e = getenv("DM_PROGRAM_ID");
+        snprintf(title, sizeof title, "%016llX", e ? strtoull(e, NULL, 16) : (unsigned long long)DM_GAME_PROGRAM_ID);
+        dm_savesync_mount(dir, title);
+    }
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_nmnt; i++)
         if (!strcmp(g_mnt[i].name, name)) { pthread_mutex_unlock(&g_lock); return RES_OK; }
@@ -576,6 +587,7 @@ static Result commit_mount_locked(int i, int *notify_error) {
     static int n; if (r == RES_OK) { uint64_t tc2 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
         LOG("save commit #%d: %s swapped atomically into %s (%d save writes so far) (clone + swap %llu us, since this transaction's first write %llu us)", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
             (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0)); atomic_fetch_add(&g_save_commits, 1);
+        dm_savesync_commit(g_mnt[i].commit);
     }
     return r;
 }

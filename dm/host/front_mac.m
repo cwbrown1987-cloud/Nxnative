@@ -357,3 +357,24 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     snprintf(out, out_cap, "%s", text.UTF8String);
     return 1;
 }
+
+// Save sync (front.h, savesync_apple.m): an NSAlert on the main thread; a conflict waits for the player's pick, a notice does not. Windowless: neither save, the log only
+int front_save_sync_choose(const char *title, const char *message) {
+    if (!g_layer) return 0;
+    __block NSModalResponse r = 0;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        g_btn = 0; g_w = g_a = g_s = g_d = 0; push(); dm_touch_set(NULL, 0);   // the alert takes the key-up / click-up, as the keyboard box above
+        NSAlert *a = [NSAlert new]; a.messageText = @(title); a.informativeText = @(message);
+        [a addButtonWithTitle:@"Use the sync folder's save"]; [a addButtonWithTitle:@"Keep this Mac's save"]; [a addButtonWithTitle:@"Not now"];
+        r = [a runModal];
+    });
+    return r == NSAlertFirstButtonReturn ? 2 : r == NSAlertSecondButtonReturn ? 1 : 0;
+}
+void front_save_sync_notice(const char *message) {
+    if (!g_layer) return;
+    NSString *m = @(message);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_btn = 0; g_w = g_a = g_s = g_d = 0; push(); dm_touch_set(NULL, 0);
+        NSAlert *a = [NSAlert new]; a.messageText = @"Save sync"; a.informativeText = m; [a runModal];
+    });
+}
