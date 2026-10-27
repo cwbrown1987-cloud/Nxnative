@@ -242,7 +242,7 @@ The bundle holds what the IPA holds, with the Mac's shader libraries:
 
 ```
 <game name>.app/Contents/
-  Info.plist                 name, version, bundle ID, the profile's app_category; DMTitleID, DMRomfsMarker, DMLanguage and DMModuleFiles for the launcher
+  Info.plist                 name, version, bundle ID, the profile's app_category; DMTitleID, DMRomfsMarker, DMLanguage, DMShowFPS and DMModuleFiles for the launcher
   MacOS/nxnative             the launcher (dm/mac/launcher.c, compiled by pack_app.py)
   MacOS/dmhost               the Mac host built for the profile
   Resources/romfs/           the packed version's RomFS
@@ -252,6 +252,8 @@ The bundle holds what the IPA holds, with the Mac's shader libraries:
   Resources/dm/              the rewritten modules and their rewriter tables, nro.tsv, the profile's shader_map.tsv, pso_manifest.tsv, c1_full.tsv, cb_extent.tsv, shader_pairs.tsv and pso_pairs.tsv, font/, env.txt (--env-file)
   Resources/AppIcon.icns
 ```
+
+`--show-fps` enables Apple's Metal performance HUD and its Metal HUD menu in a Mac app; `--no-show-fps` disables that default. With neither option, the script uses `SHOW_FPS` (on by default), as for the iPhone's frame-rate counter. `DM_METAL_HUD=0` or `1` in the app's environment files overrides the bundled choice without rebuilding. The development-only `--platform mac` command continues to use `DM_METAL_HUD` directly.
 
 The shader pairs are what the pipeline prebuild and the hybrid pipelines read ([Hybrid pipelines](#hybrid-pipelines)), as in the IPA; a profile without `pso_pairs.tsv` gets the shader split's copy (`--pso-pairs`). An app without them builds no base: [Shader-pair tables in a Mac app](reference/shaders.md#shader-pair-tables-in-a-mac-app).
 

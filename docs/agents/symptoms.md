@@ -5,6 +5,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 ## Packing
 
 - the first extraction stops with `nx_extract exit code 131` and `.NET location: Not found`, even though `dotnet` is on `PATH`. The shader translator can fail the same way. → [Homebrew .NET is on PATH but apphosts cannot find the runtime](../reference/packing.md#homebrew-net-is-on-path-but-apphosts-cannot-find-the-runtime)
+- a Mac app built with `--show-fps` has neither the Metal performance overlay nor its Metal HUD menu. → [The Mac app drops the FPS setting and Metal HUD menu](../reference/packing.md#the-mac-app-drops-the-fps-setting-and-metal-hud-menu)
 - packing succeeds, but `unzip -t` or Python's `ZipFile.testzip()` reports a bad CRC for a large deflated file. → [A streamed file changes size and the IPA fails its CRC check](../reference/packing.md#a-streamed-file-changes-size-and-the-ipa-fails-its-crc-check)
 - `decompress NSZ` stops immediately with `nsz: error: unrecognized arguments: --keys …`. → [NSZ decompression rejects `--keys`](../reference/packing.md#nsz-decompression-rejects---keys)
 

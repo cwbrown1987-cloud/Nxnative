@@ -100,6 +100,9 @@ int main(void) {
     fprintf(stderr, "launcher: %s (%s), host %s\n", name, id, host);
     snprintf(p, sizeof p, "%s/env.txt", sup); env_file(p);
     snprintf(p, sizeof p, "%s/env.txt", dm); env_file(p);
+    // Apply the build's FPS preference before spawning the host: Metal reads its HUD switch at the first device. Explicit environment values win.
+    CFTypeRef fps = CFBundleGetValueForInfoDictionaryKey(CFBundleGetMainBundle(), CFSTR("DMShowFPS"));
+    if (fps && CFGetTypeID(fps) == CFBooleanGetTypeID()) setenv("DM_METAL_HUD", CFBooleanGetValue(fps) ? "1" : "0", 0);
     setenv("DM_ROOT", sup, 0); setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
     snprintf(p, sizeof p, "%s/msl", res); setenv("DM_MSL_DIR", p, 0);
     snprintf(p, sizeof p, "%s/font", dm); setenv("DM_FONT_DIR", p, 0);
