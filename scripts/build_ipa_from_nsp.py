@@ -1444,8 +1444,8 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, o
 class ShaderWatch:
     """Progress of dmsh_build.py, read from the files it writes (it prints nothing until it ends). It works in three phases:
     the cache check (a hit restores <key>_b.json into the library directory b-<chain>/: the iOS one, or the Mac's for a Mac-only build; a miss writes <key>.bin into its temporary folder dmsh_* under WORK),
-    the translation of the misses (<key>.spv in the temporary folder), and the compile, which takes the keys in a fixed order (sorted, the vertex shaders with pixel pairs last)
-    and writes <key>_b.json again for every miss and every pixel shader: the furthest key written so far tells how far it got"""
+    the translation of the misses (<key>.spv in the temporary folder), and the compile, which takes each translated chunk as it comes (in key order, the vertex shaders with pixel pairs
+    last), so it runs beside the translation, and writes <key>_b.json again for every miss and every pixel shader: the furthest key written so far tells how far it got"""
     def __init__(self, g, out, tmp, pso_pairs=None):   # out: the library directory b-<chain>/ (the iOS one, or the Mac's for a Mac-only build)
         keys = set()
         for ln in g.table('shader_map.tsv').read_text(errors='replace').splitlines():   # the keys dmsh_build.py builds: column 4 of the rows from a shader package
@@ -1479,10 +1479,10 @@ class ShaderWatch:
             if len(self.hits) + ext['.bin'] < self.n and not ext['.spv'] and not ext['.metal']:
                 return {'step': 'cache check', 'done': len(self.hits) + ext['.bin'], 'total': self.n, 'unit': 'shaders', 'note': f'{len(self.hits):,} cached'}
             self.t1 = time.time()   # the cache check is over: from now on a <key>_b.json is written by the compile
-        if ext['.bin'] and not ext['.metal'] and ext['.spv'] < ext['.bin']:
-            return {'step': 'translating', 'done': ext['.spv'], 'total': ext['.bin'], 'unit': 'shaders'}
         new = self.written(self.pos.keys() - self.fin, self.t1)
         self.fin |= new; self.top = max([self.top] + [self.pos[k] for k in new])
+        if ext['.bin'] and ext['.spv'] < ext['.bin']:
+            return {'step': 'translating', 'done': ext['.spv'], 'total': ext['.bin'], 'unit': 'shaders', 'note': f'{len(self.fin):,} compiled' if self.fin else ''}
         return {'step': 'compiling' if ext['.bin'] else 'finishing', 'done': max(len(self.fin), self.top + 1), 'total': self.n, 'unit': 'shaders',
                 'note': f'{ext[".bin"]:,} not cached' if ext['.bin'] else ''}
 
@@ -1500,13 +1500,14 @@ def toolchain(repo, env=None):   # Metal is a separate Xcode download: its versi
 
 
 def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False):
-    """The iOS shader libraries (dmsh_build.py, which builds the Mac's into sh/cache in the same run), or with mac only the Mac's (a Mac-only build: no IOSOUT). Returns the folder the host takes
+    """The iOS shader libraries (dmsh_build.py with IOS_ONLY: the iPhone does not use the Mac's, so only each shader's MSL and reflection go into sh/cache, for chain_tables), or with mac only
+    the Mac's (a Mac-only build: no IOSOUT). Returns the folder the host takes
     them from. Reused when the shader package (pkg_key, its content; None never reuses) and the chain's tools, translator binaries, profile and compilers are as at the last successful build:
     dmsh_build.py would only restore every shader from its cache (63,000 for Breath of the Wild: about 100 s). The key of the iOS libraries is sh/ios/b-<chain>.key, that of the Mac's
-    sh/mac-b-<chain>.key (not in sh/cache, whose b-* entries dmsh_build.py reads as library folders), which an iOS build writes too, so a Mac-only build after it is reused; either is taken only
+    sh/mac-b-<chain>.key (not in sh/cache, whose b-* entries dmsh_build.py reads as library folders), which only a Mac-only build writes (an iOS build leaves no Mac libraries); either is taken only
     while the Mac libraries carry a full build's stamp (inputs.tsv) for c1_full.tsv and cb_extent.tsv to name (chain_tables).
-    An iOS build after a Mac-only one translates the shaders again (dmsh_build.py's per-shader cache keys include the iOS compile convention), but takes the Mac libraries from its
-    Metal compile cache (dmsh_mtlcache.py), so only the iPhone's are compiled"""
+    An iOS build and a Mac-only one translate the shaders again after each other (dmsh_build.py's per-shader cache keys include the iOS compile convention and IOS_ONLY), but a library
+    compiled before for the same MSL comes from the Metal compile cache (dmsh_mtlcache.py)"""
     ios, log = sh / 'ios', logs / 'dmsh_build.log'
     PROG.stage('Mac shaders' if mac else 'iOS shaders')
     chain = chain_of(repo)
@@ -1530,6 +1531,7 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False):
     benv = dict(env, XLATE=str(xlate), IOSOUT=str(ios))
     if ALLOW_OTHER_METAL: benv['DM_ALLOW_OTHER_METAL'] = '1'
     if mac: del benv['IOSOUT']   # dmsh_build.py builds the iOS libraries only with IOSOUT
+    else: benv['IOS_ONLY'] = '1'   # and no Mac libraries for an iPhone build (about half the Metal compile time)
     run([py, repo / 'dm/gfx/tools/own_compilers.py', sh / 'pkg', sh / 'cache'], log, env=benv)
     PROG.watch(None)
     if not chain_tables(py, repo, sh, env, logs, g, chain): raise BuildError(f'no stamped Mac shader outputs in {sh / "cache" / f"b-{chain}"} (inputs.tsv): dmsh_build.py did not finish a full build')
@@ -1549,7 +1551,7 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False):
     else: PROG.end()
     shader_regressions(py, repo, sh / 'cache', chain, logs)   # before the key: a stopped build is checked again on the next run
     if key:
-        for k in (kmac,) if mac else (kf, kmac): k.write_text(f'{key}\n{note}\n')
+        (kmac if mac else kf).write_text(f'{key}\n{note}\n')
     return out
 
 
