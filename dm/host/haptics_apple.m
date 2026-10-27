@@ -31,6 +31,9 @@
 static dispatch_queue_t queue;
 static NSMutableArray<DmRumbleChannel *> *channels[DM_PLAYERS];
 static GCController *controllers[DM_PLAYERS];
+static id outputOwners[DM_PLAYERS]; // protected by routeLock
+static dm_haptics_output nativeOutputs[DM_PLAYERS]; // serial queue only
+static uint64_t outputGeneration[DM_PLAYERS];
 #if TARGET_OS_IPHONE
 static BOOL phoneSupported;
 #endif
@@ -130,9 +133,21 @@ static void report(NSError *e, NSString *target, const char *stage) {
 }
 @end
 
+static void native_stop(int p) {
+    outputGeneration[p]++;
+    if (nativeOutputs[p]) nativeOutputs[p]((dm_haptic_state){.player=p}, gain);
+}
+static void native_apply(dm_haptic_state s, uint64_t generation) {
+    int p=s.player;
+    if (!nativeOutputs[p] || generation != outputGeneration[p] || s.epoch != dm_haptics_epoch(p)) return;
+    nativeOutputs[p](s,gain);
+    if (s.motor[0].amplitude_low || s.motor[0].amplitude_high || s.motor[1].amplitude_low || s.motor[1].amplitude_high)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40*NSEC_PER_MSEC),queue,^{ native_apply(s,generation); });
+}
 static void apply(dm_haptic_state s) {
     dispatch_async(queue, ^{ @autoreleasepool {
         if (s.epoch != dm_haptics_epoch(s.player)) return;
+        if (nativeOutputs[s.player]) { native_apply(s,++outputGeneration[s.player]); return; }
         NSArray<DmRumbleChannel *> *out = channels[s.player];
         for (NSUInteger i = 0; i < out.count; i++) {
             if (s.epoch != dm_haptics_epoch(s.player)) break;   // a failed channel may replace this route
@@ -185,20 +200,36 @@ static void configure(int p, GCController *controller) {
 void dm_haptics_apple_controller(int p, GCController *controller) {
     if (!queue || p < 0 || p >= DM_PLAYERS) return;
     pthread_mutex_lock(&routeLock);
-    if (controllers[p] != controller) {
+    if (controllers[p] != controller || outputOwners[p]) {
         controllers[p] = controller;
+        outputOwners[p] = nil;
         dm_haptics_route(p, 0);   // invalidate queued work before changing hardware
-        dispatch_sync(queue, ^{ configure(p, controller); });
+        dispatch_sync(queue, ^{ native_stop(p); nativeOutputs[p]=nil; configure(p, controller); });
+    }
+    pthread_mutex_unlock(&routeLock);
+}
+void dm_haptics_apple_output(int p, id owner, dm_haptics_output output) {
+    if (!queue || p < 0 || p >= DM_PLAYERS) return;
+    if (!owner || !output) { dm_haptics_apple_controller(p,nil); return; }
+    pthread_mutex_lock(&routeLock);
+    if (outputOwners[p] != owner) {
+        outputOwners[p]=owner; controllers[p]=nil; dm_haptics_route(p,0);
+        dispatch_sync(queue, ^{
+            native_stop(p);
+            for (DmRumbleChannel *c in channels[p]) [c stop];
+            channels[p]=[NSMutableArray new]; nativeOutputs[p]=[output copy]; dm_haptics_route(p,1);
+        });
     }
     pthread_mutex_unlock(&routeLock);
 }
 static void suspend(unsigned reason, BOOL on) {
     dm_haptics_suspend(reason, on);
     void (^stop)(void) = ^{
-        for (int p = 0; p < DM_PLAYERS; p++) for (DmRumbleChannel *c in channels[p]) [c stop];
+        for (int p = 0; p < DM_PLAYERS; p++) { native_stop(p); for (DmRumbleChannel *c in channels[p]) [c stop]; }
     };
     if (on) { if (dispatch_get_specific(&queue)) stop(); else dispatch_sync(queue, stop); }
 }
+void dm_haptics_apple_focus(int active) { if(queue) suspend(DM_HAPTICS_UNFOCUSED,!active); }
 void dm_haptics_apple_shutdown(void) {
     if (queue) suspend(DM_HAPTICS_INACTIVE, YES);
 }
