@@ -9,7 +9,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent / 'tools'))
 import game, nacp
 
-SECTIONS = ('Game', 'Controls', 'Performance')   # headings on the single settings screen
+SECTIONS = ('Game', 'Picture', 'Controls', 'Performance')   # headings on the single settings screen, in the order they are drawn
 
 
 def rows():
