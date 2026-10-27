@@ -10,6 +10,7 @@
 #   section   Game, Controls or Performance: a heading on the single settings screen. Rows appear in table order within each section
 #             Reset to tested defaults clears all launcher choices; values fixed by an env file stay
 #   label, note  the setting's name and the line under it (may be empty; only for a setting with a cost: latency, memory, heat)
+#   needs     <VAR>=<value>: a sub-setting of the row that sets <VAR>, drawn only while it has that value (may be empty)
 DM_FPS_TARGET	choice	30=30 fps,60=60 fps	DM_GAME_FPS_TARGET	DM_GAME_FPS_TARGET!=0	Game	Frame rate
 DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale
 DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode
@@ -18,7 +19,7 @@ DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language
 DM_SHOW_FPS	toggle	-	build:DM_SHOW_FPS	always	Game	Frame-rate counter
 DM_TOUCH_HAPTICS	toggle	-	1	always	Controls	Touch feedback
 DM_RUMBLE	toggle	-	1	always	Controls	Game rumble
-DM_RUMBLE_GAIN	range	0:3:0.1	1.0	always	Controls	Rumble strength
+DM_RUMBLE_GAIN	range	0:3:0.1	1.0	always	Controls	Rumble strength		DM_RUMBLE=1
 DM_PRESENT_SNAP	toggle	-	DM_GAME_PRESENT_SNAP	gfxapi:nvn	Performance	Frame buffering	Up to one frame more display latency.
 DM_PSO_MTL4	toggle	-	DM_GAME_PSO_MTL4	gfxapi:nvn	Performance	Metal 4 pipelines	Keeps a pipeline archive; uses more memory.
 DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.
