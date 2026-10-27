@@ -182,6 +182,8 @@ python3 -m pip install lz4 capstone fonttools "backports.zstd; python_version < 
 
 NSZ and XCZ files (compressed NSPs and XCIs) work too: the script converts them once with [nsz](https://github.com/nicoboss/nsz) (`python3 -m pip install nsz`) and keeps the NSPs in `<title ID>_build/nsp/`, which takes their full size on disk.
 
+A cartridge dump whose secure partition also holds an update or DLC can be split into one NSP per title with `uv run --with cryptography scripts/xci_split.py <game.xci> <prod.keys> <out dir>` (without `<out dir>` it only lists the NCAs and their titles). Name the outputs `<name> [<title ID>][v0].nsp` and `<name> [<update title ID>][v<version>].nsp`.
+
 Any version works, with or without an update: the script packs the newest version in the folder. DLC is optional too: the DLC in the folder is packed, and without it the game sees none, as on a Switch without it. Each game was tested on one version (an update named in the table above is the one its 60 fps needs). With another version the script builds the game with that version's own shaders and says that the version was not tested; fixes made for the tested version's code, such as the 60 fps ones, don't apply to it.
 
 **3. Run the script:**
