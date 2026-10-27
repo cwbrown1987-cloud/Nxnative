@@ -1,6 +1,33 @@
 // Run the actual serial-queue adapter with fake engines: no controller, actuator or app is opened.
-#import "../haptics_apple.m"
+#import <Foundation/Foundation.h>
 #include <assert.h>
+static dispatch_time_t test_dispatch_time(dispatch_time_t base, int64_t delay);
+static void test_dispatch_after(dispatch_time_t deadline, dispatch_queue_t target, dispatch_block_t block);
+#define dispatch_time test_dispatch_time
+#define dispatch_after test_dispatch_after
+#import "../haptics_apple.m"
+#undef dispatch_time
+#undef dispatch_after
+
+// Dispatch timers have no upper bound on scheduling latency. Drive their deadlines
+// explicitly while retaining the real serial queue and production callback bodies.
+@interface TestTimer : NSObject
+@property dispatch_time_t deadline;
+@property(copy) dispatch_block_t fire;
+@end
+@implementation TestTimer
+@end
+static dispatch_time_t timerNow = 1;
+static NSMutableArray<TestTimer *> *timers;
+static dispatch_time_t test_dispatch_time(dispatch_time_t base, int64_t delay) {
+    assert(base == DISPATCH_TIME_NOW && delay >= 0);
+    return timerNow + (uint64_t)delay;
+}
+static void test_dispatch_after(dispatch_time_t deadline, dispatch_queue_t target, dispatch_block_t block) {
+    assert(target == queue && dispatch_get_specific(&queue));
+    TestTimer *timer = [TestTimer new]; timer.deadline = deadline; timer.fire = block;
+    [timers addObject:timer];
+}
 
 @interface TestPlayer : NSObject
 @property BOOL loopEnabled, isMuted;
@@ -79,6 +106,20 @@
 @implementation TestController
 @end
 static void drain(void) { dispatch_sync(queue, ^{}); dispatch_sync(queue, ^{}); }
+static void advance_timers(uint64_t delta) {
+    drain();
+    dispatch_sync(queue, ^{
+        dispatch_time_t until = timerNow + delta;
+        for (;;) {
+            TestTimer *next = nil;
+            for (TestTimer *timer in timers) if (timer.deadline <= until && (!next || timer.deadline < next.deadline)) next = timer;
+            if (!next) break;
+            [timers removeObjectIdenticalTo:next]; timerNow = next.deadline; next.fire();
+        }
+        timerNow = until;
+    });
+    drain();
+}
 static void expire_retries(void) {
     dispatch_sync(queue, ^{ for (DmRumbleChannel *c in channels[0]) c.retryAfter = 0; });
 }
@@ -88,6 +129,7 @@ static void send_pair(float left, float right) {
 }
 static int made;   // engines the test factories made
 int main(void) { @autoreleasepool {
+    timers = [NSMutableArray new];
     queue = dispatch_queue_create("test.rumble", DISPATCH_QUEUE_SERIAL);
     dispatch_queue_set_specific(queue, &queue, &queue, NULL);
     dm_haptics_init(apply, 1); drain();
@@ -96,15 +138,19 @@ int main(void) { @autoreleasepool {
     dm_haptics_apple_output(2, owner, ^(dm_haptic_state s, float gain) { rawCalls++; rawLeft=s.motor[0].amplitude_low*gain; });
     dm_vibration_update raw={2,0,{0.5f,160,0,320}};
     dm_haptics_send(&raw,1); drain(); assert(rawLeft==0.5f && (dm_haptics_available() & 4));
-    int before=rawCalls; usleep(100000); drain(); assert(rawCalls>before); // firmware watchdog refreshed
+    int before=rawCalls;
+    advance_timers(39*NSEC_PER_MSEC); assert(rawCalls==before);
+    advance_timers(NSEC_PER_MSEC); assert(rawCalls==before+1 && rawLeft==0.5f); // firmware watchdog refreshed at 40 ms
+    advance_timers(80*NSEC_PER_MSEC); assert(rawCalls==before+3 && rawLeft==0.5f); // refresh continues without a new game send
     suspend(DM_HAPTICS_INACTIVE,YES); drain(); assert(rawLeft==0);
-    before=rawCalls; usleep(100000); drain(); assert(rawCalls==before); // stale timers cannot revive rumble
+    before=rawCalls; advance_timers(120*NSEC_PER_MSEC); assert(rawCalls==before); // stale timers cannot revive rumble
     suspend(DM_HAPTICS_INACTIVE,NO); dm_haptics_send(&raw,1); drain(); assert(rawLeft==0.5f);
     dm_haptics_apple_focus(0); drain(); assert(rawLeft==0);
     suspend(DM_HAPTICS_INACTIVE,YES); suspend(DM_HAPTICS_INACTIVE,NO);
     dm_haptics_send(&raw,1); drain(); assert(rawLeft==0); // app activation cannot bypass window suspension
     dm_haptics_apple_focus(1); dm_haptics_send(&raw,1); drain(); assert(rawLeft==0.5f);
     dm_haptics_apple_controller(2,nil); drain(); assert(rawLeft==0 && !(dm_haptics_available() & 4));
+    before=rawCalls; advance_timers(40*NSEC_PER_MSEC); assert(rawCalls==before); // stale route cannot refresh after disconnect
     TestEngine *left = [TestEngine new], *right = [TestEngine new];
     dispatch_sync(queue, ^{
         channels[0] = [NSMutableArray new];
@@ -118,7 +164,7 @@ int main(void) { @autoreleasepool {
     assert(left.testPlayer.levels.lastObject.floatValue == 0 && right.testPlayer.levels.lastObject.floatValue == 0);
     assert(left.testPlayer.levels.count == 2);   // short pulse ends immediately, without a minimum duration
     send_pair(0.4, 0.5);
-    usleep(1100000); drain();
+    advance_timers(1100*NSEC_PER_MSEC);
     assert(left.testPlayer.levels.lastObject.floatValue == 0.4f && left.testPlayer.stops == 0);   // old idle timer cannot stop a new effect
     assert(left.starts == 1);   // reused player; no per-frame engine restart
     dm_haptic_state stale = {0, dm_haptics_epoch(0), {{1, 160, 0, 320}, {1, 160, 0, 320}}};
@@ -135,7 +181,8 @@ int main(void) { @autoreleasepool {
     assert(dm_haptics_actual(0, 0).amplitude_low == 0);   // failed output is cleared, so a fresh identical send may retry
     left.fail = NO; expire_retries(); send_pair(0.8, 0.8);
     assert(left.testPlayer.levels.lastObject.floatValue == 0.8f);
-    send_pair(0, 0); usleep(1100000); drain();
+    send_pair(0, 0); advance_timers(999*NSEC_PER_MSEC); assert(left.testPlayer.stops == 0);
+    advance_timers(NSEC_PER_MSEC);
     assert(left.testPlayer.stops == 1);   // idle hardware eventually released
     int engines = made; starts = left.starts; send_pair(0.7, 0.7);
     assert(made == engines && left.starts == starts + 1 && left.testPlayer.levels.lastObject.floatValue == 0.7f);   // the released engine is restarted, not made again
