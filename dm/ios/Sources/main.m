@@ -7,12 +7,24 @@
 #include <unistd.h>
 #include "game_profile.h"   // game profile constants (the RomFS marker path)
 #include "front.h"
+#import "DmSaveFolderSync.h"
 
 int dm_main(int argc, char **argv);   // dm/host/main.c compiled in with -Dmain=dm_main
 UIViewController *front_ios_root(void);
 void front_ios_focus_event(int ev);
 
 static char *g_argv[4]; static int g_argc;
+static DmSaveFolderSync *g_folder_sync;
+void dm_save_sync_resume(void) { [g_folder_sync resumeSafely]; }
+void front_save_committed(void) { [g_folder_sync saveCommitted]; }
+void dm_save_folder_sync_committed(void) { [g_folder_sync saveCommitted]; }
+DmSaveFolderSync *dm_save_folder_sync(void) { return g_folder_sync; }
+void dm_save_folder_sync_present(DmSaveFolderSync *sync, UIViewController *viewController) { [sync presentFolderPickerFromViewController:viewController]; }
+void dm_save_folder_sync_clear(DmSaveFolderSync *sync) { [sync clearSelectedFolder]; }
+void dm_save_folder_sync_now(DmSaveFolderSync *sync) { [sync syncNow]; }
+void dm_save_folder_sync_import(DmSaveFolderSync *sync) { [sync resolveByImportingExternal]; }
+void dm_save_folder_sync_export(DmSaveFolderSync *sync) { [sync resolveByExportingLocal]; }
+void dm_save_folder_sync_preserve(DmSaveFolderSync *sync) { [sync preserveBoth]; }
 
 static NSString *romfs_locate(void) {
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -59,7 +71,13 @@ static int boot_env(void) {
     if (!romfs) { fprintf(stderr, "boot: game files not found (<App>/romfs or Documents/romfs)\n"); return 0; }
     fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
     setenv("DM_ROMFS", romfs.fileSystemRepresentation, 0);
-    setenv("DM_SAVE", [doc stringByAppendingPathComponent:@"save"].fileSystemRepresentation, 0);
+    NSString *saveRoot = [doc stringByAppendingPathComponent:@"save"];
+    setenv("DM_SAVE", saveRoot.fileSystemRepresentation, 0);
+    NSString *titleID = @DM_GAME_TITLE_ID;
+    fprintf(stderr, "save-sync: native root and payload %s\n", saveRoot.fileSystemRepresentation);
+    g_folder_sync = [[DmSaveFolderSync alloc] initWithLocalSave:[NSURL fileURLWithPath:saveRoot isDirectory:YES]
+                                                         titleID:titleID];
+    [g_folder_sync startBeforeGameplay];
     setenv("DM_TEMP", [doc stringByAppendingPathComponent:@"temp"].fileSystemRepresentation, 0);
     NSString *dm = [res stringByAppendingPathComponent:@"dm"];
     setenv("DM_NVN_SHMAP", [dm stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
@@ -112,7 +130,7 @@ int front_ios_boot_ok(void) { return g_boot_ok; }
 - (void)sceneWillResignActive:(UIScene *)s { front_ios_focus_event(0); }
 - (void)sceneDidEnterBackground:(UIScene *)s { front_ios_focus_event(1); }
 - (void)sceneWillEnterForeground:(UIScene *)s { front_ios_focus_event(2); }
-- (void)sceneDidBecomeActive:(UIScene *)s { front_ios_focus_event(3); }
+- (void)sceneDidBecomeActive:(UIScene *)s { front_ios_focus_event(3); dm_save_sync_resume(); }
 @end
 
 int main(int argc, char **argv) {
