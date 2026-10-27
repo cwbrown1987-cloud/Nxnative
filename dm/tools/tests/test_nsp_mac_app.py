@@ -174,6 +174,15 @@ class PackReuse(unittest.TestCase):
         self.assert_reused()
         self.assertEqual((partial / 'leave').read_text(), 'untouched')
 
+    def test_show_fps_change_repacks_and_keeps_the_new_default(self):
+        self.args.show_fps = False
+        self.pack(); self.assert_reused()
+        self.args.show_fps = True
+        self.assert_repacked()
+        info = plistlib.loads((Path(self.args.out) / 'Contents/Info.plist').read_bytes())
+        self.assertIs(info.get('DMShowFPS'), True)
+        self.assert_reused()
+
     def test_each_selected_file_content_invalidates_even_with_same_stat(self):
         self.pack()
         names = ['dmhost', 'patched/main.patched.bin', 'patched/main.fixups.tsv', 'patched/main.gates.tsv', 'patched/main.cuts.tsv',
@@ -400,6 +409,31 @@ class App(unittest.TestCase):
         self.assertEqual((p['CFBundleExecutable'], p['CFBundleName'], p['CFBundleIdentifier'], p['CFBundleShortVersionString']), ('nxnative', 'Game: Test', 'org.nxnative.01008cf01baac000', '1.0.1'))
         self.assertEqual((p['DMTitleID'], p['DMLanguage'], p['DMRomfsMarker'], p['CFBundleIconFile']), (TID, 'fr', 'region_common/audio/edward.bfsar', 'AppIcon'))
 
+    def test_show_fps_reaches_the_host_and_environment_overrides_win(self):
+        # The real packer and launcher must deliver the build choice before the host creates Metal's device.
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
+            tmp = Path(tmp)
+            a = types.SimpleNamespace(**vars(self.args)); a.out = str(tmp / 'HUD.app'); a.icon = None
+            cases = [('default', None, None, None), ('bundle', '0', None, None),
+                     ('player', '0', '1', None), ('process', '0', '1', '0')]
+            for enabled in (False, True):
+                a.show_fps = enabled
+                with contextlib.redirect_stdout(io.StringIO()): pack_app.pack(a)
+                for name, baked, player, process in cases:
+                    with self.subTest(enabled=enabled, source=name):
+                        home = tmp / f'home-{enabled}-{name}'; home.mkdir()
+                        sup = home / f'Library/Application Support/nxnative/{TID}'; sup.mkdir(parents=True)
+                        bundle_env = Path(a.out) / 'Contents/Resources/dm/env.txt'
+                        bundle_env.write_text('' if baked is None else f'DM_METAL_HUD={baked}\n')
+                        if player is not None: (sup / 'env.txt').write_text(f'DM_METAL_HUD={player}\n')
+                        env = dict(HOME=str(home), PATH='/usr/bin:/bin')
+                        if process is not None: env['DM_METAL_HUD'] = process
+                        r = subprocess.run([Path(a.out) / 'Contents/MacOS/nxnative'], env=env, capture_output=True, timeout=30)
+                        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+                        values = dict(line.split('=', 1) for line in (home / 'host_run.txt').read_text().splitlines())
+                        want = {'default': '1' if enabled else '0', 'bundle': '0', 'player': '1', 'process': '0'}[name]
+                        self.assertEqual(values.get('DM_METAL_HUD'), want)
+
     def test_signed(self):   # ad-hoc, both the host and the bundle, never the hardened runtime (it refuses the executable memory the host makes for the game's code)
         for target in (self.app, self.app / 'Contents/MacOS/dmhost'):
             subprocess.run(['codesign', '--verify', '--strict', target], check=True, capture_output=True)
@@ -551,9 +585,19 @@ class Script(unittest.TestCase):
         with mock.patch.object(nsp, 'run', fake_run), mock.patch.object(nsp, 'PROG', mock.Mock()), mock.patch.object(nsp, 'chain_of', lambda repo: '0123456789ab'), \
              mock.patch.object(nsp, 'mac_gpu_arch', lambda *a: 'applegpu_g14s'), mock.patch.object(nsp, 'say', self.said.append):
             nsp.mac_app(sys.executable, REPO, out, 0x01008CF01BAAC000, tmp, tmp / 'ex', tmp / 'patched', tmp / 'dmhost', tmp / 'font', tmp / 'shader/cache' if gfx == 'nvn' else tmp / 'shader',
-                        kw.get('aoc'), gfx, 'en-US', g, 'Game', '1.0.0', 'org.nxnative.01008cf01baac000', None, kw.get('sign', ''), {}, tmp, gpus=kw.get('gpus', ''))
+                        kw.get('aoc'), gfx, 'en-US', g, 'Game', '1.0.0', 'org.nxnative.01008cf01baac000', None, kw.get('sign', ''), {}, tmp, gpus=kw.get('gpus', ''),
+                        **({'show_fps': kw['show_fps']} if 'show_fps' in kw else {}))
         self.pso_cmd = ran[0] if len(ran) > 1 else None   # pso_offline.py, before the packer
+        self.pack_argv = ran[-1]
         c = ran[-1]; return {c[i]: c[i + 1] for i in range(3, len(c) - 1) if c[i].startswith('--')}, tmp
+
+    def test_show_fps_build_default_and_command_line_override(self):
+        for default, flags, wanted in [(True, [], '--show-fps'), (False, [], '--no-show-fps'),
+                                       (False, ['--show-fps'], '--show-fps'), (True, ['--no-show-fps'], '--no-show-fps')]:
+            with self.subTest(default=default, flags=flags), mock.patch.object(nsp, 'SHOW_FPS', default):
+                a = nsp.parse_args(['--platform', 'mac-app'] + flags)
+                self.pack_cmd('nvn', **({'show_fps': a.show_fps} if a.show_fps is not None else {}))
+                self.assertIn(wanted, self.pack_argv)
 
     def test_pack_command(self):
         o, tmp = self.pack_cmd('nvn')

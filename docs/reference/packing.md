@@ -9,6 +9,15 @@
 - **Fix:** `scripts/build_ipa_from_nsp.py` `configure_dotnet` derives the root from the `Microsoft.NETCore.App` entry in `dotnet --list-runtimes`, using the build's environment, before any extraction or survey. It exports `DOTNET_ROOT` both to that environment and to `os.environ`, for tools launched with an explicit environment and those that inherit it. Caller-supplied roots, including architecture-specific overrides, retain precedence. A failed or malformed probe leaves the environment unchanged rather than guessing the wrapper's directory.
 - **Found on:** [Balatro](../../dm/games/0100CD801CE5E000/README.md), first extraction with Homebrew .NET ([PR #284](https://github.com/seedds/nxnative/pull/284)). Applies to every game's build on that installation setup.
 
+## Mac apps
+
+### The Mac app drops the FPS setting and Metal HUD menu
+
+- **Symptom:** a Mac app built with `--show-fps` has neither the Metal performance overlay nor its Metal HUD menu.
+- **Cause:** the NSP script returned from its Mac packaging path before applying `SHOW_FPS` / `--show-fps`. The older bundler carried that preference into the app, but the current launcher received no HUD default. The Mac host enables Apple's HUD through `DM_METAL_HUD`, and Apple adds its menu when the HUD is enabled.
+- **Fix:** `scripts/build_ipa_from_nsp.py` passes the resolved choice to `dm/mac/pack_app.py`, which stores `DMShowFPS` in `Info.plist`. `dm/mac/launcher.c` sets `DM_METAL_HUD` from it before spawning the host, after reading environment files so explicit values retain precedence. `--no-show-fps` disables the bundled default; changing the option invalidates bundle reuse. Tests pack and launch a stand-in host to verify both defaults and process, player-file and bundled-file overrides.
+- **Found on:** [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md); applies to every Mac app. The packaging and launch environment are tested without game files; the restored menu still needs a visual check in a running game.
+
 ## IPA archives
 
 ### A streamed file changes size and the IPA fails its CRC check
