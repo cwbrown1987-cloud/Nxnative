@@ -19,7 +19,9 @@
  * 3. This notice may not be removed or altered from any source distribution.
  */
 #pragma once
+#include <math.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include "pad_map.h"
 typedef struct { int down; int32_t x, y; float pressure; } steam_pad;
@@ -38,6 +40,22 @@ static inline int steam_i16(const unsigned char *p) { unsigned n = steam_u16(p);
 static inline int32_t steam_axis(const unsigned char *p) {
     int n = steam_u16(p); if (n >= 32768) n -= 65536; return n == -32768 ? -32767 : n;
 }
+// Raw HID sticks drift slightly at rest. Games can treat any nonzero stick as
+// intentional input and suppress gyro aiming (TotK). Keep the centre exactly
+// zero, rescale the remaining travel, and retain full per-axis diagonals.
+static inline float steam_deadzone_value(void) {
+    const char *e = getenv("DM_STEAM_DEADZONE"); if (!e) return 0.10f;
+    char *end; float v = strtof(e, &end);
+    return end != e && !*end && v >= 0 && v < 0.9f ? v : 0.10f;
+}
+static inline void steam_deadzone(int32_t *x, int32_t *y, float dz) {
+    float fx = *x / 32767.0f, fy = *y / 32767.0f, radius = hypotf(fx, fy);
+    if (radius <= dz) { *x = *y = 0; return; }
+    if (radius >= 1) return; // square-range diagonals are already beyond full radial travel; do not rotate them by clipping
+    float scale = (radius - dz) / ((1 - dz) * radius);
+    *x = (int32_t)lrintf(fmaxf(-1, fminf(1, fx * scale)) * 32767);
+    *y = (int32_t)lrintf(fmaxf(-1, fminf(1, fy * scale)) * 32767);
+}
 // Return 1 for a complete state, -1 disconnected, 2 connected, 0 ignored.
 // USB (0x42), BLE (0x45), and timestamped (0x47) share their first 18 bytes.
 // Require the full 46-byte state, including touch/IMU, to reject truncated input.
@@ -54,6 +72,8 @@ static inline int steam_decode(const unsigned char *p, size_t n, steam_state *s)
     if (steam_u16(p + 8) >= 16384) s->buttons |= DM_BTN_ZR;
     s->lx = steam_axis(p + 10); s->ly = steam_axis(p + 12);
     s->rx = steam_axis(p + 14); s->ry = steam_axis(p + 16);
+    float dz = steam_deadzone_value();
+    steam_deadzone(&s->lx, &s->ly, dz); steam_deadzone(&s->rx, &s->ry, dz);
     int pad = p[0] == 0x47 ? 20 : 18; // timestamped reports insert a trackpad timestamp
     for (int i = 0; i < 2; i++, pad += 6) {
         s->pad[i] = (steam_pad){!!(b & (1u << (i ? 21 : 25))), steam_axis(p + pad), steam_axis(p + pad + 2), steam_u16(p + pad + 4) / 32768.0f};

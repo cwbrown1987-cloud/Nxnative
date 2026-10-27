@@ -1,9 +1,57 @@
 #include <assert.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
 #include "../pad_map.h"
 #include "../steam_input.h"
+static steam_state decode_sticks(unsigned char report, int16_t lx, int16_t ly, int16_t rx, int16_t ry) {
+    unsigned char packet[46] = {0}; packet[0] = report;
+    int16_t axes[] = {lx, ly, rx, ry};
+    for (int i = 0; i < 4; i++) { uint16_t v = (uint16_t)axes[i]; packet[10+2*i] = v; packet[11+2*i] = v >> 8; }
+    packet[39] = 0x40; packet[41] = 0x40; // motion must survive centred sticks
+    int pad = report == 0x47 ? 20 : 18; packet[pad] = 3; packet[pad+2] = 4;
+    steam_state s; assert(steam_decode(packet, sizeof packet, &s) == 1);
+    assert(s.acc[2] == -1 && s.gyro[0] > 0 && s.pad[0].x == 3 && s.pad[0].y == 4);
+    return s;
+}
+static void t_deadzone(void) {
+    unsetenv("DM_STEAM_DEADZONE");
+    for (int i = 0; i < 3; i++) {
+        unsigned char report = (unsigned char[]){0x42,0x45,0x47}[i];
+        steam_state s = decode_sticks(report, 7, -9, -13, 11);
+        assert(s.lx == 0 && s.ly == 0 && s.rx == 0 && s.ry == 0); // rest must not suppress gyro aiming
+        s = decode_sticks(report, 2000, 2000, 3000, -3000);
+        assert(s.lx == 0 && s.ly == 0 && s.rx > 0 && s.ry == -s.rx); // radial, not per-axis
+        s = decode_sticks(report, 3276, 0, 3278, 0);
+        assert(s.lx == 0 && s.ly == 0 && s.rx == 1 && s.ry == 0); // continuous at the boundary
+        s = decode_sticks(report, 16384, 0, 12000, -16000);
+        assert(s.lx == 14564 && s.ly == 0 && s.rx == 11149 && s.ry == -14865);
+        s = decode_sticks(report, 32767, 0, -32768, 0);
+        assert(s.lx == 32767 && s.rx == -32767); // full travel is retained
+        s = decode_sticks(report, 32767, -32768, -32768, 32767);
+        assert(s.lx == 32767 && s.ly == -32767 && s.rx == -32767 && s.ry == 32767);
+        s = decode_sticks(report, 32767, 16384, -16384, -32768);
+        assert(s.lx == 32767 && s.ly == 16384 && s.rx == -16384 && s.ry == -32767); // preserve asymmetric outer diagonals
+    }
+    setenv("DM_STEAM_DEADZONE", "0.2", 1);
+    steam_state s = decode_sticks(0x42, 6000, 0, 16384, 0);
+    assert(s.lx == 0 && s.rx == 12288);
+    setenv("DM_STEAM_DEADZONE", "0.8", 1);
+    s = decode_sticks(0x42, 32767, 16384, -16384, -32768);
+    assert(s.lx == 32767 && s.ly == 16384 && s.rx == -16384 && s.ry == -32767);
+    setenv("DM_STEAM_DEADZONE", "0", 1);
+    s = decode_sticks(0x42, 7, -9, -13, 11);
+    assert(s.lx == 7 && s.ly == -9 && s.rx == -13 && s.ry == 11);
+    const char *invalid[] = {"", "garbage", "0junk", "nan", "inf", "-0.1", "0.9", "1"};
+    for (unsigned i = 0; i < sizeof invalid / sizeof *invalid; i++) {
+        setenv("DM_STEAM_DEADZONE", invalid[i], 1);
+        s = decode_sticks(0x42, 7, -9, 16384, 0);
+        assert(s.lx == 0 && s.ly == 0 && s.rx == 14564); // invalid settings retain the safe default
+    }
+    unsetenv("DM_STEAM_DEADZONE");
+}
 int main(void) {
+    t_deadzone();
     int map[DM_PAD_BUTTONS]; pad_map_default(map, 0);
     assert(pad_map_buttons(1u << 0, map) == DM_BTN_A); // east -> Switch A
     pad_map_default(map, 1);

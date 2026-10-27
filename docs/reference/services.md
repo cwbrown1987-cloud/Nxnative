@@ -214,6 +214,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** `controllers_mac.m` completes synchronous HID discovery before admitting a fresh, non-neutral native event. It gates only unadmitted snapshots and preserves established slots and the merged rumble owner. USB device ancestry, per-port Puck interface ancestry, or the OS physical-device ID groups sibling claims; report metadata selects the Triton endpoint. Opens commit together, suppression handles have no decoder, and failure releases only that group. Unknown physical identity constrains new claims instead of guessing a native instance. See [Mac controller behavior and fallback](../mac-controllers.md#steam-controller-2026).
 - **Found on:** synthetic native/HID race, ownership-failure and mixed-controller regressions in `dm/host/tests/t_controllers_mac.m`; physical controller/game validation remains pending.
 
+### Steam Controller stick drift suppresses gyro aiming
+
+- **Symptom:** six-axis values reach the game but gyro aiming does nothing, or stops after using a stick.
+- **Cause:** the raw Triton reports contain small nonzero stick values at rest. Passing them through as intentional input prevents a game that prioritizes stick input from using motion aiming.
+- **Fix (resolved in the decoder):** apply a radial deadzone to both sticks in `steam_input.h`, default 10%, rescaling the remaining travel to full range. `DM_STEAM_DEADZONE` accepts 0 to below 0.9; invalid values retain the default. Trackpads and motion remain unchanged. Decoder regressions cover all three report formats, centre drift, radial boundaries, travel, diagonals and settings.
+- **Found on:** [Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md#services); the contributor's USB-C test confirmed gyro aiming with the proposed deadzone. No new local gameplay validation.
+
 ### History reads fill every requested entry
 
 - **Symptom:** buttons and menus work, the sticks do nothing in play (Super Mario Odyssey: its first hint, "Look Around", waited forever); an `nn::diag` abort with Result 0x2aca in the first frames of `nnMain` (Hollow Knight: Silksong, Unity 6000.0.50f1: `bt: sdk+0x514580 main+0x1296c64 …`).

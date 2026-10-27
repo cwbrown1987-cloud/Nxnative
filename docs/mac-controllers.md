@@ -41,6 +41,10 @@ The Triton adapter supports:
   `28de:1302`, `1303`, `1304`, `1305`).
 - Both sticks and stick clicks, face buttons, D-pad, shoulders, triggers,
   Menu/View, Guide/Quick Access, four rear buttons and both trackpad clicks.
+- Both raw sticks use a 10% radial deadzone so resting drift does not suppress
+  gyro aiming. Remaining travel is rescaled to full range. Set
+  `DM_STEAM_DEADZONE` to a fraction from 0 to below 0.9 to adjust it (0 disables
+  it); invalid values use 0.10. Trackpad coordinates are unaffected.
 - Rear buttons and trackpad clicks can be assigned in the same mapping panel.
   Their default is Unassigned.
 - Left trackpad defaults to **D-pad**, right trackpad to **Switch touchscreen**.
@@ -97,5 +101,9 @@ reports, sensor units/timestamp wraps, guest six-axis history, rumble output and
 stop/refresh checks, trackpad touches, identical native profile names, stale
 native events, exclusive HID ownership/failure/removal, player-slot checks and
 saved-map round trips (including older button-only maps). Those
-tests do not establish physical-device compatibility: actual 2026 hardware,
-firmware and connection modes still need a hardware smoke test.
+tests do not establish physical-device compatibility. A [PR #221 hardware
+report](https://github.com/seedds/nxnative/pull/221#issuecomment-6428699708) confirms
+USB-C buttons, sticks and rumble in TotK 1.4.3, and gyro aiming with the proposed
+10% deadzone. This revision still needs hardware retesting; trackpads, rear
+buttons, mapping persistence and other connection modes were not covered by
+that report.
