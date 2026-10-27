@@ -16,9 +16,9 @@ def rows():
     for n, line in enumerate((HERE / 'settings.tsv').read_text(encoding='utf-8').splitlines(), 1):
         if not line.strip() or line.startswith('#'): continue
         c = line.split('\t')
-        if len(c) not in (7, 8): sys.exit(f'settings.tsv:{n}: 7 or 8 columns expected, {len(c)} found')
+        if len(c) not in (7, 8, 9): sys.exit(f'settings.tsv:{n}: 7 to 9 columns expected, {len(c)} found')
         if c[5] not in SECTIONS: sys.exit(f'settings.tsv:{n}: unknown section: {c[5]}')
-        yield n, c + [''] * (8 - len(c))
+        yield n, c + [''] * (9 - len(c))
 
 
 def fixups_keys(path):   # '# KEY<TAB>value' header rows of a rewriter table
@@ -53,9 +53,10 @@ def build(gid, patched, control):
         return d
 
     out = []
-    for n, (var, kind, values, default, cond, section, label, note) in rows():
+    for n, (var, kind, values, default, cond, section, label, note, needs) in rows():
         if not shown(cond, n): continue
         s = {'env': var, 'kind': kind, 'section': section, 'label': label, 'note': note, 'default': value(default, n)}
+        if needs: s['needs'] = needs   # <VAR>=<value>: a sub-setting, drawn only while that setting has that value
         if kind == 'choice':
             opts = [list(l) for l in langs] if values == 'languages' else [v.split('=', 1) for v in values.split(',')]
             if any(len(o) != 2 for o in opts): sys.exit(f'settings.tsv:{n}: choice values are value=label,...')
