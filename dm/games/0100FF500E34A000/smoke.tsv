@@ -1,0 +1,8 @@
+# Fresh-save title route. Gameplay/save-dependent checks are documented in README.md.
+save	new
+keys	f180:A
+secs	30
+quick	20
+shots	15
+reach	60@20
+prebuild	off
