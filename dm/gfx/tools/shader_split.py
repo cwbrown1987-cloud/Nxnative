@@ -1614,6 +1614,9 @@ def arh_jobs(files, parts=64):
     return jobs, used
 
 
+MONOLITH_CONTAINERS = (b'HCPS', b'xbc1', b'DRSM', b'DMXM', b'DMSM', b'1RAS')
+
+
 def xbc_data(d, off):
     """An XBC1 stream: 48-byte header, stored / zlib / zstd payload. Return
     (decoded bytes, end), or None for bytes that merely resemble a header."""
@@ -1922,6 +1925,9 @@ def unity_text_glslc(x, base):
 
 def scan_blob(d, label, out):
     if d[:4] == b'HCPS': out.extend(hcps_shaders(d, 0, label)); return
+    # Xenoblade DE stores loose model/map containers, outside ARH/ARD archives.
+    if d[:4] in MONOLITH_CONTAINERS:
+        monolith_shaders(d, label, out); return
     for m in re.finditer(b'SLCT\x03\x10\0\0', d): out.extend(slct_shaders(d, m.start(), label))
     if d[:4] == b'Yaz0': d = yaz0(d)
     if d[:4] == b'SARC':
@@ -2014,6 +2020,9 @@ def scan_file(args):
     if ext in ('.data', '.patch', '.debug', '.nxpc') and os.path.exists(stem + '.dict'): return rel, {}, set(), {}   # read through its Next Level Games index (nlg_shaders)
     with open(path, 'rb') as f: head = f.read(16)
     found = []; trees = {}
+    if head[:4] in MONOLITH_CONTAINERS:
+        monolith_shaders(open(path, 'rb').read(), '/' + rel, found)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and args[2][0] == b'ARH1':
         arh_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees

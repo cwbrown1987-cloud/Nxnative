@@ -27,6 +27,24 @@ int main(void) {
         hex[0] = hex[0] == '0' ? '1' : '0'; assert(pso_skey_parse(hex, &b) == 0); assert(memcmp(&a, &b, sizeof a) != 0);
         assert(pso_skey_parse(hex + 1, &b) == -1); hex[0] = 'g'; assert(pso_skey_parse(hex, &b) == -1);
     }
+    // Legacy persisted keys predate logic_op. Their bytes must retain their old
+    // layout and mean COPY; OR must still survive a current-format round trip.
+    {
+        typedef struct { const void *vs, *fs; uint32_t cfmt[8], dfmt, sfmt, samples, blend_en, chmask, a2c; blend_st blend[8]; va_st attr[16]; vs_st stream[16]; uint8_t lmap[8]; const void *fsfn; } legacy_key;
+        typedef struct { char vs[24], fs[24]; uint8_t vs_stage, fs_stage, merged, fz; pso_fz_desc fz_desc; legacy_key k; } legacy_skey;
+        legacy_skey old = {0}; strcpy(old.vs, "legacy-vs"); old.k.cfmt[0] = 80;
+        old.k.chmask = 15; old.k.attr[2].stream = 3; old.k.lmap[0] = 7;
+        char hex[sizeof(pso_skey) * 2 + 1];
+        for (size_t i = 0; i < sizeof old; i++) sprintf(hex + i * 2, "%02x", ((const unsigned char *)&old)[i]);
+        pso_skey parsed;
+        assert(pso_skey_parse(hex, &parsed) == 0);
+        assert(!strcmp(parsed.vs, "legacy-vs") && parsed.k.cfmt[0] == 80 && parsed.k.chmask == 15);
+        assert(parsed.k.attr[2].stream == 3 && parsed.k.lmap[0] == 7 && parsed.k.logic_op == NVN_LOGIC_OP_COPY);
+        parsed.k.logic_op = NVN_LOGIC_OP_OR;
+        pso_skey_hex(&parsed, hex); pso_skey again;
+        assert(pso_skey_parse(hex, &again) == 0 && again.k.logic_op == NVN_LOGIC_OP_OR);
+        assert(!memcmp(&parsed, &again, sizeof parsed));
+    }
     // pso_key_norm: blend factors of a target that does not blend, and the mask / blend bit of a target a normal pass lacks, are not part of the key; a merged pass keeps
     // the mask and blend bits (they index logical targets through lmap)
     {

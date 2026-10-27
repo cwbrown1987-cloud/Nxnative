@@ -2,6 +2,7 @@
 from pathlib import Path
 import struct
 import sys
+import tempfile
 import unittest
 import zlib
 
@@ -41,6 +42,27 @@ def program(stages, extra=0):
 
 
 class MonolithTests(unittest.TestCase):
+    def test_loose_model_containers_reach_existing_hcps_reader(self):
+        data, _, _ = program(['vs', 'gs', 'ps'])
+        for magic in (b'DRSM', b'DMXM', b'DMSM', b'1RAS'):
+            with self.subTest(magic=magic), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'model.bin'
+                path.write_bytes(magic + bytes(28) + data)
+                _, shaders, pairs, _ = split.scan_file((str(path), 'model.bin'))
+                self.assertEqual(len(shaders), 3)
+                self.assertTrue(pairs)
+
+    def test_loose_xbc_stream_is_decoded_before_scanning(self):
+        data, _, _ = program(['vs', 'ps'])
+        packed = zlib.compress(data, level=0)
+        wrapper = struct.pack('<4s4I28s', b'xbc1', 1, len(data), len(packed), 0, b'test') + packed
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'map.bin'
+            path.write_bytes(wrapper)
+            _, shaders, pairs, _ = split.scan_file((str(path), 'map.bin'))
+            self.assertEqual(len(shaders), 2)
+            self.assertTrue(pairs)
+
     def test_text_controls_advance_at_eight_byte_alignment(self):
         data, ctls, codes = program(['vs', 'ps'], extra=13)
         out = split.hcps_shaders(data, 0, '/test')

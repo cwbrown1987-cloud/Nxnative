@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 #include "nvn_obj.h"
 
@@ -7,6 +8,7 @@ typedef struct {
     const void *vs, *fs; uint32_t cfmt[8], dfmt, sfmt, samples, blend_en, chmask, a2c; blend_st blend[8];
     va_st attr[16]; vs_st stream[16];
     uint8_t lmap[8]; const void *fsfn;
+    uint32_t logic_op;   // Append: the prefix remains the persisted pre-logic-op key layout.
 } pso_key;
 
 typedef struct {
@@ -45,8 +47,11 @@ static inline void pso_skey_hex(const pso_skey *key, char *out) {
 }
 
 static inline int pso_skey_parse(const char *hex, pso_skey *out) {
-    size_t n = sizeof *out * 2;
-    if (!hex || strlen(hex) != n) return -1;
+    if (!hex) return -1;
+    size_t n = strlen(hex), legacy_n = (offsetof(pso_skey, k) + offsetof(pso_key, logic_op)) * 2;
+    if (n != sizeof *out * 2 && n != legacy_n) return -1;
+    memset(out, 0, sizeof *out);
+    if (n == legacy_n) out->k.logic_op = NVN_LOGIC_OP_COPY;
     uint8_t *p = (uint8_t *)out;
     for (size_t i = 0; i < n; i += 2) {
         int a = hex[i] >= '0' && hex[i] <= '9' ? hex[i] - '0' : hex[i] >= 'a' && hex[i] <= 'f' ? hex[i] - 'a' + 10 : hex[i] >= 'A' && hex[i] <= 'F' ? hex[i] - 'A' + 10 : -1;

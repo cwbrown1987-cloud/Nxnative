@@ -267,6 +267,8 @@ run: t_nvn t_dirty_slots t_dirty_race t_tex_layout t_builtin t_vin t_tbuf2d t_tb
 	./t_builtin
 	./t_vin
 	MTL_DEBUG_LAYER=1 ./t_float_pad
+	MTL_DEBUG_LAYER=1 ./t_logic_or
+	python3 test_logic_or.py
 	./t_tbuf2d
 	./t_tbuf_align
 	./t_sparse_layout
@@ -322,3 +324,8 @@ run: t_nvn t_dirty_slots t_dirty_race t_tex_layout t_builtin t_vin t_tbuf2d t_tb
 t_float_pad: t_float_pad.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_float_pad.m $(MTL_T_SRC) $(FW)
 run: t_float_pad
+
+t_logic_or: t_logic_or.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_logic_or.m $(MTL_T_SRC) $(FW)
+
+run: t_logic_or
