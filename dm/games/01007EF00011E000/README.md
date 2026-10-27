@@ -184,6 +184,8 @@ Before publishing, the fixes were integrated with main's pipeline archive and GP
 
 ## Found on this game
 
+- **Optional touch-camera preferences (device validation pending after launcher integration):** [Relative swipe camera input on iOS](../../../docs/reference/services.md#relative-swipe-camera-input-on-ios). User feedback on the 1.9.0 prototypes motivated a game-independent swipe option and configurable touch sensitivity/dead zone; this is separate from physical-controller input.
+
 General host changes first needed here; each applies to every game:
 
 - **Shared performance work, checked independently of prewarm data:** [CPU deswizzle copies use slice and row offsets](../../../docs/reference/nvn-objects.md#cpu-deswizzle-copies-use-slice-and-row-offsets) and [Host symbol indexes avoid repeated name scans](../../../docs/reference/services.md#host-symbol-indexes-avoid-repeated-name-scans). [PR #261](https://github.com/seedds/nxnative/pull/261) reports M2 iPad Pro gameplay on update 1.9.0; local verification covers synthetic correctness and CPU microbenchmarks, without a new game/device run.
